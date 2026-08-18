@@ -3,7 +3,9 @@
 claude 原始 transcript 每个事件都带 ISO 时间戳（如 `2026-08-17T08:11:26.627Z`），
 agent-chat 的 sessions.json 在加 ts 落盘之前没有时间线。本工具按以下规则回填：
 
-- **human 消息**：按内容匹配 transcript 的 user 事件（编排器 prompt 含用户问题/任务/介入文本）；
+- **human 消息**：**只给「成功送达 claude 且有回复」的提问**回填——按内容匹配 transcript 的
+  user 事件（编排器 prompt 含用户问题/任务/介入文本）；无回复的提问（claude 根本没收到，
+  如 gemma 冷启/链路失败）不匹配，时间无从考证、保持无 ts（前端不显示时间）；
 - **agent 回复**：按内容匹配该 agent transcript 的 assistant 回合（去 --- 后子串匹配，
   避免 gemma 模板答案重复时按顺序错位）；
 - 无 transcript 对应（失败空跑等）的消息保持无 ts（前端不显示时间）。
@@ -94,6 +96,21 @@ def _content_match(local: str, transcript: str) -> bool:
     return t[:30] in l or l[:30] in t
 
 
+def _has_reply(msgs: list, human_idx: int) -> bool:
+    """该 human 提问之后、下一个提问之前，是否存在非空的 agent 回复。
+
+    无回复的提问（claude 根本没收到，如 gemma 冷启/链路失败空跑）时间无从考证，
+    不参与 transcript 时间回填。
+    """
+    for m in msgs[human_idx + 1:]:
+        sp = m.get("speaker")
+        if sp == "human":
+            return False
+        if sp and sp != "system" and (m.get("content") or "").strip():
+            return True
+    return False
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("用法: python -m backend.backfill_timestamps <project_path> [--backup]")
@@ -126,19 +143,24 @@ def main(argv: list[str]) -> int:
             agent_replies[agent_name] = replies
         if not all_users and not agent_replies:
             continue
-        used_users = set()
+        # 先清空旧 ts，再按 transcript 重算（幂等；修正历史错配的 ts，如失败提问误占时间）
         for m in msgs:
+            m.pop("ts", None)
+        used_users = set()
+        for i, m in enumerate(msgs):
             if m.get("ts"):
                 continue
             sp = m.get("speaker")
             content = m.get("content") or ""
             if sp == "human":
-                for i, (ts, prompt) in enumerate(all_users):
-                    if i in used_users:
+                if not _has_reply(msgs, i):
+                    continue  # 无回复的提问：claude 根本没收到，时间无从考证，保持无 ts
+                for j, (ts, prompt) in enumerate(all_users):
+                    if j in used_users:
                         continue
                     if content.strip() and content.strip() in prompt:
                         m["ts"] = ts
-                        used_users.add(i)
+                        used_users.add(j)
                         filled += 1
                         break
             elif sp in agent_replies:
