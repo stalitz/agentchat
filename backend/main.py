@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from . import store
 from . import executor
 from .models import AgentConfig, TeamConfig, ProjectConfig, AppSettings
-from .orchestrator import Session
+from .orchestrator import Session, TONE_STYLES
 from . import gateway
 
 app = FastAPI(title="Agent CLI Orchestrator")
@@ -157,11 +157,16 @@ async def handle_start(msg: dict):
     max_rounds = int(msg.get("max_rounds", settings.get("default_max_rounds", 12)))
     # 单轮超时取全局设置（已不在 agent 上）
     timeout = settings.get("default_timeout", 300)
-    # 会话（session）是历史的载体：优先用前端传入的 session_id，缺失则服务端新建
+    # 讨论调性（可选）：发起时选定，注入每轮 prompt；持久化到会话（历史续接保持同调）
+    tone = (msg.get("tone") or "").strip()
+    if tone and tone not in TONE_STYLES:
+        tone = ""  # 未知调名忽略（防脏数据）
     if not sid:
         title = (msg.get("task") or "").strip()[:24] or "新会话"
         sid = store.create_session(proj["path"], title)["id"]
-    sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout)
+    if tone:
+        store.set_session_tone(proj["path"], sid, tone)
+    sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout, tone=tone)
     sessions[sid] = sess  # 注册；结束后保留（running=False，可继续/复用）
     asyncio.create_task(sess.start(msg.get("task", "")))
 

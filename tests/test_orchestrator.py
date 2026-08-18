@@ -319,6 +319,30 @@ class TestOrchestrator(unittest.TestCase):
         self.assertTrue(all((m.get("content") or "") or (m.get("thinking") or "") for m in a_msgs),
                         "纯工具轮不应落空消息")
 
+    def test_tone_injected_into_prompt(self):
+        # 讨论调性：发起时选定的风格注入每轮 prompt（chat / debate 均生效），整场保持一致
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid)
+        # 未选 → 不注入
+        p = s._build_prompt(a1, "任务", round_i=1)
+        self.assertNotIn("本场讨论风格", p)
+        # 选定「批判」→ 注入风格描述
+        s.tone = "批判"
+        p = s._build_prompt(a1, "任务", round_i=1)
+        self.assertIn("本场讨论风格", p)
+        self.assertIn("挑战前提", p, "批判风格描述应注入")
+        self.assertIn("不要中途改变", p)
+        # 未知调名 → 不注入
+        s.tone = "不存在的风格"
+        p = s._build_prompt(a1, "任务", round_i=1)
+        self.assertNotIn("本场讨论风格", p)
+        # chat 模式同样生效
+        s.mode = "chat"; s.tone = "温和"
+        p = s._build_prompt(a1, "你好", round_i=0)
+        self.assertIn("本场讨论风格", p)
+        self.assertIn("礼貌克制", p)
+
     def test_round0_terminate_is_ignored_before_floor(self):
         # 共识终止有最小轮数保护：至少两轮完整往返（2*N-1）后 TERMINATE 才生效。
         # 首轮（round 0）agent 吐 TERMINATE 不再直接终止，辩论应继续、第二个 agent 也会发言。

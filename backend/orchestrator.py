@@ -5,6 +5,27 @@ from . import store
 from .executor import AgentRuntime
 from .models import AgentConfig
 
+# 讨论调性（tone）：发起讨论时可选择一个风格，注入每轮 prompt，整场保持一致。
+# key 为前端下拉显示的调名，value 为注入 prompt 的风格描述（模型按此发言）。
+TONE_STYLES: dict[str, str] = {
+    "温和": "礼貌克制、委婉表达不同意见、优先寻找共识，避免尖锐对抗",
+    "友好": "轻松亲和、强调建设性与合作，气氛融洽",
+    "中立": "不预设立场，只摆事实、讲逻辑，克制主观情绪",
+    "批判": "主动审视对方观点中的漏洞，挑战前提与假设，明确指出问题",
+    "尖锐": "直接点破问题与矛盾，不留情面但就事论事",
+    "激进": "强势推进己方立场，主动压制反方观点，措辞具有进攻性",
+    "唱反调": "刻意寻找反例与反对理由，即使基本同意也要检验对立面",
+    "严谨": "每步结论都要有证据与推理链支撑，避免跳跃与想当然",
+    "审慎": "保守小心，反复验证，不轻易下结论，宁可留有余地",
+    "怀疑": "对任何结论先假设其可能错误，要求对方证明",
+    "务实": "只关心能否落地执行，拒绝空谈与过度理论化",
+    "数据驱动": "一切观点用数据、事实与案例支撑，少用主观判断",
+    "学术": "术语严谨、引经据典、论证结构完整，像学术论文",
+    "简洁": "点到为止、惜字如金，直接给结论与关键理由",
+    "详尽": "全面展开论证，覆盖所有角度，不遗漏细节",
+    "幽默": "轻松诙谐，善用类比与玩笑化解对立，但不失深度",
+}
+
 
 def _clean_answer(text: str) -> str:
     """清洗 agent 答案文本：剥离 gemma 等推理模型在 reasoning/answer 之间输出的
@@ -36,7 +57,7 @@ class Session:
     """
 
     def __init__(self, project_path: str, session_id: str, agents: list[AgentConfig],
-                 max_rounds: int, broadcast, timeout: int = 300):
+                 max_rounds: int, broadcast, timeout: int = 300, tone: str = ""):
         self.project_path = project_path
         self.session_id = session_id
         self.agents = agents
@@ -45,6 +66,8 @@ class Session:
         self.broadcast = broadcast  # async fn(event: dict)
         sess = store.read_session(project_path, session_id)
         self.history = sess.get("messages", []) if sess else []
+        # 讨论调性：发起时传入优先；未传则沿用会话已存（历史会话续接保持同调）
+        self.tone = tone or ((sess or {}).get("tone") or "")
         # 每个 agent 的「持续 CLI 会话」id，用于 1:1 续接；从磁盘读回（历史会话恢复用）
         self.agent_sessions = (sess or {}).get("agent_sessions", {})
         self.runtimes = {a.name: AgentRuntime(a, self.agent_sessions.get(a.name)) for a in agents}
@@ -95,6 +118,12 @@ class Session:
         if agent.role:
             # 极便宜的身份锚定：避免 resume 后续接时角色设定漂移（一行，远小于重搬历史）
             parts.append(f"你是：{agent.role}。")
+        # 讨论调性：整场统一、每轮都注入，保证风格一致（chat / debate 均生效）
+        if self.tone and self.tone in TONE_STYLES:
+            parts.append(
+                f"本场讨论风格：{TONE_STYLES[self.tone]}——"
+                "请始终保持此风格发言，不要中途改变。"
+            )
 
         if self.mode == "chat":
             # 人机对话：只把用户本轮新消息作为 delta 发给 agent（其 CLI 会话已含完整历史）

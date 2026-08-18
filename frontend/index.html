@@ -237,6 +237,27 @@
         <label style="display:flex; gap:6px; align-items:center;">最大轮次
           <input id="maxRounds" type="number" min="1" value="" style="width:64px;" />
         </label>
+        <label style="display:flex; gap:6px; align-items:center;">讨论风格
+          <select id="selTone">
+            <option value="">（无，自由发挥）</option>
+            <option value="温和">温和</option>
+            <option value="友好">友好</option>
+            <option value="中立">中立</option>
+            <option value="批判">批判</option>
+            <option value="尖锐">尖锐</option>
+            <option value="激进">激进</option>
+            <option value="唱反调">唱反调</option>
+            <option value="严谨">严谨</option>
+            <option value="审慎">审慎</option>
+            <option value="怀疑">怀疑</option>
+            <option value="务实">务实</option>
+            <option value="数据驱动">数据驱动</option>
+            <option value="学术">学术</option>
+            <option value="简洁">简洁</option>
+            <option value="详尽">详尽</option>
+            <option value="幽默">幽默</option>
+          </select>
+        </label>
         <span class="hint" id="roundHint" style="margin:0;">轮到某个 agent 说一次算一轮；默认取全局设置</span>
       </div>
       <div id="injectRow" style="margin-top:6px; position:relative;">
@@ -777,11 +798,12 @@ function startSession() {
   if (isChatMode() && !task.trim()) { setStatus('请输入消息内容', false); return; }
   var n = teamAgentCount(tid);
   var mr = n < 2 ? 1 : (parseInt(document.getElementById('maxRounds').value, 10) || defaultMaxRounds());
+  var tone = document.getElementById('selTone').value;
   var ready = curSid ? Promise.resolve(curSid) : createSessionOnServer((task.trim() || '新会话').slice(0, 24), tid);
   ready.then(function (sid) {
     curSid = sid;
     runningBySid[sid] = true; refreshSendBtn();
-    WS.send(JSON.stringify({ action: 'start', project_id: curPid, team_id: tid, session_id: sid, task: task, max_rounds: mr }));
+    WS.send(JSON.stringify({ action: 'start', project_id: curPid, team_id: tid, session_id: sid, task: task, max_rounds: mr, tone: tone }));
     document.getElementById('task').value = '';  // 内容已作为消息回显，输入框清空
   }).catch(function (e) { if (curSid) runningBySid[curSid] = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
 }

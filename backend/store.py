@@ -429,6 +429,17 @@ def set_agent_session_id(project_path: str, sid: str, agent_name: str, cli_sessi
     _save_sessions(project_path, sessions)
 
 
+def set_session_tone(project_path: str, sid: str, tone: str) -> None:
+    """记录会话的讨论调性（发起讨论时选定；历史会话续接保持同调）。"""
+    sessions = _load_sessions(project_path)
+    for s in sessions:
+        if s["id"] == sid:
+            s["tone"] = tone
+            s["updated_at"] = _now()
+            break
+    _save_sessions(project_path, sessions)
+
+
 def get_original_topic(project_path: str, sid: str) -> str:
     """最初议题 = 第一条 role=='任务' 的 human 消息内容（续开新议题时回传给首个 agent 锚定）。"""
     s = read_session(project_path, sid)
