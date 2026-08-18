@@ -37,12 +37,12 @@ def _transcript_events(path: str) -> tuple[list, list]:
     """解析 transcript：返回 (user_events, reply_events)。
 
     - user_events: [(local_ts, prompt_text), ...]
-    - reply_events: [{"ts": local_ts, "content": str}, ...] —— 按 user 事件分界的每次
+    - reply_events: [{"ts": local_ts, "content": str, "thinking": str}, ...] —— 按 user 事件分界的每次
       assistant 回复（同一 user 后可能多个 assistant 事件，thinking/text 合并；取最后一条
       assistant 事件的 ts 作为回复完成时间）。
     """
     users, replies = [], []
-    pending_reply = None  # 当前回复单元 {"ts": ..., "content": [...]}
+    pending_reply = None  # 当前回复单元 {"ts": ..., "content": [...], "thinking": [...]}
     with open(path, encoding="utf-8") as fh:
         for ln in fh:
             ln = ln.strip()
@@ -55,8 +55,11 @@ def _transcript_events(path: str) -> tuple[list, list]:
             t = o.get("type")
             if t == "user":
                 if pending_reply:
-                    content = "".join(pending_reply["content"])
-                    replies.append({"ts": pending_reply["ts"], "content": content})
+                    replies.append({
+                        "ts": pending_reply["ts"],
+                        "content": "".join(pending_reply["content"]),
+                        "thinking": "".join(pending_reply["thinking"]),
+                    })
                     pending_reply = None
                 c = (o.get("message") or {}).get("content")
                 if isinstance(c, str) and c.strip():
@@ -68,7 +71,7 @@ def _transcript_events(path: str) -> tuple[list, list]:
             if t != "assistant":
                 continue
             if pending_reply is None:
-                pending_reply = {"ts": _local(o.get("timestamp", "")), "content": []}
+                pending_reply = {"ts": _local(o.get("timestamp", "")), "content": [], "thinking": []}
             else:
                 pending_reply["ts"] = _local(o.get("timestamp", ""))  # 取最后一条 assistant 的 ts
             msg = o.get("message", {})
@@ -79,8 +82,14 @@ def _transcript_events(path: str) -> tuple[list, list]:
                 for b in blocks:
                     if isinstance(b, dict) and b.get("type") == "text":
                         pending_reply["content"].append(b.get("text", ""))
+                    elif isinstance(b, dict) and b.get("type") == "thinking":
+                        pending_reply["thinking"].append(b.get("thinking", "") or b.get("text", ""))
     if pending_reply:
-        replies.append({"ts": pending_reply["ts"], "content": "".join(pending_reply["content"])})
+        replies.append({
+            "ts": pending_reply["ts"],
+            "content": "".join(pending_reply["content"]),
+            "thinking": "".join(pending_reply["thinking"]),
+        })
     return users, replies
 
 
@@ -166,6 +175,12 @@ def main(argv: list[str]) -> int:
             elif sp in agent_replies:
                 for r in agent_replies[sp]:
                     if _content_match(content, r["content"]):
+                        m["ts"] = r["ts"]
+                        filled += 1
+                        break
+                    # 思考无正文的回复（gemma 只吐 thinking + '---' 被清洗）：用 thinking 匹配
+                    if not content and not _norm(r["content"]) \
+                            and m.get("thinking") and _content_match(m.get("thinking", ""), r.get("thinking", "")):
                         m["ts"] = r["ts"]
                         filled += 1
                         break

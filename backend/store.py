@@ -311,6 +311,16 @@ def _similar_content(a: str, b: str) -> bool:
     return b[:30] in a or a[:30] in b
 
 
+# claude 外壳把 API 失败 / resume 异常渲染成普通文本（与 orchestrator._looks_like_claude_error 同源）；
+# 这些不是有效发言，reconcile 对账时应直接剔除（否则错误文本会从 transcript 被带回/追加为发言）。
+_CLAUDE_ERROR_PREFIXES = ("API Error:", "No response requested.", "Request Failed:")
+
+
+def _is_claude_error_text(text: str) -> bool:
+    t = (text or "").strip()
+    return any(t.startswith(p) for p in _CLAUDE_ERROR_PREFIXES)
+
+
 def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_turns: list) -> dict:
     """用 CLI transcript 的 agent 回合（cli_turns: 有序 [{content, thinking}]）覆盖本地该 agent 的消息。
 
@@ -324,6 +334,12 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
       盲删会丢真实历史）。
     仅当 cli_turns 非空才落盘；cli_turns 为 None/空（找不到 transcript = 离线）则保持本地不动。
     """
+    if not cli_turns:
+        return {"changed": 0, "appended": 0, "skipped": True}
+    # 剔除「错误文本」回合（API Error / No response requested. / Request Failed:）——
+    # 它们是 claude 外壳渲染的失败输出，不是有效发言，不得被对账回本地当发言
+    # （s_54d1232e 曾因 transcript 含错误文本而被带回）。
+    cli_turns = [t for t in cli_turns if not _is_claude_error_text(t.get("content", ""))]
     if not cli_turns:
         return {"changed": 0, "appended": 0, "skipped": True}
     sessions = _load_sessions(project_path)

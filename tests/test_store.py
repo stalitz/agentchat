@@ -119,6 +119,25 @@ class TestStore(unittest.TestCase):
         self.assertEqual(a_msgs[1]["content"], "agent真实答案A1")
         self.assertEqual(a_msgs[2]["content"], "agent真实答案A2")
 
+    def test_reconcile_skips_claude_error_turns(self):
+        # claude 外壳的错误文本回合（API Error / No response requested.）不是有效发言：
+        # reconcile 对账时必须剔除，不得匹配/追加回本地当发言（s_54d1232e 曾因此被带回）
+        p = TMP / "rec6"
+        s = store.create_session(str(p), "错误过滤")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "A", "role": "甲", "content": "正常回答1"})
+        cli_turns = [
+            {"content": "API Error: API returned an empty or malformed response (HTTP 200)", "thinking": ""},
+            {"content": "正常回答2", "thinking": ""},
+            {"content": "正常回答3", "thinking": ""},
+        ]
+        res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        a_msgs = [m for m in store.read_session(str(p), s["id"])["messages"] if m["speaker"] == "A"]
+        self.assertEqual(len(a_msgs), 3, "错误文本回合被过滤，仅追加正常回合")
+        self.assertEqual(a_msgs[0]["content"], "正常回答1")
+        self.assertEqual(a_msgs[1]["content"], "正常回答2")
+        self.assertEqual(a_msgs[2]["content"], "正常回答3")
+        self.assertTrue(all(not store._is_claude_error_text(m["content"]) for m in a_msgs))
+
     def test_reconcile_skips_when_no_cli_turns(self):
         # 找不到 transcript（离线 / 全新会话）→ 不动本地，作为回退
         p = TMP / "rec2"
