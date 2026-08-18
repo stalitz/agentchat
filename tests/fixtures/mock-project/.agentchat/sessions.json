@@ -1,0 +1,27 @@
+[
+  {
+    "id": "s_mock",
+    "title": "示例会话",
+    "created_at": "2026-08-10 10:00:00",
+    "updated_at": "2026-08-10 10:05:00",
+    "messages": [
+      {
+        "round": 0,
+        "speaker": "架构师",
+        "role": "系统架构师，负责方案设计与权衡",
+        "content": "建议先用 FastAPI 起后端，前端单页走 WebSocket，Claude/Codex 各负责设计/实现。"
+      },
+      {
+        "round": 1,
+        "speaker": "实现者",
+        "role": "实现者，负责落地代码与重构",
+        "content": "认同。我先把 executor 与 orchestrator 骨架落出来，记忆落 .agentchat/。"
+      }
+    ],
+    "agent_sessions": {
+      "架构师": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+      "实现者": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    },
+    "conclusion": ""
+  }
+]

@@ -1,0 +1,1275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Agent CLI 编排台</title>
+<style>
+  :root { --bg:#f5f6f8; --panel:#fff; --line:#e3e6ea; --txt:#222; --muted:#8a9099;
+          --claude:#2f6df6; --codex:#1f9d55; --human:#e08a00; --sys:#9aa1ab; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:var(--txt); height:100vh; display:flex;
+         --sidebar-w:264px; --sessions-w:280px; --composer-h:196px; }
+
+  /* ---- 左栏：项目树（可折叠为图标栏）---- */
+  #sidebar { width:var(--sidebar-w); background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  #rail { display:none; width:54px; background:var(--panel); border-right:1px solid var(--line); flex-direction:column; align-items:center; padding-top:10px; gap:8px; }
+  body.sidebar-collapsed #sidebar { display:none; }
+  body.sidebar-collapsed #rail { display:flex; }
+
+  /* ---- 中栏：会话列表（当前选中项目）---- */
+  #sessions { width:var(--sessions-w); background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  body.sessions-collapsed #sessions { display:none; }
+  /* 会话栏折叠后的展开入口（仿左栏图标 rail） */
+  #sessRail { display:none; width:46px; background:var(--panel); border-right:1px solid var(--line); flex-direction:column; align-items:center; padding-top:12px; }
+  body.sessions-collapsed #sessRail { display:flex; }
+  #sessRail .rail-label { writing-mode:vertical-rl; font-size:12px; color:var(--muted); margin-top:10px; }
+
+  main { flex:1; display:flex; flex-direction:column; min-width:0; }
+
+  /* ---- 分隔条（可拖拽调整大小）---- */
+  .vsplit { flex:0 0 auto; width:5px; cursor:col-resize; background:transparent; }
+  .vsplit:hover { background:#d7dde6; }
+  .hsplit { flex:0 0 auto; height:5px; cursor:row-resize; background:transparent; }
+  .hsplit:hover { background:#d7dde6; }
+  /* 折叠态下对应分隔条无意义，隐藏 */
+  body.sidebar-collapsed #splitSidebar { display:none; }
+  body.sessions-collapsed #splitSessions { display:none; }
+
+  .icon-btn { cursor:pointer; border:1px solid var(--line); background:#fff; border-radius:6px; padding:2px 9px; font-size:14px; line-height:1.4; color:var(--muted); }
+  .icon-btn:hover { background:#eef2f8; color:var(--txt); }
+  .side-head { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--line); }
+  .side-head h1 { font-size:15px; margin:0; }
+  #tree { flex:1; overflow:auto; padding:8px 10px; }
+  .node { padding:4px 6px; border-radius:6px; display:flex; align-items:center; gap:6px; }
+  .node.proj { font-weight:600; margin-top:8px; }
+  .node.team { margin-left:14px; color:#445; }
+  .node.agent { margin-left:28px; font-size:13px; color:#334; }
+  .node.agent .chev { cursor:default; }
+  .node.selectable { cursor:pointer; }
+  .node.selectable:hover { background:#eef2f8; }
+  .node.selected { background:#eaf1ff; }
+  .chev { width:16px; text-align:center; color:var(--muted); cursor:pointer; user-select:none; flex:0 0 auto; font-size:11px; }
+  .chev:hover { color:var(--txt); }
+  .nm { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .badge { font-size:10px; padding:1px 5px; border-radius:4px; color:#667; background:#eef1f5; flex:0 0 auto; }
+  .b-proj { background:#dfe7ff; color:#2f6df6; }
+  .b-team { background:#e3f5ea; color:#1f9d55; }
+  .b-agent { background:#fff0db; color:#b9760a; }
+  .tag { font-size:11px; padding:1px 6px; border-radius:10px; color:#fff; flex:0 0 auto; }
+  .tag.claude-code { background:var(--claude); }
+  .tag.codex { background:var(--codex); }
+  .tag.fake { background:#e08a00; }
+  /* agent 节点上的「模型」标签：直接显示该 agent 连的模型，名称不被模型绑定 */
+  .tag.model-local { background:#7c3aed; }    /* 本地网关模型（base_url 已配） */
+  .tag.model-cloud { background:#3b6fb0; }    /* 显式指定的云端模型 */
+  .tag.model-default { background:#8893a5; }  /* 未配置：走 Claude Code 全局默认 */
+  .edit-btn { border:none; background:transparent; color:var(--muted); cursor:pointer; font-size:12px; padding:1px 5px; border-radius:5px; flex:0 0 auto; }
+  .edit-btn:hover { background:#e3e8ef; color:var(--txt); }
+  .ops { padding:10px 12px; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:6px; }
+  .rail-proj { width:38px; height:38px; border-radius:9px; background:#dfe7ff; color:#2f6df6; font-weight:700;
+               display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:15px; }
+  .rail-proj:hover, .rail-proj.active { background:var(--claude); color:#fff; }
+
+  button { cursor:pointer; border:1px solid var(--line); background:#fff; border-radius:6px; padding:5px 9px; font-size:12px; }
+  button:hover { background:#eef1f5; }
+  button.primary { background:var(--claude); color:#fff; border-color:var(--claude); }
+  button.ghost { background:transparent; color:var(--muted); border-style:dashed; }
+
+  /* ---- 中栏会话 ---- */
+  .sessions-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 14px; border-bottom:1px solid var(--line); }
+  .sessions-head span { font-weight:600; font-size:14px; }
+  .sessions-head .right { display:flex; gap:6px; align-items:center; }
+  #sessionList { flex:1; overflow:auto; padding:8px; }
+  .sess-card { position:relative; padding:8px 10px; border-radius:8px; margin-bottom:6px; border:1px solid var(--line); cursor:pointer; background:#fff; }
+  .sess-card:hover { background:#eef2f8; }
+  .sess-card.active { border-color:var(--claude); background:#eaf1ff; }
+  .sess-title { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:34px; }
+  .sess-meta { font-size:11px; color:var(--muted); margin-top:2px; }
+  .sess-badges { margin-top:4px; display:flex; gap:4px; flex-wrap:wrap; }
+  .sess-badges .badge { margin:0; }
+  .sess-prev { font-size:12px; color:var(--muted); margin-top:4px; max-height:32px; overflow:hidden; }
+  .sess-del { position:absolute; top:6px; right:6px; font-size:11px; padding:1px 6px; color:#c33; border-color:#e88; }
+  .sess-empty { padding:14px 10px; color:var(--muted); font-size:12px; line-height:1.6; }
+
+  /* ---- 右栏 ---- */
+  #ctxHead { display:flex; align-items:center; gap:10px; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
+  #ctxTitle { font-weight:600; }
+  .ctx-meta { font-size:12px; color:var(--muted); }
+  #ctxHead .ghost { margin-left:auto; font-size:12px; padding:3px 8px; }
+  #chat { flex:1; min-height:0; overflow:auto; padding:16px 20px; }
+  .row { display:flex; margin:10px 0; }
+  .row.human { justify-content:flex-end; }
+  .bubble { max-width:78%; padding:10px 13px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
+  .bubble.claude-code { background:#eaf1ff; border:1px solid #cfe0ff; }
+  .bubble.codex { background:#e6f6ec; border:1px solid #c7ecd4; }
+  .bubble.fake { background:#fff4e6; border:1px solid #ffd8a8; }
+  .bubble.human { background:#fff2dc; border:1px solid #ffe0a8; }
+  .bubble.sys { background:#f0f1f3; border:1px solid var(--line); color:var(--muted); font-size:12px; max-width:90%; }
+  .bubble.thinking { background:#f7f7fb; border:1px solid #e6e6ef; border-left:3px solid #c4c4d4; color:#6b6b76; max-width:84%; font-size:12.5px; border-radius:10px; }
+  .bubble.thinking summary { cursor:pointer; color:#8a8a96; font-size:12px; user-select:none; list-style:none; padding:3px 2px; display:flex; align-items:center; gap:4px; }
+  .bubble.thinking summary::-webkit-details-marker { display:none; }
+  .bubble.thinking summary .th-title { font-weight:500; }
+  .bubble.thinking summary .tw { margin-left:auto; color:#bcbcc8; font-size:11px; }
+  .bubble.thinking[open] summary .tw::after { content:" ▾ 收起"; }
+  .bubble.thinking:not([open]) summary .tw::after { content:" ▸ 展开"; }
+  .bubble.thinking .thinking-body { margin-top:6px; padding:8px 10px; background:#fff; border:1px solid #ededf3; border-radius:8px; white-space:pre-wrap; word-break:break-word; line-height:1.55; }
+  /* 思考块 / 系统消息内的 markdown 排版（与 agent 正文一致，但配色沿用各自气泡） */
+  .bubble.thinking .thinking-body p, .bubble.sys p { margin:0 0 6px; }
+  .bubble.thinking .thinking-body p:last-child, .bubble.sys p:last-child { margin-bottom:0; }
+  .bubble.thinking .thinking-body h1, .bubble.thinking .thinking-body h2, .bubble.thinking .thinking-body h3,
+  .bubble.thinking .thinking-body h4, .bubble.thinking .thinking-body h5, .bubble.thinking .thinking-body h6,
+  .bubble.sys h1, .bubble.sys h2, .bubble.sys h3, .bubble.sys h4, .bubble.sys h5, .bubble.sys h6 { margin:6px 0 4px; line-height:1.3; }
+  .bubble.thinking .thinking-body ul, .bubble.thinking .thinking-body ol, .bubble.sys ul, .bubble.sys ol { margin:4px 0 6px; padding-left:20px; }
+  .bubble.thinking .thinking-body li, .bubble.sys li { margin:2px 0; }
+  .bubble.thinking .thinking-body pre, .bubble.sys pre { background:#f4f4f8; border:1px solid #e6e6ef; padding:8px 10px; border-radius:6px; overflow:auto; margin:6px 0; }
+  .bubble.thinking .thinking-body code, .bubble.sys code { background:#ededf3; padding:1px 4px; border-radius:3px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.92em; }
+  .bubble.thinking .thinking-body a, .bubble.sys a { color:#3b6fd4; }
+  /* 思考块按 agent 着色 + 标题显示 agent 名 */
+  .bubble.thinking.claude-code { border-left-color:#9ec1ff; }
+  .bubble.thinking.codex { border-left-color:#9bdcb4; }
+  .bubble.thinking.fake { border-left-color:#ffc078; }
+  .bubble.thinking.claude-code summary .th-title { color:#3b6fd4; }
+  .bubble.thinking.codex summary .th-title { color:#2f9e63; }
+  .bubble.thinking.fake summary .th-title { color:#e8851a; }
+  .who { font-size:11px; color:var(--muted); margin-bottom:3px; }
+  #composer { border-top:1px solid var(--line); padding:10px 14px; background:var(--panel); height:var(--composer-h); overflow:auto; }
+  .ctl { display:flex; gap:8px; margin-bottom:8px; align-items:center; flex-wrap:wrap; }
+  select, textarea, input { font:inherit; border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  textarea { width:100%; resize:vertical; min-height:46px; }
+  .status { font-size:12px; color:var(--muted); margin-left:auto; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  /* 对话模式（单 agent）：轮次 / 暂停继续停止 / 人工介入 均不适用，隐藏以免误点 */
+  body.chat-mode #roundRow, body.chat-mode #injectRow, body.chat-mode .debate-only { display:none !important; }
+  #modeTag { padding:1px 7px; border-radius:10px; background:#eef1f5; }
+  body.chat-mode #modeTag { background:#fff0db; color:#b9760a; }
+
+  .modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.3); align-items:center; justify-content:center; }
+  .modal.show { display:flex; }
+  .card { background:#fff; border-radius:10px; padding:18px; width:360px; display:flex; flex-direction:column; gap:8px; }
+  .card h3 { margin:0 0 6px; }
+  #promptCard .badge { display:inline-block; background:#fef3e2; color:#b45309; border:1px solid #fcd9a8; border-radius:6px; padding:1px 6px; font-size:11px; margin-left:6px; }
+  pre.prompt-text { white-space:pre-wrap; word-break:break-word; background:#f7f8fa; border-radius:6px; padding:10px; margin:6px 0 0; font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; max-height:300px; overflow:auto; }
+  .hint { color:var(--muted); font-size:12px; }
+  .model-box { margin:6px 0 10px; padding:10px 12px; border:1px solid var(--border); border-left:3px solid var(--claude); border-radius:8px; background:rgba(211, 43, 24, 0.05); }
+  .model-box b { font-size:14px; color:var(--fg); }
+  .fs-path { font-size:12px; color:var(--muted); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; word-break:break-all; }
+  .fs-list { max-height:300px; overflow:auto; border:1px solid var(--line); border-radius:6px; }
+  .fs-item { padding:7px 10px; cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
+  .fs-item:hover { background:#e3f5ea; }
+  .fs-item.up { color:var(--codex); font-style:italic; }
+  .fs-enter { color:var(--muted); font-size:12px; }
+  .fs-empty { padding:10px; color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+  <!-- 左栏：项目树（常驻、直观）。「-」折叠成图标栏；编辑走行内 ✎ 图标 -->
+  <aside id="sidebar">
+    <div class="side-head">
+      <h1>项目</h1>
+      <button class="icon-btn" id="btnCollapse" onclick="toggleSidebar()" title="隐藏项目栏">–</button>
+    </div>
+    <div id="tree"></div>
+    <div class="ops">
+      <button onclick="openProjectForm()">+ 项目</button>
+      <button onclick="openTeamForm()">+ Team</button>
+      <button onclick="openAgentForm()">+ Agent</button>
+      <button id="btnSettings" onclick="openSettings()" title="全局设置">⚙ 设置</button>
+    </div>
+  </aside>
+  <div class="vsplit" id="splitSidebar" title="拖动调整项目栏宽度"></div>
+
+  <!-- 折叠态：左侧图标栏（点图标重新展开） -->
+  <aside id="rail">
+    <button class="icon-btn" onclick="toggleSidebar()" title="显示项目栏">»</button>
+    <div id="railProjects"></div>
+    <button class="icon-btn" id="btnSettingsRail" onclick="openSettings()" title="全局设置" style="margin-top:auto; margin-bottom:12px;">⚙</button>
+  </aside>
+
+  <!-- 中栏：会话列表（当前选中项目）。可折叠 -->
+  <section id="sessions">
+    <div class="sessions-head">
+      <span>会话</span>
+      <div class="right">
+        <button class="icon-btn" id="btnSessCollapse" onclick="toggleSessions()" title="隐藏会话栏">–</button>
+        <button class="ghost" id="btnNew" onclick="openNewSession()">＋ 新</button>
+      </div>
+    </div>
+    <div id="sessionList"></div>
+  </section>
+
+  <!-- 会话栏折叠后的展开入口：点击重新显示会话列表 -->
+  <div id="sessRail">
+    <button class="icon-btn" onclick="toggleSessions()" title="显示会话栏">≫</button>
+    <div class="rail-label">会话</div>
+  </div>
+  <div class="vsplit" id="splitSessions" title="拖动调整会话栏宽度"></div>
+
+  <!-- 右栏：聊天 + composer -->
+  <main>
+    <div id="ctxHead">
+      <div>
+        <div id="ctxTitle">未选择会话</div>
+        <div class="ctx-meta" id="ctxMeta"></div>
+      </div>
+      <button class="ghost" onclick="openPromptLog()">提示词</button>
+    </div>
+    <div id="chat"></div>
+    <div class="hsplit" id="splitChat" title="拖动调整聊天区 / 输入区高度"></div>
+    <div id="composer">
+      <div class="ctl">
+        <span class="ctx-meta" id="composerProj">项目：—</span>
+        <label>Team <select id="selTeam" onchange="updateRoundControl()"></select></label>
+        <span class="ctx-meta" id="modeTag"></span>
+        <button class="primary" id="btnStart" onclick="startSession()">开始讨论</button>
+        <span id="ctrlBtns" class="debate-only" style="display:inline-flex; gap:8px;">
+          <button onclick="ctrl('pause')">暂停</button>
+          <button onclick="ctrl('resume')">继续</button>
+          <button onclick="ctrl('stop')">停止</button>
+        </span>
+        <span class="status" id="status">未连接</span>
+      </div>
+      <textarea id="task" placeholder="输入任务 / 讨论主题，然后点「开始讨论」…"></textarea>
+      <div id="roundRow" style="margin-top:6px; display:flex; gap:8px; align-items:center;">
+        <label style="display:flex; gap:6px; align-items:center;">最大轮次
+          <input id="maxRounds" type="number" min="1" value="" style="width:64px;" />
+        </label>
+        <span class="hint" id="roundHint" style="margin:0;">轮到某个 agent 说一次算一轮；默认取全局设置</span>
+      </div>
+      <div id="injectRow" style="margin-top:6px; position:relative;">
+        <textarea id="inject" style="width:100%; resize:vertical; min-height:64px; padding:8px 78px 8px 8px; box-sizing:border-box;" rows="2" placeholder="人工介入：讨论进行中插入一条人类消息（下一轮 agent 基于它继续）"></textarea>
+        <button class="primary" onclick="doInject()" style="position:absolute; right:8px; bottom:8px; min-width:56px; border-radius:16px; padding:6px 14px; font-weight:600;">介入</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- 新建会话：选 Team（+ 标题） -->
+  <div class="modal" id="newModal">
+    <div class="card" id="newCard"></div>
+  </div>
+
+  <!-- 表单 / 编辑弹窗 -->
+  <div class="modal" id="modal">
+    <div class="card" id="modalCard"></div>
+  </div>
+
+  <!-- 目录选择器 -->
+  <div class="modal" id="fsModal">
+    <div class="card" id="fsCard"></div>
+  </div>
+
+  <!-- 提示词日志：查看每轮发给 agent 的完整 prompt -->
+  <div class="modal" id="promptModal">
+    <div class="card" id="promptCard" style="width:min(760px,92vw); max-height:84vh; overflow:auto;"></div>
+  </div>
+
+<script>
+var WS = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+var chat = document.getElementById('chat');
+var cfg = { projects: [], teams: [], agents: {} };
+var agentNameColor = {};
+var cur = null;
+var curSid = null;          // 当前选中的会话 id
+var curPid = null;          // 当前选中的项目 id
+var curTid = null;          // 当前会话所用 Team id（composer 下拉 / 单 agent 判定）
+var curProjSessions = [];   // 当前项目的会话列表
+var curMsgCount = 0;        // 当前会话已有消息条数（决定主按钮文案）
+var running = false;        // 是否有会话正在跑（跑的时候禁用主按钮）
+var expanded = { projects: {}, teams: {} };  // 树展开状态
+
+WS.onopen = function () { setStatus('已连接', true); };
+WS.onclose = function () { setStatus('断开', false); };
+WS.onmessage = function (e) { handleEvent(JSON.parse(e.data)); };
+window.onerror = function (msg) { setStatus('JS错误: ' + msg, false); };
+// 点弹窗背景关闭（不含 promptModal 的卡片内部）
+document.getElementById('promptModal').addEventListener('click', function (e) {
+  if (e.target === this) closePromptLog();
+});
+
+// ---- 布局拖拽（列宽 + 聊天/输入区高度，记忆到 localStorage）----
+function applySizes() {
+  try {
+    var s = JSON.parse(localStorage.getItem('agentchat_sizes') || '{}');
+    if (s.sidebarW) document.body.style.setProperty('--sidebar-w', s.sidebarW + 'px');
+    if (s.sessionsW) document.body.style.setProperty('--sessions-w', s.sessionsW + 'px');
+    if (s.composerH) document.body.style.setProperty('--composer-h', s.composerH + 'px');
+  } catch (e) {}
+}
+function saveSizes() {
+  try {
+    var cs = getComputedStyle(document.body);
+    localStorage.setItem('agentchat_sizes', JSON.stringify({
+      sidebarW: parseFloat(cs.getPropertyValue('--sidebar-w')),
+      sessionsW: parseFloat(cs.getPropertyValue('--sessions-w')),
+      composerH: parseFloat(cs.getPropertyValue('--composer-h')),
+    }));
+  } catch (e) {}
+}
+function makeVsplit(elId, varName, dir) {
+  var el = document.getElementById(elId);
+  if (!el) return;
+  var dft = varName === '--sidebar-w' ? 264 : 280;
+  el.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    var startX = e.clientX;
+    var start = parseFloat(getComputedStyle(document.body).getPropertyValue(varName));
+    if (isNaN(start)) start = dft;
+    document.body.style.userSelect = 'none'; document.body.style.cursor = 'col-resize';
+    function mv(ev) {
+      var v = start + (dir > 0 ? (ev.clientX - startX) : -(ev.clientX - startX));
+      v = Math.max(160, Math.min(520, v));
+      document.body.style.setProperty(varName, v + 'px');
+    }
+    function up() {
+      document.removeEventListener('mousemove', mv);
+      document.removeEventListener('mouseup', up);
+      document.body.style.userSelect = ''; document.body.style.cursor = '';
+      saveSizes();
+    }
+    document.addEventListener('mousemove', mv);
+    document.addEventListener('mouseup', up);
+  });
+}
+function makeHsplit(elId, varName) {
+  var el = document.getElementById(elId);
+  if (!el) return;
+  var dft = 196;
+  el.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    var startY = e.clientY;
+    var start = parseFloat(getComputedStyle(document.body).getPropertyValue(varName));
+    if (isNaN(start)) start = dft;
+    document.body.style.userSelect = 'none'; document.body.style.cursor = 'row-resize';
+    function mv(ev) {
+      var v = start - (ev.clientY - startY);   // 向上拖 → 输入区更高
+      v = Math.max(96, Math.min(window.innerHeight * 0.7, v));
+      document.body.style.setProperty(varName, v + 'px');
+    }
+    function up() {
+      document.removeEventListener('mousemove', mv);
+      document.removeEventListener('mouseup', up);
+      document.body.style.userSelect = ''; document.body.style.cursor = '';
+      saveSizes();
+    }
+    document.addEventListener('mousemove', mv);
+    document.addEventListener('mouseup', up);
+  });
+}
+applySizes();
+makeVsplit('splitSidebar', '--sidebar-w', 1);
+makeVsplit('splitSessions', '--sessions-w', -1);
+makeHsplit('splitChat', '--composer-h');
+
+function setStatus(t, ok) { document.getElementById('status').textContent = t; }
+
+function handleEvent(ev) {
+  switch (ev.type) {
+    case 'system': addRow('sys', '系统', ev.msg); break;
+    // 一次运行结束：对话模式只刷新会话列表（不重载聊天，免得滚动跳走）；
+    // 辩论模式重载为持久化后的权威内容。
+    case 'run_end':
+      running = false; refreshSendBtn();
+      if (!curPid) break;
+      if (ev.mode === 'chat') { refreshSessionList(curPid); }
+      else {
+        setTimeout(function () {
+          loadProjectSessions(curPid).then(function () { if (curSid) openSession(curSid); });
+        }, 250);
+      }
+      break;
+    case 'human': addRow('human', ev.role || '人工介入', ev.text); break;
+    case 'error': addRow('sys', '错误', ev.text); break;
+    case 'turn_start':
+      agentNameColor[ev.agent] = ev.atype || 'claude-code';
+      curTurnAgent = ev.agent;
+      break;  // 气泡懒建：第一个 thinking / token 事件来时再建对应块
+    case 'thinking':
+      curTurnAgent = ev.agent || curTurnAgent;
+      appendThinking(ev.agent, ev.text, agentNameColor[ev.agent]);
+      break;
+    case 'token':
+      curTurnAgent = ev.agent || curTurnAgent;
+      appendToken(ev.agent, ev.text);
+      break;
+    case 'turn_end':
+      // 推理模型 answer 为空时，正文气泡可能未创建；建一个空气泡并提示用户看思考块。
+      if (!cur && curThinking && curThinking.textContent.trim()) {
+        startBubble(curTurnAgent || ev.agent || 'Agent', agentNameColor[curTurnAgent || ev.agent] || 'claude-code');
+      }
+      if (cur) {
+        if (!cur.textContent.trim() && curThinking && curThinking.textContent.trim()) {
+          cur.innerHTML = '<em class="no-answer">（本轮未输出独立结论，见上方思考过程）</em>';
+        } else if (cur.textContent.trim()) {
+          cur.innerHTML = mdToHtml(cur.textContent);
+        }
+      }
+      curTurnAgent = null; endBubble(); endThinking(); break;
+  }
+}
+
+function startBubble(name, atype) {
+  var row = document.createElement('div'); row.className = 'row';
+  var b = document.createElement('div'); b.className = 'bubble ' + (atype || 'claude-code');
+  b.innerHTML = '<div class="who">' + esc(name) + '</div><div class="body"></div>';
+  row.appendChild(b); chat.appendChild(row); cur = b.querySelector('.body');
+  chat.scrollTop = chat.scrollHeight;
+}
+var curTurnAgent = null;     // 当前轮次发言的 agent，turn_end 回填答案/建气泡用
+var curThinking = null;
+var curThinkingTw = null;
+var curThinkingCnt = 0;
+function startThinking(name, atype) {
+  var row = document.createElement('div'); row.className = 'row';
+  var b = document.createElement('details'); b.className = 'bubble thinking' + (atype ? ' ' + atype : ''); b.open = true;
+  var sum = document.createElement('summary');
+  var title = document.createElement('span'); title.className = 'th-title'; title.textContent = '💭 ' + (name || 'Agent') + ' 的思考过程';
+  var tw = document.createElement('span'); tw.className = 'tw';
+  sum.appendChild(title); sum.appendChild(tw);
+  var body = document.createElement('div'); body.className = 'thinking-body';
+  b.appendChild(sum); b.appendChild(body);
+  row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+  curThinking = body; curThinkingTw = tw; curThinkingCnt = 0;
+}
+function appendThinking(name, text, atype) {
+  if (!curThinking) startThinking(name, atype);
+  curThinking.textContent += text; curThinkingCnt += text.length;
+  if (curThinkingTw) curThinkingTw.textContent = curThinkingCnt + ' 字';
+  chat.scrollTop = chat.scrollHeight;
+}
+function endThinking() {
+  // 整轮结束：思考块内容渲染为 markdown（思考仍是可折叠思考块，不被当正文），随后自动收起
+  if (curThinking) {
+    curThinking.innerHTML = mdToHtml(curThinking.textContent);
+    var det = curThinking.closest('details');
+    if (det) det.open = false;
+  }
+  curThinking = null; curThinkingTw = null; curThinkingCnt = 0;
+}
+function appendToken(name, text) {
+  if (!cur) startBubble(name, agentNameColor[name] || 'claude-code');
+  cur.textContent += text; chat.scrollTop = chat.scrollHeight;
+}
+function endBubble() { cur = null; }
+function addRow(cls, who, text) {
+  var row = document.createElement('div'); row.className = 'row' + (cls === 'human' ? ' human' : '');
+  var b = document.createElement('div'); b.className = 'bubble ' + cls;
+  // 系统消息 / 人工介入支持 markdown；错误等纯文本保持转义
+  var rich = (cls === 'sys' || cls === 'human') ? mdToHtml(text) : esc(text);
+  b.innerHTML = '<div class="who">' + esc(who) + '</div>' + rich;
+  row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+}
+function esc(s) { return (s || '').replace(/[&<>]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]; }); }
+// 渲染兜底：剥离 gemma 等推理模型在思考/答案间吐的 --- 分隔符（与后端 _clean_answer 一致，仅去首尾），
+// 盘里若有历史脏数据也不在气泡里显示成 ---/--。
+function cleanSep(s) { return (s || '').replace(/^\s*---\s*/, '').replace(/\s*---\s*$/, '').trim(); }
+
+// 轻量 Markdown 渲染：支持代码块、行内代码、标题、列表、粗斜体、链接、水平线。
+// 先转义 HTML 再替换标签，避免 XSS；不依赖外部库。
+function mdToHtml(src) {
+  if (!src) return '';
+  var lines = src.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  var out = [];
+  var inCode = false, codeBuf = [], codeLang = '';
+  function escHtml(s) {
+    return s.replace(/[&<>]/g, function (c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]; });
+  }
+  function inline(s) {
+    return escHtml(s)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+  function flushPara(buf) {
+    if (!buf.length) return;
+    out.push('<p>' + inline(buf.join(' ')) + '</p>');
+  }
+  var para = [];
+  for (var i = 0; i < lines.length; i++) {
+    var ln = lines[i];
+    if (/^```/.test(ln)) {
+      flushPara(para); para = [];
+      if (!inCode) {
+        inCode = true;
+        codeLang = ln.replace(/^```\s*/, '').trim();
+        codeBuf = [];
+      } else {
+        out.push('<pre><code' + (codeLang ? ' class="lang-' + escHtml(codeLang) + '"' : '') + '>' + escHtml(codeBuf.join('\n')) + '</code></pre>');
+        inCode = false; codeLang = ''; codeBuf = [];
+      }
+      continue;
+    }
+    if (inCode) { codeBuf.push(ln); continue; }
+    if (/^\s*---+\s*$|^\s*\*\*\*+\s*$|^\s*___+\s*$/.test(ln)) { flushPara(para); para = []; out.push('<hr>'); continue; }
+    var h = ln.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { flushPara(para); para = []; out.push('<h' + h[1].length + '>' + inline(h[2]) + '</h' + h[1].length + '>'); continue; }
+    var ul = ln.match(/^(\s*)[-*]\s+(.*)$/);
+    if (ul) { flushPara(para); para = []; var items = [inline(ul[2])]; while (i+1 < lines.length && /^(\s*)[-*]\s+(.*)$/.test(lines[i+1])) { i++; var m = lines[i].match(/^(\s*)[-*]\s+(.*)$/); items.push(inline(m[2])); } out.push('<ul>' + items.map(function(x){return '<li>'+x+'</li>';}).join('') + '</ul>'); continue; }
+    var ol = ln.match(/^(\s*)\d+\.\s+(.*)$/);
+    if (ol) { flushPara(para); para = []; var items = [inline(ol[2])]; while (i+1 < lines.length && /^(\s*)\d+\.\s+(.*)$/.test(lines[i+1])) { i++; var m = lines[i].match(/^(\s*)\d+\.\s+(.*)$/); items.push(inline(m[2])); } out.push('<ol>' + items.map(function(x){return '<li>'+x+'</li>';}).join('') + '</ol>'); continue; }
+    if (/^\s*$/.test(ln)) { flushPara(para); para = []; continue; }
+    para.push(ln.trim());
+  }
+  if (inCode) {
+    out.push('<pre><code' + (codeLang ? ' class="lang-' + escHtml(codeLang) + '"' : '') + '>' + escHtml(codeBuf.join('\n')) + '</code></pre>');
+  }
+  flushPara(para);
+  return out.join('');
+}
+
+function loadConfig() {
+  return fetch('/api/config', { cache: 'no-store' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (d) {
+      var rawAgents = d.agents || {};
+      cfg = { agents: {}, teams: d.teams || [], projects: d.projects || [], settings: d.settings || { default_timeout: 300 } };
+      if (Array.isArray(rawAgents)) {
+        rawAgents.forEach(function (a) { if (a && a.id) cfg.agents[a.id] = a; });
+      } else {
+        Object.keys(rawAgents).forEach(function (k) { cfg.agents[k] = rawAgents[k]; });
+      }
+      // 默认展开全部项目与 Team，使项目树直观可见（用户要"项目列表直观"）
+      cfg.projects.forEach(function (p) { expanded.projects[p.id] = true; });
+      cfg.teams.forEach(function (t) { expanded.teams[t.id] = true; });
+      renderTree();
+      renderRail();
+      // 自动选中第一个项目并加载其会话（加载即恢复，刷新不丢）
+      if (cfg.projects.length) selectProject(cfg.projects[0].id);
+      else { curPid = null; composeClear(); applyMode(); setStatus('已连接', true); }
+      setStatus('已连接', true);
+    })
+    .catch(function (e) { setStatus('配置加载失败: ' + e.message, false); });
+}
+
+// ---- 项目树（项目可展开 Team/Agent；点击名=选中，点击 ✎=编辑）----
+function renderTree() {
+  var t = document.getElementById('tree'); t.innerHTML = '';
+  // 归属关系（与展开/折叠无关）：被任意 project/team 收纳即不算未分组。
+  // 折叠只是隐藏子树，不改变归属，因此「未分组」只能用归属判定，不能用渲染可见性判定。
+  var assignedTeams = {}, assignedAgents = {};
+  cfg.projects.forEach(function (p) {
+    (p.team_ids || []).forEach(function (tid) { assignedTeams[tid] = true; });
+  });
+  cfg.teams.forEach(function (tm) {
+    (tm.agent_ids || []).forEach(function (aid) { assignedAgents[aid] = true; });
+  });
+  cfg.projects.forEach(function (p) {
+    t.appendChild(projNode(p));
+    if (expanded.projects[p.id]) {
+      cfg.teams.filter(function (tm) { return p.team_ids.indexOf(tm.id) >= 0; }).forEach(function (tm) {
+        t.appendChild(teamNode(tm));
+        if (expanded.teams[tm.id]) {
+          tm.agent_ids.forEach(function (aid) {
+            if (!cfg.agents[aid]) return;
+            t.appendChild(agentNode(cfg.agents[aid]));
+          });
+        }
+      });
+    }
+  });
+  var orphanTeams = cfg.teams.filter(function (tm) { return !assignedTeams[tm.id]; });
+  if (orphanTeams.length) {
+    t.appendChild(el('div', 'node proj', '未分组的 Team'));
+    orphanTeams.forEach(function (tm) {
+      t.appendChild(teamNode(tm));
+      if (expanded.teams[tm.id]) {
+        tm.agent_ids.forEach(function (aid) {
+          if (!cfg.agents[aid]) return;
+          t.appendChild(agentNode(cfg.agents[aid]));
+        });
+      }
+    });
+  }
+  var orphanAgents = Object.keys(cfg.agents).filter(function (k) { return !assignedAgents[k]; });
+  if (orphanAgents.length) {
+    t.appendChild(el('div', 'node proj', '未分组的 Agent'));
+    orphanAgents.forEach(function (k) { t.appendChild(agentNode(cfg.agents[k])); });
+  }
+}
+function projNode(p) {
+  var row = el('div', 'node proj selectable' + (p.id === curPid ? ' selected' : ''), '');
+  var chev = el('span', 'chev', expanded.projects[p.id] ? '▾' : '▸');
+  chev.onclick = function (e) { e.stopPropagation(); expanded.projects[p.id] = !expanded.projects[p.id]; renderTree(); };
+  var bEl = badge('b-proj', '项目');
+  var nm = el('span', 'nm', p.name);
+  nm.onclick = function (e) { e.stopPropagation(); selectProject(p.id); };
+  var edit = editBtn(function (e) { e.stopPropagation(); editProject(p.id); });
+  row.appendChild(chev); row.appendChild(bEl); row.appendChild(nm); row.appendChild(edit);
+  return row;
+}
+function teamNode(tm) {
+  var row = el('div', 'node team selectable', '');
+  var chev = el('span', 'chev', expanded.teams[tm.id] ? '▾' : '▸');
+  chev.onclick = function (e) { e.stopPropagation(); expanded.teams[tm.id] = !expanded.teams[tm.id]; renderTree(); };
+  var bEl = badge('b-team', 'Team');
+  var nm = el('span', 'nm', tm.name);
+  nm.onclick = function (e) { e.stopPropagation(); selectTeam(tm.id); };
+  var edit = editBtn(function (e) { e.stopPropagation(); editTeam(tm.id); });
+  row.appendChild(chev); row.appendChild(bEl); row.appendChild(nm); row.appendChild(edit);
+  return row;
+}
+// 计算某 agent 当前生效的模型名（用于配置表单的「当前生效模型」展示）
+function effectiveModelName(a) {
+  if (a && a.base_url) return a.model || '本地网关';
+  if (a && a.model) return a.model;
+  if (a && a.type === 'claude-code') {
+    return (cfg.settings && cfg.settings.default_model) ? cfg.settings.default_model : '默认';
+  }
+  if (a && a.type === 'codex') {
+    return (cfg.settings && cfg.settings.default_model_codex) ? cfg.settings.default_model_codex : '默认';
+  }
+  return '默认';
+}
+
+function agentModelLabel(a) {
+  // 直接显示该 agent 连的模型，不靠名称推断：
+  // - 配了 base_url → 本地网关模型（model 或「本地网关」）
+  // - 未配 base_url 但显式指定 model → 该云端模型
+  // - 都未配 → claude-code / codex 走各自全局默认模型（后端探测 CLI 当前默认，展示真实名，如 claude-sonnet-4-… / deepseek-v4-flash）；
+  //           fake 等无探测则显示「默认」
+  if (a.base_url) return { text: a.model || '本地网关', cls: 'model-local' };
+  if (a.model) return { text: a.model, cls: 'model-cloud' };
+  if (a.type === 'claude-code') {
+    var dm = (cfg.settings && cfg.settings.default_model) ? cfg.settings.default_model : '';
+    return dm ? { text: dm, cls: 'model-default' } : { text: '默认', cls: 'model-default' };
+  }
+  if (a.type === 'codex') {
+    var dmc = (cfg.settings && cfg.settings.default_model_codex) ? cfg.settings.default_model_codex : '';
+    return dmc ? { text: dmc, cls: 'model-default' } : { text: '默认', cls: 'model-default' };
+  }
+  return { text: '默认', cls: 'model-default' };
+}
+
+function agentNode(a) {
+  var row = el('div', 'node agent selectable', '');
+  // 占位折叠箭头：agent 无子级不可点，但需占与 Team/项目相同的 16px 宽度，
+  // 否则 margin-left(28px) 会因缺少 chevron 而视觉上浅于 team(14px+chevron)，与分级相反。
+  row.appendChild(el('span', 'chev', ''));
+  var bEl = badge('b-agent', 'Agent');
+  var nm = el('span', 'nm', a.name);
+  nm.onclick = function (e) { e.stopPropagation(); selectAgent(a.id); };
+  var tag = el('span', 'tag ' + a.type, a.type);
+  var m = agentModelLabel(a);
+  var mtag = el('span', 'tag ' + m.cls, m.text);
+  mtag.title = a.base_url ? ('本地模型网关：' + a.base_url) : (a.model ? ('云端模型：' + a.model) : 'Claude Code 全局默认模型');
+  var edit = editBtn(function (e) { e.stopPropagation(); editAgent(a.id); });
+  row.appendChild(bEl); row.appendChild(nm); row.appendChild(tag); row.appendChild(mtag); row.appendChild(edit);
+  return row;
+}
+function editBtn(fn) { var b = document.createElement('button'); b.className = 'edit-btn'; b.textContent = '✎'; b.title = '编辑'; b.onclick = fn; return b; }
+function el(tag, cls, txt) { var e = document.createElement(tag); e.className = cls; if (txt) e.textContent = txt; return e; }
+function badge(cls, txt) { var b = document.createElement('span'); b.className = 'badge ' + cls; b.textContent = txt; return b; }
+function projectById(id) { return (cfg.projects || []).filter(function (x) { return x.id === id; })[0]; }
+function teamById(id) { return (cfg.teams || []).filter(function (x) { return x.id === id; })[0]; }
+
+// 选中项目：高亮 + composer 显示项目名 + 填充 Team 下拉 + 中栏加载会话
+function selectProject(pid) {
+  curPid = pid; curSid = null; curTid = null;
+  renderTree(); renderRail();
+  var p = projectById(pid);
+  document.getElementById('composerProj').textContent = '项目：' + (p ? p.name : '—');
+  fillTeamSelect(p);
+  updateRoundControl();
+  loadProjectSessions(pid);
+  composeClear();
+}
+function fillTeamSelect(p) {
+  var sel = document.getElementById('selTeam'); sel.innerHTML = '';
+  var teams = p ? (p.team_ids || []).map(teamById).filter(Boolean) : [];
+  if (!teams.length) { sel.innerHTML = '<option value="">（无 Team）</option>'; curTid = null; return; }
+  teams.forEach(function (t) { var o = document.createElement('option'); o.value = t.id; o.textContent = t.name; sel.appendChild(o); });
+  curTid = teams[0].id;
+}
+function selectTeam(tid) {
+  document.getElementById('selTeam').value = tid; curTid = tid; updateRoundControl();
+}
+function selectAgent(aid) {
+  var a = cfg.agents[aid]; if (!a) return;
+  var tm = (cfg.teams || []).filter(function (t) { return (t.agent_ids || []).indexOf(aid) >= 0; })[0];
+  if (!tm) { setStatus('该 agent 未加入任何 Team', false); return; }
+  document.getElementById('selTeam').value = tm.id; curTid = tm.id; updateRoundControl();
+  setStatus('已选单 agent：' + a.name + '（Team：' + tm.name + '）', true);
+}
+
+function teamAgentCount(tid) {
+  var tm = teamById(tid);
+  return tm ? (tm.agent_ids || []).length : 0;
+}
+// 全局默认轮次上限（存 config.json settings.default_max_rounds）；composer 的 maxRounds 默认值来源
+function defaultMaxRounds() {
+  return (cfg && cfg.settings && cfg.settings.default_max_rounds) ? cfg.settings.default_max_rounds : 12;
+}
+// 轮次控件跟随 composer 当前 Team：单 agent Team 时置灰（单 agent = 对话模式，轮次不生效）
+function updateRoundControl() {
+  if (!cfg) return;
+  var tid = document.getElementById('selTeam').value || curTid || '';
+  var n = teamAgentCount(tid);
+  var mr = document.getElementById('maxRounds');
+  var hint = document.getElementById('roundHint');
+  if (n < 2) {
+    mr.disabled = true; mr.value = 1;
+    hint.textContent = '单 agent 模式：退回人机对话，直接发消息即可（Team 需≥2个agent 才进入辩论轮次）';
+    hint.style.color = 'var(--codex)';
+  } else {
+    mr.disabled = false;
+    // 从单 agent 切回 / 初次进入辩论模式时，回填全局默认轮次（而非硬编码 12）
+    if (mr.value === '1' || mr.value === '') mr.value = defaultMaxRounds();
+    hint.textContent = '轮到某个 agent 说一次算一轮；默认 ' + defaultMaxRounds() + '（可在⚙全局设置改）';
+    hint.style.color = '';
+  }
+  applyMode();
+}
+
+// ---- 两种模式：单 agent = 对话模式（chat）；≥2 agent = 辩论模式（debate）----
+function isChatMode() { return document.body.classList.contains('chat-mode'); }
+function applyMode() {
+  var tid = document.getElementById('selTeam').value || curTid || '';
+  var n = teamAgentCount(tid);
+  var chatMode = n < 2;
+  if (chatMode) document.body.classList.add('chat-mode');
+  else document.body.classList.remove('chat-mode');
+  var tag = document.getElementById('modeTag');
+  if (tag) tag.textContent = chatMode ? '对话模式（单 agent）' : '辩论模式（' + n + ' agents）';
+  var ta = document.getElementById('task');
+  if (ta) {
+    ta.placeholder = chatMode
+      ? '输入消息，Enter 发送、Shift+Enter 换行…'
+      : '输入任务 / 讨论主题，然后点「开始讨论」…';
+  }
+  refreshSendBtn();
+}
+// 主按钮文案随模式与会话状态变化：对话模式=发送；辩论模式=开始/继续讨论
+function refreshSendBtn() {
+  var b = document.getElementById('btnStart');
+  if (!b) return;
+  if (running) { b.disabled = true; b.textContent = isChatMode() ? '回复中…' : '讨论进行中…'; return; }
+  // 输入为空时禁用：对话模式不能发空消息；辩论模式不能发起/继续空议题
+  // （达成一致后若想继续，必须输入新议题；空点「继续讨论」不应再让 agent 空跑）
+  var empty = !document.getElementById('task').value.trim();
+  b.disabled = empty;
+  b.textContent = isChatMode()
+    ? '发送'
+    : (curMsgCount > 0 ? '继续讨论（已有 ' + curMsgCount + ' 条）' : '开始讨论');
+}
+
+function startSession() {
+  if (running) return;
+  if (!curPid) { alert('请先在左侧选择一个项目'); return; }
+  var tid = document.getElementById('selTeam').value;
+  if (!tid) { alert('该项目暂无 Team，请先创建并挂到项目'); return; }
+  var task = document.getElementById('task').value;
+  if (isChatMode() && !task.trim()) { setStatus('请输入消息内容', false); return; }
+  var n = teamAgentCount(tid);
+  var mr = n < 2 ? 1 : (parseInt(document.getElementById('maxRounds').value, 10) || defaultMaxRounds());
+  var ready = curSid ? Promise.resolve(curSid) : createSessionOnServer((task.trim() || '新会话').slice(0, 24), tid);
+  ready.then(function (sid) {
+    curSid = sid;
+    running = true; refreshSendBtn();
+    WS.send(JSON.stringify({ action: 'start', project_id: curPid, team_id: tid, session_id: sid, task: task, max_rounds: mr }));
+    document.getElementById('task').value = '';  // 内容已作为消息回显，输入框清空
+  }).catch(function (e) { running = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
+}
+function ctrl(a) { WS.send(JSON.stringify({ action: a })); }
+function doInject() {
+  var x = document.getElementById('inject').value.trim();
+  if (!x) { setStatus('介入内容为空', false); return; }
+  WS.send(JSON.stringify({ action: 'inject', text: x }));
+  document.getElementById('inject').value = '';
+}
+function composeClear() {
+  chat.innerHTML = ''; cur = null;
+  document.getElementById('ctxTitle').textContent = '未选择会话';
+  document.getElementById('ctxMeta').textContent = '';
+  curMsgCount = 0; refreshSendBtn();
+}
+
+// ---- 会话（session）：中栏显示当前选中项目的会话，聊天区跟随当前选中会话 ----
+
+// 只刷新中栏列表与头部计数，不动聊天区（对话模式每发一条都要用）
+function refreshSessionList(pid) {
+  if (!pid) return Promise.resolve();
+  return fetch('/api/sessions/' + pid, { cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      curProjSessions = d.sessions || [];
+      renderSessions();
+      var hit = curProjSessions.filter(function (x) { return x.id === curSid; })[0];
+      if (hit) { curMsgCount = hit.message_count != null ? hit.message_count : curMsgCount; updateCtxHead(hit); }
+      refreshSendBtn();
+    })
+    .catch(function () {});
+}
+
+function loadProjectSessions(pid) {
+  if (!pid) { curProjSessions = []; renderSessions(); chat.innerHTML = ''; curMsgCount = 0; refreshSendBtn(); return Promise.resolve(); }
+  return refreshSessionList(pid).then(function () {
+    if (curProjSessions.length) openSession(curProjSessions[0].id);
+    else { chat.innerHTML = ''; addRow('sys', '系统', '（该项目暂无会话，点中栏「＋ 新」创建）'); curMsgCount = 0; refreshSendBtn(); }
+  });
+}
+
+function renderSessions() {
+  var box = document.getElementById('sessionList');
+  box.innerHTML = '';
+  if (!curProjSessions.length) {
+    box.innerHTML = '<div class="sess-empty">该项目暂无会话。<br>点中栏「＋ 新」开始，或在右侧输入任务后点「开始会话」自动建会话。</div>';
+    return;
+  }
+  curProjSessions.forEach(function (s) {
+    var card = document.createElement('div');
+    card.className = 'sess-card' + (s.id === curSid ? ' active' : '');
+    card.onclick = function () { openSession(s.id); };
+    var title = document.createElement('div'); title.className = 'sess-title'; title.textContent = s.title || '会话';
+    var meta = document.createElement('div'); meta.className = 'sess-meta';
+    meta.textContent = (s.updated_at ? s.updated_at : '') + (s.message_count != null ? ' · ' + s.message_count + ' 条' : '');
+    card.appendChild(title); card.appendChild(meta);
+    var badges = document.createElement('div'); badges.className = 'sess-badges';
+    if (s.team_name) badges.appendChild(badge('b-team', s.team_name));
+    card.appendChild(badges);
+    if (s.preview) {
+      var prev = document.createElement('div'); prev.className = 'sess-prev'; prev.textContent = s.preview;
+      card.appendChild(prev);
+    }
+    var del = document.createElement('button'); del.className = 'sess-del'; del.textContent = '删除';
+    del.onclick = function (e) { e.stopPropagation(); delSession(s.id); };
+    card.appendChild(del);
+    box.appendChild(card);
+  });
+}
+
+function openSession(sid) {
+  var s = null;
+  for (var i = 0; i < curProjSessions.length; i++) { if (curProjSessions[i].id === sid) { s = curProjSessions[i]; break; } }
+  if (!s && curPid) s = { id: sid, project_id: curPid, team_id: curTid || '' };
+  if (!s) return;
+  curSid = sid; curPid = s.project_id || curPid; curTid = s.team_id || '';
+  renderSessions();
+  var sel = document.getElementById('selTeam'); if (sel && curTid) sel.value = curTid;
+  updateRoundControl();
+  updateCtxHead(s);
+  fetch('/api/session/' + curPid + '/' + sid, { cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      chat.innerHTML = ''; cur = null; curThinking = null;
+      var msgs = d.messages || [];
+      // 系统消息（终止原因 / 会话结束）不计入「已有 N 条」计数
+      curMsgCount = msgs.filter(function (m) { return m.speaker !== 'system'; }).length;
+      if (!msgs.length) {
+        addRow('sys', '系统', d.exists === false ? '（会话不存在）'
+          : (isChatMode() ? '（新会话：在下方输入消息，Enter 发送）' : '（该会话暂无记录，输入任务点「开始讨论」）'));
+        refreshSendBtn();
+        return;
+      }
+      addRow('sys', '系统', '—— 已恢复会话记录（' + msgs.length + ' 条） ——');
+      msgs.forEach(renderHistoryEntry);
+      if (d.agent_sessions && Object.keys(d.agent_sessions).length) {
+        var asp = Object.keys(d.agent_sessions).map(function (k) {
+          var v = d.agent_sessions[k] || '';
+          return k + ' → ' + (v ? v.slice(0, 8) + '…' : '(未开启)');
+        });
+        addRow('sys', 'agent 持久会话', asp.join('；'));
+      }
+      chat.scrollTop = chat.scrollHeight;
+      refreshSendBtn();
+    })
+    .catch(function () {});
+}
+
+function updateCtxHead(s) {
+  document.getElementById('ctxTitle').textContent = s.title || '会话';
+  var meta = [];
+  if (s.project_name) meta.push(s.project_name);
+  if (s.team_name) meta.push(s.team_name);
+  if (s.message_count != null) meta.push(s.message_count + ' 条');
+  document.getElementById('ctxMeta').textContent = meta.join(' · ');
+}
+
+function renderHistoryEntry(h) {
+  if (h.speaker === 'system') { addRow('sys', h.role || '系统', h.content || ''); return; }
+  if (h.speaker === 'human') { addRow('human', h.role || '人工介入', h.content || ''); return; }
+  var type = cfg_agents_by_name(h.speaker) || 'claude-code';
+  if (h.thinking) renderThinkingBlock(h.speaker, h.thinking, type);
+  startBubble(h.speaker, type);
+  var body = cleanSep(h.content || '');
+  // 旧数据可能把思考内容混进了正文（与 thinking 相同），此时不重复显示
+  if (!body || (h.thinking && body === h.thinking.trim())) {
+    cur.innerHTML = '<em class="no-answer">（本轮未输出独立结论，见上方思考过程）</em>';
+  } else {
+    cur.innerHTML = mdToHtml(body);
+  }
+  endBubble();
+}
+function renderThinkingBlock(name, text, atype) {
+  var row = document.createElement('div'); row.className = 'row';
+  var b = document.createElement('details'); b.className = 'bubble thinking' + (atype ? ' ' + atype : '');
+  b.open = false;  // 历史默认收起，与实时「整轮结束自动收起」一致
+  var sum = document.createElement('summary');
+  var title = document.createElement('span'); title.className = 'th-title'; title.textContent = '💭 ' + (name || 'Agent') + ' 的思考过程';
+  var tw = document.createElement('span'); tw.className = 'tw'; tw.textContent = (text || '').length + ' 字';
+  sum.appendChild(title); sum.appendChild(tw);
+  var body = document.createElement('div'); body.className = 'thinking-body'; body.innerHTML = mdToHtml(text || '');
+  b.appendChild(sum); b.appendChild(body);
+  row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+}
+
+function createSessionOnServer(title, tid) {
+  return fetch('/api/sessions/' + curPid, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, team_id: tid }) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (d) { return loadProjectSessions(curPid).then(function () { return d.session.id; }); });
+}
+
+// 新建会话：用当前选中项目，弹窗选 Team（+ 标题）
+function openNewSession() {
+  if (!curPid) { alert('请先在左侧选择一个项目'); return; }
+  var p = projectById(curPid);
+  var teams = (p ? p.team_ids : []).map(teamById).filter(Boolean);
+  if (!teams.length) { alert('该项目暂无 Team，请先在左侧 + Team 并挂到项目'); return; }
+  var tOpts = teams.map(function (t) { return '<option value="' + t.id + '">' + esc(t.name) + '</option>'; }).join('');
+  var c = document.getElementById('newCard');
+  c.innerHTML = '<h3>新建会话</h3>' +
+    '<label>项目（当前）<br><input value="' + esc(p.name) + '" disabled style="width:100%"></label>' +
+    '<label style="margin-top:6px;display:block;">Team<br><select id="nTeam" style="width:100%">' + tOpts + '</select></label>' +
+    '<label style="margin-top:6px;display:block;">标题（可选）<br><input id="nTitle" style="width:100%" placeholder="留空则用任务首句"></label>' +
+    '<div style="display:flex; gap:8px; margin-top:10px;">' +
+    '<button class="primary" onclick="submitNewSession()">创建</button>' +
+    '<button onclick="closeNew()">取消</button></div>';
+  document.getElementById('newModal').classList.add('show');
+}
+function submitNewSession() {
+  var tid = v('nTeam'); var title = (v('nTitle') || '').trim();
+  if (!tid) { alert('请选择 Team'); return; }
+  fetch('/api/sessions/' + curPid, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title || '新会话', team_id: tid }) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (d) { closeNew(); return loadProjectSessions(curPid).then(function () { openSession(d.session.id); }); })
+    .catch(function (e) { setStatus('新建会话失败: ' + e.message, false); });
+}
+function closeNew() { document.getElementById('newModal').classList.remove('show'); }
+
+function delSession(sid) {
+  if (!confirm('删除该会话？此操作不可撤销。')) return;
+  fetch('/api/session/' + curPid + '/' + sid, { method: 'DELETE' })
+    .then(function () {
+      if (curSid === sid) { curSid = null; }
+      loadProjectSessions(curPid);
+    })
+    .catch(function (e) { setStatus('删除失败: ' + e.message, false); });
+}
+
+
+// 提示词日志：拉取并展示该会话每轮发给 agent 的完整 prompt
+function openPromptLog() {
+  if (!curSid) { alert('请先选择一个会话'); return; }
+  var c = document.getElementById('promptCard');
+  c.innerHTML = '<h3>提示词日志</h3><div class="ctx-meta">加载中…</div>';
+  document.getElementById('promptModal').classList.add('show');
+  fetch('/api/session/' + curPid + '/' + curSid + '/prompts', { cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var ps = d.prompts || [];
+      if (!ps.length) {
+        c.innerHTML = '<h3>提示词日志</h3><div class="ctx-meta">该会话暂无提示词记录（先发起一次讨论 / 对话）。</div>' +
+          '<div style="display:flex;gap:8px;margin-top:10px;"><button onclick="closePromptLog()">关闭</button></div>';
+        return;
+      }
+      var html = '<h3>提示词日志（' + ps.length + ' 条）</h3>';
+      ps.forEach(function (p, i) {
+        var badge = p.first_turn ? ' <span class="badge">首轮·含判定指令</span>' : '';
+        html += '<div style="margin-top:12px; border:1px solid #eee; border-radius:8px; padding:10px;">' +
+          '<div class="ctx-meta">#' + (i + 1) + ' · 第' + p.round + '轮 · ' + esc(p.agent) +
+          (p.role ? '（' + esc(p.role) + '）' : '') + ' · ' + esc(p.ts || '') + badge + '</div>' +
+          '<pre class="prompt-text">' + esc(p.prompt) + '</pre></div>';
+      });
+      html += '<div style="display:flex;gap:8px;margin-top:14px;"><button onclick="closePromptLog()">关闭</button></div>';
+      c.innerHTML = html;
+    })
+    .catch(function (e) { c.innerHTML = '<h3>提示词日志</h3><div class="ctx-meta">加载失败: ' + esc(e.message) + '</div>'; });
+}
+function closePromptLog() { document.getElementById('promptModal').classList.remove('show'); }
+function cfg_agents_by_name(name) {
+  var keys = Object.keys(cfg.agents);
+  for (var i = 0; i < keys.length; i++) { if (cfg.agents[keys[i]].name === name) return cfg.agents[keys[i]].type; }
+  return null;
+}
+
+// ---- 折叠：项目栏（IDEA 风格「-」-> 图标栏）/ 会话栏 ----
+function toggleSidebar() { document.body.classList.toggle('sidebar-collapsed'); renderRail(); }
+function toggleSessions() { document.body.classList.toggle('sessions-collapsed'); }
+function renderRail() {
+  var box = document.getElementById('railProjects'); box.innerHTML = '';
+  cfg.projects.forEach(function (p) {
+    var b = document.createElement('div');
+    b.className = 'rail-proj' + (p.id === curPid ? ' active' : '');
+    b.textContent = (p.name || '?').slice(0, 1); b.title = p.name;
+    b.onclick = function () { document.body.classList.remove('sidebar-collapsed'); selectProject(p.id); };
+    box.appendChild(b);
+  });
+}
+
+// ---- 表单（新建 / 编辑通用；editingId 非空表示编辑）----
+var editingId = null, editingKind = null;
+
+function modelSrcOf(a) {
+  if (!a || !a.base_url) return 'default';
+  var b = a.base_url;
+  if (b.indexOf('127.0.0.1:8777') >= 0 || b.indexOf('localhost:8777') >= 0) return 'gemma';
+  return 'custom';
+}
+
+function openAgentForm(a) {
+  editingId = a ? a.id : null; editingKind = 'agent';
+  var isCC = (a ? a.type : 'claude-code') === 'claude-code';
+  var src = modelSrcOf(a);
+  var showDefault = (isCC && src === 'default');
+  var c = document.getElementById('modalCard');
+  var html = '<h3>' + (a ? '编辑 Agent' : '新建 Agent') + '</h3>' +
+    f('name', '名称', a ? a.name : '') +
+    f('role', 'System Prompt / 系统提示', a ? a.role : '') +
+    sel('type', '类型', [['claude-code', 'Claude Code'], ['codex', 'Codex'], ['fake', 'Fake（调试假 agent，不烧 token）']], a ? a.type : 'claude-code');
+  if (isCC) {
+    html += sel('modelSrc', '模型来源', [
+      ['default', '默认（' + effectiveModelName({ type: 'claude-code' }) + '）'],
+      ['gemma', '本地 Ollama · gemma'],
+      ['custom', '自定义网关（litellm 等）'],
+    ], src);
+    html += '<div id="defBox" class="model-box" style="display:' + (showDefault ? 'block' : 'none') + '">' +
+      '当前生效模型：<b>' + effectiveModelName({ type: 'claude-code' }) + '</b>' +
+      '<div class="hint">选「默认」即走上面探测到的 Claude Code 全局默认模型，无需任何配置。</div></div>';
+    html += '<div id="locBox" style="display:' + (showDefault ? 'none' : 'block') + '">' +
+      f('base_url', '模型网关地址', a ? (a.base_url || '') : '') +
+      f('model', '模型', a ? (a.model || '') : '') +
+      f('api_key', '网关 Key(可选)', a ? (a.api_key || '') : '') +
+      '<div class="hint">选「本地 Ollama · gemma」会自动填好内置网关地址与模型名，<b>选了直接能用</b>（前提是本机 Ollama 已 pull 好对应 gemma 模型，如 <code>gemma4:26b</code>；若你 pull 的是其它 tag，把模型名改成实际 tag 即可；Ollama 配置无需改动）。' +
+      '选「自定义网关」可改指向 litellm 等其它翻译网关。<br>这些值会作为 Claude Code 子进程的环境变量（<code>ANTHROPIC_BASE_URL</code> 等）注入，' +
+      '<b>不动 Claude Code 配置、不串默认后端</b>。</div>' +
+      '</div>';
+  } else if (a && a.type === 'codex') {
+    html += f('model', '模型(可选)', a ? (a.model || '') : '') +
+      '<div class="hint">codex 类型填模型 tag（如 deepseek-v4-flash），留空走 Codex 全局默认。</div>';
+  }
+  html += formButtons('submitAgent', a);
+  c.innerHTML = html;
+  var sync = function () {
+    var t = v('type');
+    // 切类型时重载表单，正确显示「模型来源」或普通「模型」字段（简单可靠，编辑时少切类型）
+    if (t !== (a ? a.type : 'claude-code')) { openAgentForm(a); return; }
+    if (t !== 'claude-code') return;
+    var s = v('modelSrc');
+    var loc = document.getElementById('locBox'), def = document.getElementById('defBox');
+    if (loc) loc.style.display = (s === 'default') ? 'none' : 'block';
+    if (def) def.style.display = (s === 'default') ? 'block' : 'none';
+    if (s === 'gemma') {
+      var bu = document.getElementById('base_url'), md = document.getElementById('model');
+      if (bu && !bu.value) bu.value = 'http://127.0.0.1:8777';
+      if (md && !md.value) md.value = 'gemma4:26b';
+    }
+  };
+  ['type', 'modelSrc'].forEach(function (id) {
+    var e = document.getElementById(id);
+    if (e) e.addEventListener('change', sync);
+  });
+  document.getElementById('modal').classList.add('show');
+}
+function openTeamForm(t) {
+  editingId = t ? t.id : null; editingKind = 'team';
+  var ags = Object.keys(cfg.agents).map(function (k) {
+    var sel0 = (t && t.agent_ids.indexOf(k) >= 0) ? ' selected' : '';
+    return '<option value="' + cfg.agents[k].id + '"' + sel0 + '>' + esc(cfg.agents[k].name) + '</option>';
+  }).join('');
+  var c = document.getElementById('modalCard');
+  c.innerHTML = '<h3>' + (t ? '编辑 Team' : '新建 Team') + '</h3>' +
+    f('name', '名称', t ? t.name : '') +
+    '<div>成员：<select id="mAgents" multiple size="5">' + ags + '</select></div>' +
+    formButtons('submitTeam', t);
+  document.getElementById('modal').classList.add('show');
+}
+function openProjectForm(p) {
+  editingId = p ? p.id : null; editingKind = 'project';
+  var tms = cfg.teams.map(function (tm) {
+    var sel0 = (p && p.team_ids.indexOf(tm.id) >= 0) ? ' selected' : '';
+    return '<option value="' + tm.id + '"' + sel0 + '>' + esc(tm.name) + '</option>';
+  }).join('');
+  var c = document.getElementById('modalCard');
+  c.innerHTML = '<h3>' + (p ? '编辑 项目' : '新建 项目') + '</h3>' +
+    f('name', '名称', p ? p.name : '') +
+    '<label>项目目录（点「选择文件夹」即可）<br>' +
+    '<div style="display:flex; gap:6px;">' +
+    '<input id="path" value="' + (p ? esc(p.path) : '') + '" style="flex:1; min-width:0;" placeholder="未选择" readonly>' +
+    '<button type="button" class="ghost" onclick="openFsPicker(' + (p ? "'" + (p.path || '') + "'" : "null") + ')">选择文件夹</button>' +
+    '</div></label>' +
+    '<div>Teams：<select id="mTeams" multiple size="5" style="width:100%">' + tms + '</select></div>' +
+    formButtons('submitProject', p);
+  document.getElementById('modal').classList.add('show');
+}
+function editProject(id) { var p = projectById(id); if (p) openProjectForm(p); }
+function editTeam(id) { var t = teamById(id); if (t) openTeamForm(t); }
+function editAgent(id) { var a = cfg.agents[id]; if (a) openAgentForm(a); }
+
+function formButtons(submitFn, ent) {
+  var html = '<div style="display:flex; gap:8px; margin-top:8px;">' +
+    '<button class="primary" onclick="' + submitFn + '()">保存</button>';
+  if (ent) html += '<button onclick="deleteEntity()" style="border-color:#e88;color:#c33">删除</button>';
+  html += '<button onclick="closeModal()">取消</button></div>';
+  return html;
+}
+function deleteEntity() {
+  if (!editingId || !editingKind) return;
+  var label = { agent: 'Agent', team: 'Team', project: '项目' }[editingKind] || '';
+  if (!confirm('确定删除该' + label + '？此操作不可撤销。')) return;
+  fetch('/api/' + editingKind + 's/' + editingId, { method: 'DELETE' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); })
+    .then(closeModal).then(loadConfig).then(function () { setStatus('已删除 ✓', true); })
+    .catch(function (e) { setStatus('删除失败: ' + e.message, false); });
+}
+function f(id, label, def) {
+  def = def == null ? '' : String(def);
+  var safe = def.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return '<label>' + label + '<br><input id="' + id + '" value="' + safe + '" style="width:100%"></label>';
+}
+function sel(id, label, opts, sel0) {
+  var html = opts.map(function (o) {
+    return '<option value="' + o[0] + '"' + (o[0] === sel0 ? ' selected' : '') + '>' + o[1] + '</option>';
+  }).join('');
+  return '<label>' + label + '<br><select id="' + id + '" style="width:100%; box-sizing:border-box;">' + html + '</select></label>';
+}
+function closeModal() { document.getElementById('modal').classList.remove('show'); }
+
+// ---- 全局设置（timeout / 默认轮次等 App 级配置）----
+function openSettings() {
+  var c = document.getElementById('modalCard');
+  var dt = (cfg.settings && cfg.settings.default_timeout) ? cfg.settings.default_timeout : 300;
+  var dmr = (cfg.settings && cfg.settings.default_max_rounds) ? cfg.settings.default_max_rounds : 12;
+  var dm = (cfg.settings && cfg.settings.default_model) ? cfg.settings.default_model : '';
+  var dmc = (cfg.settings && cfg.settings.default_model_codex) ? cfg.settings.default_model_codex : '';
+  c.innerHTML = '<h3>全局设置</h3>' +
+    f('gTimeout', '单轮静默超时(秒)', dt) +
+    '<div class="hint">某个 agent 连续这么久不输出新内容，就判定卡死并终止该轮。流式输出过程中不会触发。</div>' +
+    f('gMaxRounds', '辩论模式默认轮次上限', dmr) +
+    '<div class="hint">发起讨论时「最大轮次」输入框的默认值；仅对尚未手动改过的会话生效。改完点保存即全局生效，无需重启。</div>' +
+    f('gDefaultModel', 'Claude Code 默认模型(可选)', dm) +
+    '<div class="hint">claude-code 类型 agent 未单独填「模型」时，左栏/配置中显示的默认模型名。' +
+    '留空则自动探测 Claude Code 当前默认（读 ANTHROPIC_DEFAULT_MODEL 或 ~/.claude/settings.json）。填了则以此为准并展示。</div>' +
+    f('gDefaultModelCodex', 'Codex 默认模型(可选)', dmc) +
+    '<div class="hint">codex 类型 agent 未单独填「模型」时显示的默认模型名。' +
+    '留空则自动探测 Codex 当前默认（读 CODEX_MODEL/OPENAI_MODEL 或 ~/.codex/config.toml）。填了则以此为准并展示。</div>' +
+    f('gOllama', 'Ollama 地址(内置网关用)', (cfg.settings && cfg.settings.ollama_base_url) ? cfg.settings.ollama_base_url : 'http://localhost:11434') +
+    '<div class="hint">内置 Anthropic→Ollama 翻译网关转发到的 Ollama OpenAI 兼容端点。' +
+    '仅被读取、<b>不改 Ollama 自身配置</b>；默认 http://localhost:11434（Ollama 默认端口）。若你的 Ollama 在别的地址/端口，改这里即可。</div>' +
+    '<div style="display:flex; gap:8px; margin-top:4px;">' +
+    '<button class="primary" onclick="submitSettings()">保存</button>' +
+    '<button onclick="closeModal()">取消</button></div>';
+  document.getElementById('modal').classList.add('show');
+}
+function submitSettings() {
+  var body = {
+    default_timeout: parseInt(v('gTimeout'), 10) || 300,
+    default_max_rounds: parseInt(v('gMaxRounds'), 10) || 12,
+    default_model: v('gDefaultModel').trim(),
+    default_model_codex: v('gDefaultModelCodex').trim(),
+    ollama_base_url: v('gOllama').trim() || 'http://localhost:11434',
+  };
+  return fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (d) { cfg.settings = d.settings; renderTree(); })
+    .then(closeModal).then(function () {
+      updateRoundControl();  // 全局默认变化后，未手动改过的轮次输入同步刷新
+      setStatus('全局设置已保存 ✓', true);
+    })
+    .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
+}
+['modal', 'newModal', 'fsModal'].forEach(function (id) {
+  document.getElementById(id).addEventListener('click', function (e) { if (e.target === this) this.classList.remove('show'); });
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') { ['modal', 'newModal', 'fsModal'].forEach(function (id) { document.getElementById(id).classList.remove('show'); }); }
+});
+// 对话模式：Enter 发送、Shift+Enter 换行（辩论模式的任务框保持多行，不抢 Enter）
+document.getElementById('task').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey && isChatMode()) { e.preventDefault(); startSession(); }
+});
+// 输入变化即刷新主按钮可用态（辩论模式：空议题时「开始/继续讨论」禁用）
+document.getElementById('task').addEventListener('input', refreshSendBtn);
+// 介入框：Enter 直接介入；Shift+Enter 换行
+document.getElementById('inject').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doInject(); }
+});
+
+function closeFs() { document.getElementById('fsModal').classList.remove('show'); }
+
+// ---- 目录选择器（服务端驱动，可拿到真实绝对路径）----
+function q(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+function openFsPicker(initial) { fsRender(initial && initial.trim() ? initial.trim() : ''); document.getElementById('fsModal').classList.add('show'); }
+function fsRender(path) {
+  var url = '/api/fs' + (path ? ('?path=' + encodeURIComponent(path)) : '');
+  fetch(url, { cache: 'no-store' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (d) {
+      var rows = '';
+      if (d.parent) rows += '<div class="fs-item up" onclick="fsNav(\'' + q(d.parent) + '\')">↑ 上一级 (' + esc(d.parent) + ')</div>';
+      if (!d.dirs.length) rows += '<div class="fs-empty">此目录下没有子目录</div>';
+      d.dirs.forEach(function (x) {
+        rows += '<div class="fs-item" onclick="fsNav(\'' + q(x.path) + '\')" ondblclick="fsChoose(\'' + q(x.path) + '\')">' +
+          esc(x.name) + '<span class="fs-enter">进入 ›</span></div>';
+      });
+      var c = document.getElementById('fsCard');
+      c.innerHTML = '<h3>选择项目目录</h3>' +
+        '<div class="fs-path">' + esc(d.path) + '</div>' +
+        '<div class="fs-list">' + rows + '</div>' +
+        '<div style="display:flex; gap:8px; margin-top:8px;">' +
+        '<button class="primary" onclick="fsChoose(\'' + q(d.path) + '\')">选择此目录</button>' +
+        '<button onclick="closeFs()">取消</button></div>';
+    })
+    .catch(function (e) { document.getElementById('fsCard').innerHTML = '<h3>选择项目目录</h3><div class="fs-empty">加载失败: ' + esc(e.message) + '</div><button onclick="closeFs()">取消</button>'; });
+}
+function fsNav(p) { fsRender(p); }
+function fsChoose(p) { var inp = document.getElementById('path'); if (inp) inp.value = p; closeFs(); }
+
+function submitAgent() {
+  var type = v('type');
+  var body = { name: v('name'), type: type, role: v('role') };
+  if (type === 'claude-code') {
+    if (v('modelSrc') === 'default') {
+      body.model = null; body.base_url = null; body.api_key = null;
+    } else {
+      body.model = v('model') || null;
+      body.base_url = v('base_url') || null;
+      body.api_key = v('api_key') || null;
+    }
+  } else {
+    body.model = v('model') || null;
+    body.base_url = null;
+    body.api_key = null;
+  }
+  if (editingId) body.id = editingId;
+  return fetch('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); })
+    .then(closeModal).then(loadConfig).then(function () { setStatus('已保存 ✓', true); })
+    .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
+}
+function submitTeam() {
+  var sel = document.getElementById('mAgents');
+  var ids = Array.prototype.slice.call(sel.selectedOptions).map(function (o) { return o.value; });
+  var body = { name: v('name'), agent_ids: ids };
+  if (editingId) body.id = editingId;
+  return fetch('/api/teams', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); })
+    .then(closeModal).then(loadConfig).then(function () { setStatus('已保存 ✓', true); })
+    .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
+}
+function submitProject() {
+  var sel = document.getElementById('mTeams');
+  var ids = sel ? Array.prototype.slice.call(sel.selectedOptions).map(function (o) { return o.value; }) : [];
+  var body = { name: v('name'), path: v('path'), team_ids: ids };
+  if (editingId) body.id = editingId;
+  return fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(closeModal).then(loadConfig).then(function () { setStatus('已保存 ✓', true); })
+    .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
+}
+function v(id) { var e = document.getElementById(id); return e ? e.value : ''; }
+
+loadConfig();
+</script>
+</body>
+</html>

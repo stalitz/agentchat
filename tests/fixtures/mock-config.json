@@ -1,0 +1,51 @@
+{
+  "projects": {
+    "pr_mock": {
+      "id": "pr_mock",
+      "name": "mock-project",
+      "path": "/tmp/agentchat-mock-project",
+      "team_ids": ["tm_mock", "tm_mock_debug"]
+    }
+  },
+  "teams": {
+    "tm_mock": {
+      "id": "tm_mock",
+      "name": "双核Team（Claude + Codex）",
+      "agent_ids": ["ag_arch", "ag_impl"]
+    },
+    "tm_mock_debug": {
+      "id": "tm_mock_debug",
+      "name": "调试Team（仅 Fake，不烧 token）",
+      "agent_ids": ["ag_fake"]
+    }
+  },
+  "agents": {
+    "ag_arch": {
+      "id": "ag_arch",
+      "name": "架构师",
+      "type": "claude-code",
+      "role": "系统架构师，负责方案设计与权衡",
+      "model": null,
+      "cli_args": "",
+      "fake_terminate_round": 0
+    },
+    "ag_impl": {
+      "id": "ag_impl",
+      "name": "实现者",
+      "type": "codex",
+      "role": "实现者，负责落地代码与重构",
+      "model": null,
+      "cli_args": "",
+      "fake_terminate_round": 0
+    },
+    "ag_fake": {
+      "id": "ag_fake",
+      "name": "假Agent（调试）",
+      "type": "fake",
+      "role": "调试用假 agent：流式吐确定性文本，不调用 CLI、不烧 token",
+      "model": null,
+      "cli_args": "",
+      "fake_terminate_round": 3
+    }
+  }
+}
