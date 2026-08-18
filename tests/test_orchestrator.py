@@ -263,6 +263,35 @@ class TestOrchestrator(unittest.TestCase):
         self.assertNotIn("首次发言特别要求", p, "已移除首轮「不可讨论就终止」诱导指令")
         self.assertNotIn("是否适合展开多 agent 讨论", p)
 
+    def test_round_reminder_after_floor(self):
+        # 达最小轮数后的每轮硬提醒：floor 前无提醒；floor 后无提议→「轮次提醒」；
+        # 对方已提议→推动本方确认；自己已提议→等待对方
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid)
+        # floor = 2*2-1 = 3：round 2（第 3 轮）前无提醒
+        p = s._build_prompt(a1, "任务", round_i=2)
+        self.assertNotIn("轮次提醒", p)
+        self.assertNotIn("对方已提议终止", p)
+        self.assertNotIn("你已提议终止", p)
+        # round 3（第 4 轮）达标且无提议 → 轮次提醒
+        p = s._build_prompt(a1, "任务", round_i=3)
+        self.assertIn("轮次提醒", p)
+        self.assertIn("end_discussion", p)
+        # 对方已提议 → 推动本方确认（含对方名与理由）
+        s.terminate_proposed_by = "B"
+        s.terminate_reason = "双方同意结论X"
+        p = s._build_prompt(a1, "任务", round_i=4)
+        self.assertIn("对方已提议终止", p)
+        self.assertIn("B", p)
+        self.assertIn("结论X", p)
+        self.assertIn("确认", p)
+        # 自己已提议 → 等待对方
+        s.terminate_proposed_by = "A"
+        p = s._build_prompt(a1, "任务", round_i=4)
+        self.assertIn("你已提议终止", p)
+        self.assertNotIn("对方已提议终止", p)
+
     def test_round0_terminate_is_ignored_before_floor(self):
         # 共识终止有最小轮数保护：至少两轮完整往返（2*N-1）后 TERMINATE 才生效。
         # 首轮（round 0）agent 吐 TERMINATE 不再直接终止，辩论应继续、第二个 agent 也会发言。

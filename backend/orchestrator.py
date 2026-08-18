@@ -134,6 +134,29 @@ class Session:
             "调用后还需对方 agent 也调用 end_discussion 确认才会真正终止——若本轮只是你提议，对方可能继续讨论，"
             "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
         )
+        # 达到最少轮数（双方各发言 2 次）后的每轮硬提醒：推着模型主动决策收尾，而非等它想起。
+        # 本地弱工具调用模型（gemma/r1）在长辩论中几乎不主动调用工具（实测跑满轮次），
+        # 故 floor 后每轮明确告知轮次与可选动作，并把「对方已提议」显式喂给本方推动确认。
+        floor = 2 * len(self.agents) - 1
+        if round_i >= floor:
+            if self.terminate_proposed_by and self.terminate_proposed_by != agent.name:
+                parts.append(
+                    f"【对方已提议终止】{self.terminate_proposed_by} 已调用 end_discussion 提议终止"
+                    f"（理由：{self.terminate_reason or '未说明'}）。"
+                    "若你认同该结论，请**调用 end_discussion 确认**（reason 填你的确认意见），"
+                    "双方确认后讨论即终止；若仍有异议，继续正常讨论即可。"
+                )
+            elif self.terminate_proposed_by == agent.name:
+                parts.append(
+                    "【你已提议终止】你已调用 end_discussion 提议终止，正在等待对方确认。"
+                    "请继续正常参与讨论；若对方也调用 end_discussion 确认，讨论即终止。"
+                )
+            else:
+                parts.append(
+                    f"【轮次提醒】本场已讨论到第 {round_i + 1} 轮（达到最少轮数，可以收尾）。"
+                    "若你认为双方已达一致，**请调用 end_discussion 工具终止**（reason 填共识结论）；"
+                    "不调用工具的文字总结不会被当作终止信号，讨论会继续。若仍有分歧，继续讨论。"
+                )
         return "\n\n".join(parts)
 
     # ---------------- 单轮执行（两种模式共用） ----------------
