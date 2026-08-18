@@ -67,6 +67,18 @@ class TestStore(unittest.TestCase):
         data = _json.loads(raw.read_text(encoding="utf-8"))
         self.assertEqual(data[0]["agent_sessions"]["A"], "sid-aaa")
 
+    def test_append_message_adds_timestamp(self):
+        # 每条消息落盘自动带 ts（时间线）：前端据此展示发言时间，历史数据由回填脚本补齐
+        p = TMP / "ts"
+        s = store.create_session(str(p), "时间线会话")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "human", "content": "你好"})
+        m = store.read_session(str(p), s["id"])["messages"][0]
+        self.assertTrue(m.get("ts"), "落盘消息应自动带 ts 时间戳")
+        self.assertRegex(m["ts"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        # 显式传入的 ts 不被覆盖
+        store.append_message(str(p), s["id"], {"round": 1, "speaker": "A", "content": "回", "ts": "2026-08-17 16:00:00"})
+        self.assertEqual(store.read_session(str(p), s["id"])["messages"][1]["ts"], "2026-08-17 16:00:00")
+
     def test_reconcile_agent_messages_overwrites_and_appends(self):
         # 打开会话时：CLI transcript 的 agent 回合应以 agent 为准覆盖本地；CLI 多出的回合追加
         p = TMP / "rec"

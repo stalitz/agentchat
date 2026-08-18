@@ -134,6 +134,7 @@
   .bubble.thinking.codex summary .th-title { color:#2f9e63; }
   .bubble.thinking.fake summary .th-title { color:#e8851a; }
   .who { font-size:11px; color:var(--muted); margin-bottom:3px; }
+  .who .ts { margin-left:8px; color:#c6c6d2; font-size:10px; font-weight:400; }
   #composer { border-top:1px solid var(--line); padding:10px 14px; background:var(--panel); height:var(--composer-h); overflow:auto; }
   .ctl { display:flex; gap:8px; margin-bottom:8px; align-items:center; flex-wrap:wrap; }
   select, textarea, input { font:inherit; border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
@@ -408,10 +409,10 @@ function handleEvent(ev) {
   }
 }
 
-function startBubble(name, atype) {
+function startBubble(name, atype, ts) {
   var row = document.createElement('div'); row.className = 'row';
   var b = document.createElement('div'); b.className = 'bubble ' + (atype || 'claude-code');
-  b.innerHTML = '<div class="who">' + esc(name) + '</div><div class="body"></div>';
+  b.innerHTML = '<div class="who">' + esc(name) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '') + '</div><div class="body"></div>';
   row.appendChild(b); chat.appendChild(row); cur = b.querySelector('.body');
   chat.scrollTop = chat.scrollHeight;
 }
@@ -451,12 +452,12 @@ function appendToken(name, text) {
   cur.textContent += text; chat.scrollTop = chat.scrollHeight;
 }
 function endBubble() { cur = null; }
-function addRow(cls, who, text) {
+function addRow(cls, who, text, ts) {
   var row = document.createElement('div'); row.className = 'row' + (cls === 'human' ? ' human' : '');
   var b = document.createElement('div'); b.className = 'bubble ' + cls;
   // 系统消息 / 人工介入支持 markdown；错误等纯文本保持转义
   var rich = (cls === 'sys' || cls === 'human') ? mdToHtml(text) : esc(text);
-  b.innerHTML = '<div class="who">' + esc(who) + '</div>' + rich;
+  b.innerHTML = '<div class="who">' + esc(who) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '') + '</div>' + rich;
   row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
 }
 function esc(s) { return (s || '').replace(/[&<>]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]; }); }
@@ -887,11 +888,11 @@ function updateCtxHead(s) {
 }
 
 function renderHistoryEntry(h) {
-  if (h.speaker === 'system') { addRow('sys', h.role || '系统', h.content || ''); return; }
-  if (h.speaker === 'human') { addRow('human', h.role || '人工介入', h.content || ''); return; }
+  if (h.speaker === 'system') { addRow('sys', h.role || '系统', h.content || '', h.ts); return; }
+  if (h.speaker === 'human') { addRow('human', h.role || '人工介入', h.content || '', h.ts); return; }
   var type = cfg_agents_by_name(h.speaker) || 'claude-code';
   if (h.thinking) renderThinkingBlock(h.speaker, h.thinking, type);
-  startBubble(h.speaker, type);
+  startBubble(h.speaker, type, h.ts);
   var body = cleanSep(h.content || '');
   // 旧数据可能把思考内容混进了正文（与 thinking 相同），此时不重复显示
   if (!body || (h.thinking && body === h.thinking.trim())) {
