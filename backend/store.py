@@ -301,8 +301,9 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
     对齐规则（agent 为准）：按本地 `speaker==agent_name` 的顺序逐条对齐 CLI 回合——
     - CLI 第 k 条有内容：覆盖本地第 k 条的 content/thinking（冲突以 agent 为准）；
     - CLI 多出本地没有的回合：追加到末尾（崩写/掉轮恢复）；
-    - CLI 回合少于本地：删除本地末尾多余的 agent 消息（claude 外壳曾把一次回复拆成多条
-      assistant 事件，旧解析把拆条各当一条回合、对账后本地多出残留——修复解析器后按此收敛）。
+    - CLI 回合少于本地：仅删除本地末尾多余的「think-only 残留」（content 为空、thinking 非空，
+      拆条修复后的典型残留）；**有 content 的条目一律保留**——transcript 可能因 auto-compact /
+      截断而不完整（实测 s_2289e1cf：cli 仅 3 条 vs 本地 7 条真实回复，盲删会丢历史）。
     仅当 cli_turns 非空才落盘；cli_turns 为 None/空（找不到 transcript = 离线）则保持本地不动。
     """
     if not cli_turns:
@@ -333,11 +334,15 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                     "content": new_content, "thinking": new_think,
                 })
                 appended += 1
-        # CLI 回合少于本地：删除末尾多余的本地消息（拆条残留收敛；reverse 保下标正确）
+        # CLI 回合少于本地：只删除「think-only 残留」（content 空、thinking 非空）——
+        # 拆条修复后本地多出的"思考空答案"一半。有 content 的条目是真实历史，
+        # 可能因 transcript 不完整（auto-compact/截断）而比 cli 多，绝不盲删（reverse 保下标正确）。
         if len(cli_turns) < len(idxs):
             for i in sorted(idxs[len(cli_turns):], reverse=True):
-                msgs.pop(i)
-                changed += 1
+                m = msgs[i]
+                if (m.get("thinking") or "") and not (m.get("content") or ""):
+                    msgs.pop(i)
+                    changed += 1
         if changed or appended:
             s["updated_at"] = _now()
             _save_sessions(project_path, sessions)

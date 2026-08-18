@@ -103,15 +103,16 @@ class TestStore(unittest.TestCase):
         self.assertEqual(store.read_session(str(p), s["id"])["messages"][0]["content"], "仅本地")
 
     def test_reconcile_removes_extra_when_cli_fewer(self):
-        # CLI 回合数少于本地（本地曾被拆条残留：一次回复被拆成 thinking-only + text-only 两条）：
-        # 对账后应删除本地末尾多余的 agent 消息，收敛为与 CLI 一致
+        # CLI 回合数少于本地（本地曾有拆条残留）：只删除「think-only 残留」（content 空、thinking 非空），
+        # 有 content 的条目保守保留——transcript 可能因 auto-compact/截断而不完整，盲删会丢真实历史
+        # （实测 s_2289e1cf 曾因此丢 4 条回复，数据已从备份恢复并收紧删除条件）。
         p = TMP / "rec3"
         s = store.create_session(str(p), "拆条修复")
         store.append_message(str(p), s["id"], {"round": 0, "speaker": "A", "role": "甲", "content": "完整回答1", "thinking": "思考1"})
         store.append_message(str(p), s["id"], {"round": 1, "speaker": "B", "role": "乙", "content": "B的回答"})
-        store.append_message(str(p), s["id"], {"round": 2, "speaker": "A", "role": "甲", "content": "", "thinking": "思考1残留"})
+        store.append_message(str(p), s["id"], {"round": 2, "speaker": "A", "role": "甲", "content": "", "thinking": "思考2残留"})
         store.append_message(str(p), s["id"], {"round": 3, "speaker": "A", "role": "甲", "content": "完整回答2", "thinking": "思考2"})
-        store.append_message(str(p), s["id"], {"round": 4, "speaker": "A", "role": "甲", "content": "", "thinking": "思考2残留"})
+        store.append_message(str(p), s["id"], {"round": 4, "speaker": "A", "role": "甲", "content": "", "thinking": "思考2残留2"})
         cli_turns = [
             {"content": "完整回答1", "thinking": "思考1"},
             {"content": "完整回答2", "thinking": "思考2"},
@@ -119,13 +120,42 @@ class TestStore(unittest.TestCase):
         res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
         msgs = store.read_session(str(p), s["id"])["messages"]
         a_msgs = [m for m in msgs if m["speaker"] == "A"]
-        self.assertEqual(len(a_msgs), 2, "多余的拆条残留应被删除")
+        # 覆盖：A1 不变；think-only「思考2残留」被合并覆盖为 完整回答2+思考2；两条 think-only 残留被删；
+        # 「完整回答2」（有 content）保守保留 → 共 3 条，不丢数据
+        self.assertEqual(len(a_msgs), 3, "think-only 残留删除；有 content 的条目保守保留")
         self.assertEqual(a_msgs[0]["content"], "完整回答1")
         self.assertEqual(a_msgs[1]["content"], "完整回答2")
         self.assertEqual(a_msgs[1]["thinking"], "思考2")
+        self.assertEqual(a_msgs[2]["content"], "完整回答2")
         # B 不受影响
         self.assertEqual([m for m in msgs if m["speaker"] == "B"][0]["content"], "B的回答")
         self.assertTrue(res["appended"] == 0)
+
+    def test_reconcile_keeps_content_when_cli_fewer(self):
+        # CLI 回合少于本地且多出的条目**有 content**：一律保留，绝不盲删——
+        # transcript 可能因 auto-compact/截断而不完整（实测 s_2289e1cf：cli 3 条 vs 本地 7 条
+        # 真实回复，旧逻辑盲删丢了 4 条历史）；只删「think-only 残留」（content 空、thinking 非空）。
+        p = TMP / "rec4"
+        s = store.create_session(str(p), "防误删")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "A", "role": "甲", "content": "回答1", "thinking": ""})
+        store.append_message(str(p), s["id"], {"round": 1, "speaker": "B", "role": "乙", "content": "B的回答"})
+        store.append_message(str(p), s["id"], {"round": 2, "speaker": "A", "role": "甲", "content": "回答2", "thinking": ""})
+        store.append_message(str(p), s["id"], {"round": 3, "speaker": "A", "role": "甲", "content": "", "thinking": "思考3残留"})
+        store.append_message(str(p), s["id"], {"round": 4, "speaker": "A", "role": "甲", "content": "回答4", "thinking": ""})
+        # transcript 只记录到 A 的前 3 次回复（后续被截断）：回答4 必须保留
+        cli_turns = [
+            {"content": "回答1", "thinking": ""},
+            {"content": "回答2", "thinking": ""},
+            {"content": "", "thinking": "思考3"},
+        ]
+        res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        msgs = store.read_session(str(p), s["id"])["messages"]
+        a_msgs = [m for m in msgs if m["speaker"] == "A"]
+        # 覆盖前 3 条（思考3残留被合并覆盖）；回答4 有 content → 保留
+        self.assertEqual(len(a_msgs), 4, "有 content 的多出条目必须保留（防 transcript 不完整误删）")
+        self.assertEqual(a_msgs[3]["content"], "回答4")
+        # B 不受影响
+        self.assertEqual([m for m in msgs if m["speaker"] == "B"][0]["content"], "B的回答")
 
 
 
