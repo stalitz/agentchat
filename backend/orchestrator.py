@@ -244,13 +244,10 @@ class Session:
             self.agent_sessions[agent.name] = runtime.cli_session_id
             store.set_agent_session_id(self.project_path, self.session_id, agent.name, runtime.cli_session_id)
         await self._emit(type="turn_end", agent=agent.name)
-        if errors:
-            # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止
-            await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
-            return "", errors
-        # end_discussion 终止状态机（编排层权威判定；MCP 服务仅做无状态确认通道）：
-        # 未达最小轮数 → 拒绝（记 rejected 日志，不记录状态）；达标后：无提议→记提议（proposed）；
-        # 同方重复→repeat；对方已提议→确认达成（terminate_confirm，_debate 据此收敛）。
+        # end_discussion 终止状态机（编排层权威判定）——必须先于 errors 检查：
+        # 工具由网关注入、claude 侧无对应实现，模型调用后 claude 会因「未知工具」报错退出；
+        # 若先查 errors 会把工具轮误判为失败而中止。工具轮的错误应忽略（意图已被捕获）。
+        tool_intent = any(isinstance(tu, dict) and tu.get("name") == "end_discussion" for tu in tool_uses)
         floor = 2 * len(self.agents) - 1
         for tu in tool_uses:
             if not isinstance(tu, dict) or tu.get("name") != "end_discussion":
@@ -281,6 +278,10 @@ class Session:
                     "action": "confirmed", "agent": agent.name, "round_i": round_i,
                     "reason": self.terminate_reason, "msg": "对方确认，讨论终止",
                 })
+        if errors and not tool_intent:
+            # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止
+            await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
+            return "", errors
         thinking_text = "\n\n".join(thinking_parts).strip()
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。
@@ -289,9 +290,14 @@ class Session:
             "content": full,
             "thinking": thinking_text,
         }
-        self.history.append(entry)
-        store.append_message(self.project_path, self.session_id, entry)
-        return full, errors
+        # 纯工具轮（模型只调 end_discussion、无正文无思考）：意图与状态已入工具日志，
+        # 不落空 agent 发言（避免「本轮未输出独立结论」占位噪声）。
+        if not (tool_intent and not full and not thinking_text):
+            self.history.append(entry)
+            store.append_message(self.project_path, self.session_id, entry)
+        # 工具轮的错误已由状态机消化（claude 对注入工具报「未知工具」是预期行为），
+        # 返回空 errors，_debate 据此继续下一轮而非中止。
+        return full, ([] if tool_intent else errors)
 
     # ---------------- 入口 ----------------
     async def start(self, initial_task: str):

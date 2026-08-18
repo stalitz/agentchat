@@ -70,6 +70,32 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         # 受支持的通用字段应保留
         self.assertEqual(oa["temperature"], 0.7)
 
+    def test_end_discussion_tool_injected(self):
+        # 网关向模型注入 end_discussion 工具（claude MCP 加载在 -p/隔离配置下不可靠，
+        # 注入后凡经网关的模型必可见工具、可主动收敛）——tools 无该工具时自动追加
+        oa = gateway.anthropic_to_openai({
+            "model": "gemma", "messages": [],
+            "tools": [{"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
+        })
+        names = [t["function"]["name"] for t in oa["tools"]]
+        self.assertIn("end_discussion", names, "应自动注入 end_discussion 工具")
+        ed = next(t["function"] for t in oa["tools"] if t["function"]["name"] == "end_discussion")
+        self.assertIn("reason", ed["parameters"]["properties"])
+        self.assertIn("reason", ed["parameters"]["required"])
+        # 已存在则不重复注入
+        oa2 = gateway.anthropic_to_openai({
+            "model": "gemma", "messages": [],
+            "tools": [
+                {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "end_discussion", "description": "d", "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}}},
+            ],
+        })
+        names2 = [t["function"]["name"] for t in oa2["tools"]]
+        self.assertEqual(names2.count("end_discussion"), 1, "已有 end_discussion 时不应重复注入")
+        # 无 tools 时不注入（纯文本请求不需要）
+        oa3 = gateway.anthropic_to_openai({"model": "gemma", "messages": []})
+        self.assertNotIn("tools", oa3)
+
 
 class TestStreamTranslator(unittest.TestCase):
     def test_text_only(self):
@@ -241,6 +267,11 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         self.assertIn("text_delta", out)
         self.assertIn("你好", out)
         self.assertIn("message_stop", out)
+        # message_start 必须先行于任何内容事件（网关进流即发，不等 Ollama 首 chunk）：
+        # 否则 claude 进程 SDK 对「200 已建立但长时间无首事件」有内部超时（约 60s），
+        # gemma 等本地模型慢 prefill 时会被误判「API Error: empty or malformed」退出。
+        self.assertLess(out.index("message_start"), out.index("text_delta"),
+                        "message_start 应先于内容事件发出")
 
     def test_stream_route_propagates_ollama_error(self):
         # Ollama 返回非 200 时，网关必须把错误透传为 SSE error 事件，
@@ -281,6 +312,9 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         self.assertIn("event: error", out)
         self.assertIn("empty or malformed stream", out)
         self.assertNotIn("message_stop", out, "空流应直接报错，不产出正常 message_stop")
+        # message_start 已先行发出（防 claude 首事件超时），随后才 error
+        self.assertLess(out.index("message_start"), out.index("event: error"),
+                        "message_start 应先发，claude 才不至于误判空响应")
 
 
 if __name__ == "__main__":

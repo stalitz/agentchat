@@ -292,6 +292,33 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("你已提议终止", p)
         self.assertNotIn("对方已提议终止", p)
 
+    def test_tool_round_error_does_not_abort(self):
+        # 模型调用 end_discussion 后 claude 因「未知工具」报错（工具由网关注入、claude 侧无实现）：
+        # 本轮不得中止——编排层已捕获工具意图（记 rejected/proposed 日志），错误应忽略、会话继续。
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=3)  # 6 轮，floor=3
+
+        async def tool_then_error(prompt, cwd, timeout, meta=None):
+            yield "tool_use", {"name": "end_discussion", "input": {"reason": "测试"}}
+            yield "error", "API Error: API returned an empty or malformed response (HTTP 200)"
+            yield "done", ""
+
+        s.runtimes["A"].run = tool_then_error  # A 每轮都发工具调用 + 报错
+        self.run_session(s, task="测试工具轮")
+        log = store.read_tool_log(self.proj, self.sid)
+        self.assertTrue(log, "工具轮应有日志")
+        actions = [e.get("action") for e in log]
+        self.assertIn("rejected", actions, "floor 前调用应记 rejected")
+        self.assertIn("proposed", actions, "floor 后调用应记 proposed")
+        sys_msgs = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
+        self.assertFalse(any("执行出错" in m for m in sys_msgs), "工具轮错误不应中止会话")
+        # 纯工具轮（无正文无思考）不落 agent 发言——A 的 6 轮中 3 轮是纯工具轮
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msgs = [m for m in msgs if m.get("speaker") == "A"]
+        self.assertTrue(all((m.get("content") or "") or (m.get("thinking") or "") for m in a_msgs),
+                        "纯工具轮不应落空消息")
+
     def test_round0_terminate_is_ignored_before_floor(self):
         # 共识终止有最小轮数保护：至少两轮完整往返（2*N-1）后 TERMINATE 才生效。
         # 首轮（round 0）agent 吐 TERMINATE 不再直接终止，辩论应继续、第二个 agent 也会发言。

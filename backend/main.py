@@ -16,6 +16,25 @@ app = FastAPI(title="Agent CLI Orchestrator")
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 
+
+@app.middleware("http")
+async def _rewrite_claude_tool_roundtrip_url(request: Request, call_next):
+    """兜底 claude-code 2.1.212 的工具往返 URL bug：模型发出 tool_use 后，claude 的续接请求
+    （把 tool_result 回传）会把 ANTHROPIC_BASE_URL 整体编码进 path——实测形如
+    `POST /http%3A//127.0.0.1%3A8777/v1/messages?beta=true` → 本服务 404，导致工具调用
+    永远拿不到结果（claude 报「There's an issue with the selected model」退出）。
+    识别该模式并改写为 /v1/messages，保证工具往返走通（网关对 tool_result 处理本就正常）。
+    """
+    from urllib.parse import unquote
+
+    path = request.url.path
+    if path.startswith("/http%3A") or path.startswith("/http:"):
+        decoded = unquote(path)
+        if "/v1/messages" in decoded:
+            request.scope["path"] = "/v1/messages"
+            request.scope["raw_path"] = b"/v1/messages"
+    return await call_next(request)
+
 clients: set[WebSocket] = set()
 # 会话注册表：sid -> Session。多会话可并行——每个会话独立 running/stop/pause/inject，
 # 只锁自己，互不干扰（事件均带 sid，前端按会话归属渲染）。

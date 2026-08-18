@@ -129,6 +129,30 @@ def anthropic_to_openai(body: dict) -> dict:
                 "parameters": t.get("input_schema", {}),
             },
         } for t in tools]
+    # 注入 end_discussion 工具：claude-code 的 MCP 加载在 -p 非交互/隔离配置下不可靠
+    # （实测 2.1.212：.mcp.json 服务器 Pending approval、claude mcp add 后 Failed to connect，
+    # 请求 tools 里 25 个全是内置工具、无 end_discussion → 模型看不到工具、无法主动收敛）。
+    # 改为在网关层直接向模型注入工具定义——凡经网关的模型（gemma/r1 等）必可见，
+    # 调用后网关把 tool_calls 翻译为 tool_use 事件，编排层据此走两阶段终止状态机；
+    # 不依赖 claude 的 MCP 机制（terminate_signal_mcp.py 保留为备用，不再必需）。
+    if tools and not any((t.get("name") or "") == "end_discussion" for t in tools):
+        oa["tools"].append({
+            "type": "function",
+            "function": {
+                "name": "end_discussion",
+                "description": (
+                    "结束当前多 agent 讨论。只有当本场讨论已充分进行（至少两轮完整往返）且你真正认为"
+                    "双方已达成一致、可以收尾时才调用；否则不要调用。reason 请用一两句话说明达成的一致结论。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "双方达成的一致结论（一两句话）"},
+                    },
+                    "required": ["reason"],
+                },
+            },
+        })
     return oa
 
 
@@ -368,6 +392,14 @@ async def handle_messages(req: Request, settings: dict):
                     yield _sse_event({"type": "error", "error": {"type": "api_error", "message": "Ollama gateway error: " + str(em)[:500]}})
                     return
                 translator = _AnthropicTranslator(model=body.get("model", ""), est_input_tokens=_estimate_input_tokens(body))
+                # 立即发 message_start（不等 Ollama 首个 chunk）：claude 进程的 SDK 对「HTTP 200
+                # 已建立但长时间无首个 SSE 事件」有内部超时（约 60s），gemma 等本地模型冷启 /
+                # 慢 prefill 时首 chunk 可达 60s+，网关若等首 chunk 才发 message_start，claude
+                # 会误判「API Error: empty or malformed (HTTP 200)」并退出（实测复现）。
+                # 先发 message_start 让 claude 确认流已开始，Ollama 慢则由 600s 超时兜底；
+                # 若最终真空流，下方空流检测仍会产出 SSE error 事件。
+                for ev in translator._start():
+                    yield _sse_event(ev)
                 got_any = False  # 是否收到过任何内容增量（空流检测）
                 async for line in r.aiter_lines():
                     if not line or not line.startswith("data:"):
