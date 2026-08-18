@@ -479,12 +479,28 @@ def _normalize_turn(content: str, thinking: str) -> dict:
 def _parse_claude_transcript(path: str) -> list:
     """解析 claude JSONL：返回有序 [{content, thinking}]，每个 = 一次 assistant 回复。
 
-    - `type=='assistant'` 的 `message.content` 为 block 列表：`thinking` 块→思考、`text` 块→答案；
-      网关 agent（gemma 等）经外壳落盘的 text 块可能带 `\x01THINK\x01`/`\x01ANSW\x01` 哨兵，
+    - claude-code 外壳会把「一次回复（原生 thinking 块 + text 块）」**拆成多个独立
+      assistant 事件**（实测 2.1.212：thinking-only 与 text-only 各占一条、中间无 user 事件）。
+      若逐事件各当一条回合，reconcile 对账时会把一次回复拆成「思考空答案 + 无思考答案」两条，
+      历史错乱。故这里以 `user` 事件为回复单元分界：同一 user 之后的所有 assistant 内容
+      合并为一次回复（thinking 与 answer 不再被拆开）。
+    - 网关 agent（gemma 等）经外壳落盘的 text 块可能带 `\x01THINK\x01`/`\x01ANSW\x01` 哨兵，
       按 _classify_text 切分（思考/答案）。其他元数据事件（queue-operation/last-prompt 等）忽略。
     """
     import re as _re
     turns = []
+    pending = None  # 当前回复单元：{"think": [...], "ans": [...]}
+
+    def flush():
+        nonlocal pending
+        if pending is None:
+            return
+        content = _re.sub(r"^\s*---\s*", "", _re.sub(r"\s*---\s*$", "", _clean_sentinels("".join(pending["ans"]).strip()))).strip()
+        thinking = _clean_sentinels("\n\n".join(pending["think"])).strip()
+        if content or thinking:
+            turns.append(_normalize_turn(content, thinking))
+        pending = None
+
     with open(path, encoding="utf-8") as fh:
         for ln in fh:
             ln = ln.strip()
@@ -494,32 +510,35 @@ def _parse_claude_transcript(path: str) -> list:
                 o = json.loads(ln)
             except json.JSONDecodeError:
                 continue
-            if o.get("type") != "assistant":
+            t = o.get("type")
+            if t == "user":
+                flush()  # 新回复单元：先收口上一条（若存在）
+                pending = {"think": [], "ans": []}
                 continue
+            if t != "assistant":
+                continue
+            if pending is None:
+                pending = {"think": [], "ans": []}  # 容错：无 user 前置（历史/测试数据）
             msg = o.get("message", {})
             blocks = msg.get("content")
             if not isinstance(blocks, list):
                 if isinstance(blocks, str) and blocks.strip():
-                    turns.append(_normalize_turn(_clean_sentinels(blocks).strip(), ""))
+                    pending["ans"].append(_clean_sentinels(blocks).strip())
                 continue
-            think, ans = [], []
             for b in blocks:
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
                 if bt == "thinking":
-                    think.append(b.get("thinking") or b.get("text", ""))
+                    pending["think"].append(b.get("thinking") or b.get("text", ""))
                 elif bt == "text":
-                    t = b.get("text", "")
-                    if THINK_SENT in t or ANSW_SENT in t:
-                        for kind, txt in _classify_text(None, t):
-                            (think if kind == "thinking" else ans).append(txt)
+                    t2 = b.get("text", "")
+                    if THINK_SENT in t2 or ANSW_SENT in t2:
+                        for kind, txt in _classify_text(None, t2):
+                            (pending["think"] if kind == "thinking" else pending["ans"]).append(txt)
                     else:
-                        ans.append(t)
-            content = _re.sub(r"^\s*---\s*", "", _re.sub(r"\s*---\s*$", "", _clean_sentinels("".join(ans)).strip())).strip()
-            thinking = _clean_sentinels("\n\n".join(think)).strip()
-            if content or thinking:
-                turns.append(_normalize_turn(content, thinking))
+                        pending["ans"].append(t2)
+    flush()  # 文件尾收口最后一条回复单元
     return turns
 
 

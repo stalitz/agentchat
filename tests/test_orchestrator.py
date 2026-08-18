@@ -355,5 +355,48 @@ class TestOrchestrator(unittest.TestCase):
         self.assertFalse(log[1].get("first_turn"))
 
 
+    def test_agent_error_aborts_debate(self):
+        # agent 执行失败（error 事件）：不得把错误当议题继续讨论，会话直接中止；
+        # 失败轮不落 agent 发言（避免错误文本/空回答进历史），落 system 错误消息
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
+        s.runtimes["A"] = StubRuntime([("error", "Ollama 挂了")])
+        self.run_session(s, task="设计登录")
+        starts = [e["agent"] for e in rec.events if e.get("type") == "turn_start"]
+        self.assertEqual(starts, ["A"], "A 失败后不应继续讨论（B 不应发言）")
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msgs = [m for m in msgs if m["speaker"] == "A"]
+        self.assertEqual(a_msgs, [], "失败轮不应把错误当 A 的发言落盘")
+        self.assertTrue(any(m["speaker"] == "system" and "执行出错" in m["content"] for m in msgs),
+                        "应落 system 错误消息说明原因")
+
+    def test_claude_error_text_treated_as_failure(self):
+        # claude 外壳把 API 失败渲染成普通文本（如 API Error: ...）：编排器必须识别并中止，
+        # 不能把它当正常发言落盘、再喂给下一个 agent（历史 bug：两 agent 基于报错信息讨论）
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
+        s.runtimes["A"] = StubRuntime([
+            ("text", "API Error: API returned an empty or malformed response (HTTP 200)")])
+        self.run_session(s, task="男人和女人谁更聪明")
+        starts = [e["agent"] for e in rec.events if e.get("type") == "turn_start"]
+        self.assertEqual(starts, ["A"], "错误文本轮后不应继续讨论")
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msgs = [m for m in msgs if m["speaker"] == "A"]
+        self.assertEqual(a_msgs, [], "错误文本不得作为 A 的正常发言落盘")
+        self.assertTrue(any(m["speaker"] == "system" and "执行出错" in m["content"] for m in msgs))
+
+    def test_agent_error_chat_mode_records_system(self):
+        # 单 agent 对话模式：执行失败同样不落 agent 发言、落 system 错误消息
+        a1 = models.AgentConfig(name="A", type="fake")
+        s, rec = make_session([a1], self.proj, self.sid)
+        s.runtimes["A"] = StubRuntime([("error", "超时")])
+        self.run_session(s, task="你好")
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        self.assertTrue(any(m["speaker"] == "system" and "执行出错" in m["content"] for m in msgs))
+        self.assertEqual([m for m in msgs if m["speaker"] == "A"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

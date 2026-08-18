@@ -316,6 +316,39 @@ class TestCliTranscriptParse(unittest.TestCase):
         turns = executor._parse_claude_transcript(p)
         self.assertEqual(turns[0]["content"], "真正答案 --- 中间分隔")
 
+    def test_parse_claude_transcript_merges_split_turn(self):
+        # claude-code 外壳把「一次回复」拆成 thinking-only + text-only 两个独立 assistant 事件
+        # （中间无 user 事件，实测 2.1.212 对原生 thinking 块的行为）。
+        # 解析器必须以 user 事件为分界合并为一条，否则 reconcile 会把一次回复拆成两条（历史 bug）。
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "thinking", "thinking": "思考过程内容"}]}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "最终答案内容"}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 1, "同一 user 后的 thinking/text 应合并为一条回复")
+        self.assertEqual(turns[0]["content"], "最终答案内容")
+        self.assertEqual(turns[0]["thinking"], "思考过程内容")
+
+    def test_parse_claude_transcript_user_boundary_keeps_separate(self):
+        # 两次真实回复之间必有 user 事件：user 分界处不得合并
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题1"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "thinking", "thinking": "第一次思考"}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题2"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "第二次答案"}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 2, "两次回复中间有 user 事件，应保持两条")
+        self.assertEqual(turns[0]["content"], "")
+        self.assertEqual(turns[0]["thinking"], "第一次思考")
+        self.assertEqual(turns[1]["content"], "第二次答案")
+        self.assertEqual(turns[1]["thinking"], "")
+
     def test_parse_codex_transcript_best_effort(self):
         # codex 格式多变：尽力解析出 assistant 文本，解析不出返回空（对账时跳过）
         p = self._write([

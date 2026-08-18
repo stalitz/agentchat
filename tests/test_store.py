@@ -102,6 +102,31 @@ class TestStore(unittest.TestCase):
         self.assertTrue(res["skipped"])
         self.assertEqual(store.read_session(str(p), s["id"])["messages"][0]["content"], "仅本地")
 
+    def test_reconcile_removes_extra_when_cli_fewer(self):
+        # CLI 回合数少于本地（本地曾被拆条残留：一次回复被拆成 thinking-only + text-only 两条）：
+        # 对账后应删除本地末尾多余的 agent 消息，收敛为与 CLI 一致
+        p = TMP / "rec3"
+        s = store.create_session(str(p), "拆条修复")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "A", "role": "甲", "content": "完整回答1", "thinking": "思考1"})
+        store.append_message(str(p), s["id"], {"round": 1, "speaker": "B", "role": "乙", "content": "B的回答"})
+        store.append_message(str(p), s["id"], {"round": 2, "speaker": "A", "role": "甲", "content": "", "thinking": "思考1残留"})
+        store.append_message(str(p), s["id"], {"round": 3, "speaker": "A", "role": "甲", "content": "完整回答2", "thinking": "思考2"})
+        store.append_message(str(p), s["id"], {"round": 4, "speaker": "A", "role": "甲", "content": "", "thinking": "思考2残留"})
+        cli_turns = [
+            {"content": "完整回答1", "thinking": "思考1"},
+            {"content": "完整回答2", "thinking": "思考2"},
+        ]
+        res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        msgs = store.read_session(str(p), s["id"])["messages"]
+        a_msgs = [m for m in msgs if m["speaker"] == "A"]
+        self.assertEqual(len(a_msgs), 2, "多余的拆条残留应被删除")
+        self.assertEqual(a_msgs[0]["content"], "完整回答1")
+        self.assertEqual(a_msgs[1]["content"], "完整回答2")
+        self.assertEqual(a_msgs[1]["thinking"], "思考2")
+        # B 不受影响
+        self.assertEqual([m for m in msgs if m["speaker"] == "B"][0]["content"], "B的回答")
+        self.assertTrue(res["appended"] == 0)
+
 
 
         self.assertEqual(store.list_sessions(str(TMP / "nope")), [])

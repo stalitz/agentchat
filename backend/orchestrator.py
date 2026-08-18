@@ -15,6 +15,16 @@ def _clean_answer(text: str) -> str:
     return t
 
 
+# claude-code 外壳把 API 失败 / resume 异常渲染为普通文本而非结构化错误（实测出现过的）：
+# 这类"回答"不是有效发言，须按执行失败处理——否则会被落盘成正常内容、再被当议题喂给下一个 agent。
+_CLAUDE_ERROR_PREFIXES = ("API Error:", "No response requested.", "Request Failed:")
+
+
+def _looks_like_claude_error(text: str) -> bool:
+    t = (text or "").strip()
+    return any(t.startswith(p) for p in _CLAUDE_ERROR_PREFIXES)
+
+
 class Session:
     """一场会话的编排器。
 
@@ -143,7 +153,14 @@ class Session:
                 return text.strip()
         return ""
 
-    async def _run_turn(self, agent: AgentConfig, round_i: int, inject: str | None) -> str:
+    async def _run_turn(self, agent: AgentConfig, round_i: int, inject: str | None) -> tuple[str, list[str]]:
+        """执行单轮，返回 (full, errors)。
+
+        errors 非空 = 本轮执行失败（agent 没有产出有效回答）：
+        - 不把任何内容当作 agent 发言落盘（错误文本/空响应会被误读为正常回答，
+          并作为「对手发言」喂给下一个 agent，导致两个 agent 基于报错信息继续讨论——历史 bug）；
+        - 落一条 system 错误消息说明原因，调用方（_debate/_chat_turn）据此中止。
+        """
         # 首轮（round_i==0 且 debate 模式）标记 first_turn 仅用于记录/排查；
         # 共识判定交由提示词（见 _build_prompt）引导，不再下发明示「不可讨论就 TERMINATE」指令。
         first_turn = round_i == 0 and not self.single
@@ -160,6 +177,7 @@ class Session:
         runtime = self.runtimes[agent.name]
         collected = []
         thinking_parts = []
+        errors: list[str] = []
         async for kind, text in runtime.run(
             prompt, self.project_path, self.timeout,
             meta={"round_index": round_i, "max_rounds": self.max_rounds},
@@ -172,12 +190,27 @@ class Session:
                 thinking_parts.append(text)
                 await self._emit(type="thinking", agent=agent.name, text=text)
             elif kind == "error":
+                errors.append(text)
                 await self._emit(type="error", agent=agent.name, text=text)
             # done: 忽略
         full = "".join(collected).strip()
         # 剥离 gemma 等推理模型在 reasoning/answer 之间输出的 '---' 分隔符噪声
         # （Ollama 常把 --- 作为思考与答案的分界，原样落库会被前端显示成一条横线）
         full = _clean_answer(full)
+        # claude 外壳把 API 失败/resume 异常渲染成普通文本（如 API Error: ... / No response requested.），
+        # 这类"回答"不是有效发言，必须按失败处理，否则会被当议题继续讨论。
+        if full and _looks_like_claude_error(full):
+            errors.append(full)
+        # 持久化首次创建的 CLI 会话 id（resume 后续不变）——供点历史会话时恢复对应 agent 会话
+        # （无论成败 claude 进程都已启动，失败轮也要记录，避免下次重开 CLI 会话）
+        if runtime.cli_session_id and self.agent_sessions.get(agent.name) != runtime.cli_session_id:
+            self.agent_sessions[agent.name] = runtime.cli_session_id
+            store.set_agent_session_id(self.project_path, self.session_id, agent.name, runtime.cli_session_id)
+        await self._emit(type="turn_end", agent=agent.name)
+        if errors:
+            # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止
+            await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
+            return "", errors
         thinking_text = "\n\n".join(thinking_parts).strip()
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。
@@ -188,12 +221,7 @@ class Session:
         }
         self.history.append(entry)
         store.append_message(self.project_path, self.session_id, entry)
-        # 持久化首次创建的 CLI 会话 id（resume 后续不变）——供点历史会话时恢复对应 agent 会话
-        if runtime.cli_session_id and self.agent_sessions.get(agent.name) != runtime.cli_session_id:
-            self.agent_sessions[agent.name] = runtime.cli_session_id
-            store.set_agent_session_id(self.project_path, self.session_id, agent.name, runtime.cli_session_id)
-        await self._emit(type="turn_end", agent=agent.name)
-        return full
+        return full, errors
 
     # ---------------- 入口 ----------------
     async def start(self, initial_task: str):
@@ -218,6 +246,7 @@ class Session:
         text = (text or "").strip()
         if text:
             await self._record_human(text, "用户")
+        # 失败时 _run_turn 已落 system 错误消息并广播 error；单 agent 本轮即结束，无需额外处理
         await self._run_turn(self.agents[0], len(self.history), text or None)
         await self._emit(type="run_end", mode="chat")
 
@@ -241,8 +270,13 @@ class Session:
                 await self._emit(type="system", msg="已继续")
 
             current = self.agents[round_i % len(self.agents)]
-            full = await self._run_turn(current, round_i, pending_inject)
+            full, errors = await self._run_turn(current, round_i, pending_inject)
             pending_inject = None
+
+            # agent 执行失败（API 错误 / 空响应 / resume 异常）：不把报错信息当议题继续讨论，
+            # 直接中止（_run_turn 已落 system 错误消息说明原因）。
+            if errors:
+                break
 
             # 共识终止：至少完成两轮完整往返（每个 agent 都发过两次言），
             # 否则把 TERMINATE 当普通文本忽略，继续讨论——

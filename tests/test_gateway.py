@@ -105,6 +105,29 @@ class TestStreamTranslator(unittest.TestCase):
         md = [e for e in evs if e["type"] == "message_delta"][-1]
         self.assertEqual(md["delta"]["stop_reason"], "tool_use")
 
+    def test_message_start_uses_estimated_input_tokens(self):
+        # message_start 的 input_tokens 用请求估算值（Ollama 真实值流末才返回），避免恒为 0
+        t = gateway._AnthropicTranslator(model="gemma", est_input_tokens=88)
+        evs = t.feed({"content": "hi"})
+        ms = [e for e in evs if e["type"] == "message_start"][0]
+        self.assertEqual(ms["message"]["usage"]["input_tokens"], 88)
+
+    def test_finish_usage_from_ollama(self):
+        # Ollama 流末 chunk 返回 usage 后，message_delta 应回填真实 tokens（UI 工具不再显示 0）
+        t = gateway._AnthropicTranslator(model="gemma", est_input_tokens=42)
+        t.feed({"content": "你好"})
+        t.usage = {"prompt_tokens": 100, "completion_tokens": 50}
+        fin = t.finish()
+        md = [e for e in fin if e["type"] == "message_delta"][-1]
+        self.assertEqual(md["usage"]["input_tokens"], 100)
+        self.assertEqual(md["usage"]["output_tokens"], 50)
+
+    def test_estimate_input_tokens(self):
+        # 估算：文本长度/4 粗估，至少 1
+        body = {"system": "你是助手", "messages": [{"role": "user", "content": "你好世界"}]}
+        self.assertGreater(gateway._estimate_input_tokens(body), 0)
+        self.assertEqual(gateway._estimate_input_tokens({"messages": []}), 1)
+
 
 class TestNonStreamResponse(unittest.TestCase):
     def test_translate(self):
@@ -178,6 +201,18 @@ class _FakeErrOllamaClient:
         return _FakeOllamaCtx([], status_code=400, err=b'{"error":{"message":"model \'gemma\' not found"}}')
 
 
+class _FakeEmptyOllamaClient:
+    """HTTP 200 但流完全为空（Ollama 空/畸形响应，claude-code 会渲染成 API Error 文本）。"""
+    def __init__(self, *a, **k):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    def stream(self, method, url, json=None, headers=None):
+        return _FakeOllamaCtx([])
+
+
 class _FakeRequest:
     def __init__(self, body):
         self._body = body
@@ -225,6 +260,27 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
             gateway.httpx.AsyncClient = orig
         self.assertIn("event: error", out)
         self.assertIn("model 'gemma' not found", out)
+
+    def test_stream_route_empty_stream_yields_error(self):
+        # HTTP 200 但空流（Ollama 空/畸形响应）：网关必须产出 SSE error 事件，
+        # 否则 claude-code 会把「API Error: empty or malformed response」渲染成普通文本
+        # 混进正文、被编排器当正常发言喂给下一个 agent（历史 bug）。
+        orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeEmptyOllamaClient
+        try:
+            async def run():
+                resp = await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                    {"ollama_base_url": "http://x"},
+                )
+                out = "".join([c async for c in resp.body_iterator])
+                return out
+            out = asyncio.run(run())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        self.assertIn("event: error", out)
+        self.assertIn("empty or malformed stream", out)
+        self.assertNotIn("message_stop", out, "空流应直接报错，不产出正常 message_stop")
 
 
 if __name__ == "__main__":

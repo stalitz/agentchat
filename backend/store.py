@@ -300,7 +300,9 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
 
     对齐规则（agent 为准）：按本地 `speaker==agent_name` 的顺序逐条对齐 CLI 回合——
     - CLI 第 k 条有内容：覆盖本地第 k 条的 content/thinking（冲突以 agent 为准）；
-    - CLI 多出本地没有的回合：追加到末尾（崩写/掉轮恢复）。
+    - CLI 多出本地没有的回合：追加到末尾（崩写/掉轮恢复）；
+    - CLI 回合少于本地：删除本地末尾多余的 agent 消息（claude 外壳曾把一次回复拆成多条
+      assistant 事件，旧解析把拆条各当一条回合、对账后本地多出残留——修复解析器后按此收敛）。
     仅当 cli_turns 非空才落盘；cli_turns 为 None/空（找不到 transcript = 离线）则保持本地不动。
     """
     if not cli_turns:
@@ -331,6 +333,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                     "content": new_content, "thinking": new_think,
                 })
                 appended += 1
+        # CLI 回合少于本地：删除末尾多余的本地消息（拆条残留收敛；reverse 保下标正确）
+        if len(cli_turns) < len(idxs):
+            for i in sorted(idxs[len(cli_turns):], reverse=True):
+                msgs.pop(i)
+                changed += 1
         if changed or appended:
             s["updated_at"] = _now()
             _save_sessions(project_path, sessions)

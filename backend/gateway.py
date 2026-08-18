@@ -141,11 +141,39 @@ def _map_stop(reason: str | None) -> str:
     }.get(reason or "", "end_turn")
 
 
+def _estimate_input_tokens(body: dict) -> int:
+    """估算请求输入 token 数。
+
+    message_start 阶段 Ollama 尚未返回 usage（其真实 prompt_tokens 在流末 chunk 才有），
+    先用文本长度/4 粗估，避免 transcript 里 input_tokens 恒为 0；message_delta 会用
+    Ollama 真实 usage 覆盖。
+    """
+    total = 0
+    sys = body.get("system")
+    if isinstance(sys, str):
+        total += len(sys)
+    elif isinstance(sys, list):
+        total += sum(len(b.get("text", "") or "") for b in sys if isinstance(b, dict))
+    for m in body.get("messages", []):
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                total += len(b.get("text", "") or "")
+                if b.get("type") == "tool_use":
+                    total += len(json.dumps(b.get("input", {}), ensure_ascii=False))
+    return max(1, total // 4)
+
+
 class _AnthropicTranslator:
     """把 OpenAI 流式 chunk 增量翻译为 Anthropic SSE 事件序列（可单测的纯逻辑）。"""
 
-    def __init__(self, model: str = ""):
+    def __init__(self, model: str = "", est_input_tokens: int = 0):
         self.model = model
+        self.est_input_tokens = est_input_tokens
         self.started = False
         self.text_started = False
         self.cur_block = 0  # 当前 text 块 index：0=reasoning（思考），1=answer（正文）
@@ -167,7 +195,9 @@ class _AnthropicTranslator:
                 "role": "assistant",
                 "model": self.model,
                 "content": [],
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                # input_tokens 先用请求文本估算（Ollama 真实值流末才返回）；
+                # output_tokens 由 finish() 的 message_delta 用 Ollama usage 回填
+                "usage": {"input_tokens": self.est_input_tokens, "output_tokens": 0},
             },
         }]
 
@@ -249,7 +279,12 @@ class _AnthropicTranslator:
         events.append({
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": None},
-            "usage": {"output_tokens": usage.get("completion_tokens", 0)},
+            # 用 Ollama 真实 usage 回填（流式请求已带 stream_options.include_usage）：
+            # 否则 transcript 里 output_tokens 恒为 0，UI 工具显示「输出 0」
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens") or self.est_input_tokens or 0,
+                "output_tokens": usage.get("completion_tokens", 0),
+            },
         })
         events.append({"type": "message_stop"})
         return events
@@ -317,6 +352,9 @@ async def handle_messages(req: Request, settings: dict):
             return JSONResponse(_non_stream_response(body, r.json()))
 
     oa["stream"] = True
+    # 请求 Ollama 在流末 chunk 返回真实 usage（OpenAI 标准字段，Ollama 已支持），
+    # 使 transcript 里 input/output tokens 非 0（问题：UI 工具显示「输入 0 输出 0」）。
+    oa["stream_options"] = {"include_usage": True}
 
     async def gen():
         async with httpx.AsyncClient(timeout=600) as client:
@@ -329,13 +367,14 @@ async def handle_messages(req: Request, settings: dict):
                         em = err.decode("utf-8", "replace")
                     yield _sse_event({"type": "error", "error": {"type": "api_error", "message": "Ollama gateway error: " + str(em)[:500]}})
                     return
-                translator = _AnthropicTranslator(model=body.get("model", ""))
+                translator = _AnthropicTranslator(model=body.get("model", ""), est_input_tokens=_estimate_input_tokens(body))
+                got_any = False  # 是否收到过任何内容增量（空流检测）
                 async for line in r.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
-                        continue
+                        break
                     try:
                         chunk = json.loads(data)
                     except Exception:
@@ -344,11 +383,20 @@ async def handle_messages(req: Request, settings: dict):
                     delta = choice.get("delta") or {}
                     if chunk.get("usage"):
                         translator.usage = chunk["usage"]
+                    if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                        got_any = True
                     for ev in translator.feed(delta):
                         yield _sse_event(ev)
-                    if choice.get("finish_reason"):
+                    if choice.get("finish_reason") and not translator.stop_reason:
                         translator.stop_reason = _map_stop(choice["finish_reason"])
-                        break
+                if not got_any and not (translator.usage or {}).get("completion_tokens"):
+                    # HTTP 200 但空流/畸形流：claude-code 会把这种情况渲染成普通文本
+                    # 「API Error: API returned an empty or malformed response ...」混进正文，
+                    # 随后被编排器当正常发言喂给下一个 agent。这里主动产出 SSE error，
+                    # 让 claude 走错误通道（result is_error），编排器据此中止会话而非继续讨论。
+                    yield _sse_event({"type": "error", "error": {"type": "api_error",
+                        "message": "Ollama gateway error: empty or malformed stream (HTTP 200), no content received"}})
+                    return
                 for ev in translator.finish():
                     yield _sse_event(ev)
 
