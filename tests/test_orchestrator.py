@@ -427,5 +427,24 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual([m for m in msgs if m["speaker"] == "A"], [])
 
 
+    def test_end_discussion_logs_tool_usage(self):
+        # 工具调用日志：end_discussion 每次调用都落盘（rejected/proposed/confirmed），可经 read_tool_log 读取
+        # A 从 round0 起每轮都发（round0/2 未达 floor=3 → rejected）；B round3 提议、A round4 确认
+        a1 = models.AgentConfig(name="A", type="fake", fake_terminate_round=1)
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=4)
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
+        self.run_session(s, task="讨论日志")
+        log = store.read_tool_log(self.proj, self.sid)
+        self.assertTrue(log, "end_discussion 调用应写入工具日志")
+        actions = [e.get("action") for e in log]
+        self.assertIn("proposed", actions, "应有提议记录")
+        self.assertIn("confirmed", actions, "应有确认记录")
+        # 未达最小轮数时提前调用应记 rejected（A 在 round0/2 提前调用被拒）
+        self.assertIn("rejected", actions)
+        self.assertEqual(actions[0], "rejected", "round0 的调用应被拒")
+        # 每条日志含 agent / round_i / ts
+        for e in log:
+            self.assertTrue(e.get("agent") and e.get("round_i") is not None and e.get("ts"))
+
 if __name__ == "__main__":
     unittest.main()

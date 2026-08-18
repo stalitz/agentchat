@@ -1,15 +1,9 @@
 import asyncio
-import json
 import re
-from pathlib import Path
 
 from . import store
 from .executor import AgentRuntime
 from .models import AgentConfig
-
-# MCP 共享状态文件：end_discussion 工具（backend/terminate_signal_mcp.py）读取它做
-# 最小轮数 gate 与两阶段确认判定；编排层每轮启动 claude 前写入（app 单会话串行，无竞态）。
-TERMINATE_STATE_FILE = "/tmp/agentchat_terminate_state.json"
 
 
 def _clean_answer(text: str) -> str:
@@ -70,6 +64,9 @@ class Session:
         self.terminate_confirm = False
 
     async def _emit(self, **kw):
+        # 所有事件带 sid（会话 id）：多会话并发时前端据此区分事件归属，
+        # 只渲染当前选中会话的流式内容、按会话更新按钮状态。
+        kw.setdefault("sid", self.session_id)
         await self.broadcast(kw)
 
     def stop(self):
@@ -139,24 +136,6 @@ class Session:
         )
         return "\n\n".join(parts)
 
-    def _write_terminate_state(self, agent: AgentConfig, round_i: int):
-        """把本轮终止状态写入 MCP 共享文件（terminate-signal 服务读取，做 gate 判定）。
-
-        每轮启动 claude 之前调用；提议状态（proposed_by/reason）由 _run_turn 状态机更新后
-        立即重写，供下一轮对方 claude 进程的 MCP 实例读取。
-        """
-        try:
-            Path(TERMINATE_STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
-            Path(TERMINATE_STATE_FILE).write_text(json.dumps({
-                "round_i": round_i,
-                "agent_count": len(self.agents),
-                "current_agent": agent.name,
-                "proposed_by": self.terminate_proposed_by or "",
-                "reason": self.terminate_reason or "",
-            }, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-
     # ---------------- 单轮执行（两种模式共用） ----------------
     async def _record_human(self, text: str, role: str):
         entry = {"round": len(self.history), "speaker": "human", "role": role, "content": text}
@@ -207,8 +186,6 @@ class Session:
             pass
         await self._emit(type="turn_start", agent=agent.name, role=agent.role, atype=agent.type)
         runtime = self.runtimes[agent.name]
-        # 写 MCP 共享状态（本轮轮次/调用者/提议状态）——claude 启动后其 MCP 实例读它做判定
-        self._write_terminate_state(agent, round_i)
         collected = []
         thinking_parts = []
         errors: list[str] = []
@@ -248,21 +225,39 @@ class Session:
             # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止
             await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
             return "", errors
-        # end_discussion 两阶段终止状态机（与 MCP server 判定配合）：
-        # 未达最小轮数时 MCP 已返回 isError 拒绝（这里不记录）；达标后：无提议→记提议（写状态文件
-        # 供下一轮对方读取）；对方已提议→确认达成（terminate_confirm 由 _debate 据此收敛）。
+        # end_discussion 终止状态机（编排层权威判定；MCP 服务仅做无状态确认通道）：
+        # 未达最小轮数 → 拒绝（记 rejected 日志，不记录状态）；达标后：无提议→记提议（proposed）；
+        # 同方重复→repeat；对方已提议→确认达成（terminate_confirm，_debate 据此收敛）。
         floor = 2 * len(self.agents) - 1
         for tu in tool_uses:
-            if not isinstance(tu, dict) or tu.get("name") != "end_discussion" or round_i < floor:
+            if not isinstance(tu, dict) or tu.get("name") != "end_discussion":
                 continue
             reason = (tu.get("input") or {}).get("reason", "") or ""
+            if round_i < floor:
+                store.append_tool_log(self.project_path, self.session_id, {
+                    "action": "rejected", "agent": agent.name, "round_i": round_i,
+                    "reason": reason, "msg": f"未达最小轮数（floor={floor}），终止被拒",
+                })
+                continue
             if self.terminate_proposed_by is None:
                 self.terminate_proposed_by = agent.name
                 self.terminate_reason = reason
-                self._write_terminate_state(agent, round_i)  # 立即落盘，下一轮对方 MCP 可读到
-            elif self.terminate_proposed_by != agent.name:
+                store.append_tool_log(self.project_path, self.session_id, {
+                    "action": "proposed", "agent": agent.name, "round_i": round_i,
+                    "reason": reason, "msg": "已记录终止提议，等待对方确认",
+                })
+            elif self.terminate_proposed_by == agent.name:
+                store.append_tool_log(self.project_path, self.session_id, {
+                    "action": "repeat", "agent": agent.name, "round_i": round_i,
+                    "reason": reason, "msg": "本方重复提议，仍在等待对方确认",
+                })
+            else:
                 self.terminate_confirm = True
                 self.terminate_reason = reason or self.terminate_reason
+                store.append_tool_log(self.project_path, self.session_id, {
+                    "action": "confirmed", "agent": agent.name, "round_i": round_i,
+                    "reason": self.terminate_reason, "msg": "对方确认，讨论终止",
+                })
         thinking_text = "\n\n".join(thinking_parts).strip()
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。

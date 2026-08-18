@@ -501,3 +501,35 @@ def read_prompt_log(project_path: str, sid: str) -> list:
             except Exception:
                 pass
     return out
+
+
+# ---- 工具调用日志（tool log）：记录每次 end_discussion 调用（无论被拒/提议/确认），便于排查 ----
+# 存储结构：<project>/.agentchat/tools/<sid>.jsonl，每行一条
+# {ts, agent, round_i, action(rejected/proposed/repeat/confirmed), reason, msg}
+def tool_log_dir(project_path: str) -> Path:
+    p = memory_dir(project_path) / "tools"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def append_tool_log(project_path: str, sid: str, entry: dict) -> None:
+    entry = dict(entry)
+    entry.setdefault("ts", _now())
+    f = tool_log_dir(project_path) / f"{sid}.jsonl"
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_tool_log(project_path: str, sid: str) -> list:
+    f = tool_log_dir(project_path) / f"{sid}.jsonl"
+    if not f.exists():
+        return []
+    out = []
+    for line in f.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out

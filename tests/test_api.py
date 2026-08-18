@@ -209,5 +209,57 @@ class TestAPI(unittest.TestCase):
         self.assertIn("parent", d)
 
 
+    def test_ws_parallel_sessions_both_run(self):
+        # 多会话并行：会话 A 正在跑时，会话 B 可正常发起（不被全局锁拒绝），两会话独立 turn
+        sid_a = store.create_session(str(TMP / "api_proj"), "并行A")["id"]
+        sid_b = store.create_session(str(TMP / "api_proj"), "并行B")["id"]
+        with self.client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "start", "project_id": self.pr_id,
+                          "team_id": self.tm_id, "session_id": sid_a, "task": "任务A", "max_rounds": 50})
+            # 等 A 开跑（收到首个 turn_start）
+            got_a_start = False
+            for _ in range(20):
+                ev = ws.receive_json()
+                if ev.get("type") == "turn_start":
+                    got_a_start = True
+                    break
+            self.assertTrue(got_a_start, "A 应开始运行")
+            # A 还在跑时发起 B：不应被拒，B 应正常开始
+            ws.send_json({"action": "start", "project_id": self.pr_id,
+                          "team_id": self.tm_id, "session_id": sid_b, "task": "任务B", "max_rounds": 2})
+            got_b_start, got_err = False, False
+            for _ in range(30):
+                ev = ws.receive_json()
+                if ev.get("type") == "turn_start":
+                    got_b_start = True
+                    break
+                if ev.get("type") == "error":
+                    got_err = True
+                    break
+            self.assertFalse(got_err, "并行会话 B 不应被拒绝")
+            self.assertTrue(got_b_start, "B 应正常开始（与 A 并行）")
+            # 停止 A（避免后台任务挂住测试进程）；B 会自己跑完（max_rounds=2）
+            ws.send_json({"action": "stop", "session_id": sid_a})
+        self.client.delete(f"/api/session/{self.pr_id}/{sid_a}")
+        self.client.delete(f"/api/session/{self.pr_id}/{sid_b}")
+
+    def test_tools_endpoint_returns_log(self):
+        # 工具调用日志（end_discussion）应可经接口读取（本用例 fake 无 tool_use，返回空数组即可）
+        sid = store.create_session(str(TMP / "api_proj"), "工具日志")["id"]
+        with self.client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "start", "project_id": self.pr_id,
+                          "team_id": self.tm_id, "session_id": sid, "task": "设计登录", "max_rounds": 1})
+            for _ in range(30):
+                try:
+                    ev = ws.receive_json()
+                except Exception:
+                    break
+                if ev.get("type") == "run_end":
+                    break
+        r = self.client.get(f"/api/session/{self.pr_id}/{sid}/tools")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("tools", r.json())
+        self.client.delete(f"/api/session/{self.pr_id}/{sid}")
+
 if __name__ == "__main__":
     unittest.main()

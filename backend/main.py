@@ -17,7 +17,9 @@ ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 
 clients: set[WebSocket] = set()
-session: Session | None = None
+# 会话注册表：sid -> Session。多会话可并行——每个会话独立 running/stop/pause/inject，
+# 只锁自己，互不干扰（事件均带 sid，前端按会话归属渲染）。
+sessions: dict[str, Session] = {}
 
 ACTION_CN = {"stop": "停止", "pause": "暂停", "resume": "继续", "inject": "介入"}
 
@@ -106,9 +108,10 @@ async def del_project(pid: str):
 
 # ---------------- 会话控制（走 WS） ----------------
 async def handle_start(msg: dict):
-    global session
-    if session and session.running:
-        await broadcast({"type": "error", "text": "当前会话正在运行，请等待本轮结束或点「停止」后再发。"})
+    sid = msg.get("session_id")
+    # 只锁本会话：同一会话正在运行时拒绝重复发起；其他会话不受影响（可并行）
+    if sid and sessions.get(sid) and sessions[sid].running:
+        await broadcast({"type": "error", "text": "该会话正在运行，请等待本轮结束或点「停止」后再发。"})
         return
     proj = store.get_project(msg["project_id"])
     team = store.get_team(msg["team_id"])
@@ -136,12 +139,12 @@ async def handle_start(msg: dict):
     # 单轮超时取全局设置（已不在 agent 上）
     timeout = settings.get("default_timeout", 300)
     # 会话（session）是历史的载体：优先用前端传入的 session_id，缺失则服务端新建
-    sid = msg.get("session_id")
     if not sid:
         title = (msg.get("task") or "").strip()[:24] or "新会话"
         sid = store.create_session(proj["path"], title)["id"]
-    session = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout)
-    asyncio.create_task(session.start(msg.get("task", "")))
+    sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout)
+    sessions[sid] = sess  # 注册；结束后保留（running=False，可继续/复用）
+    asyncio.create_task(sess.start(msg.get("task", "")))
 
 
 @app.websocket("/ws")
@@ -156,31 +159,33 @@ async def ws_endpoint(ws: WebSocket):
             if action == "start":
                 await handle_start(msg)
             elif action in ("stop", "pause", "resume", "inject"):
-                # 无运行中的会话时必须给出反馈，否则点了按钮「毫无反应」（历史 bug）
-                if not (session and session.running):
+                # 按 session_id 路由到对应会话（只操作目标会话，其他会话并行不受影响）
+                sid = msg.get("session_id")
+                s = sessions.get(sid) if sid else None
+                if not (s and s.running):
                     await broadcast({
                         "type": "error",
                         "text": f"当前没有正在运行的会话，「{ACTION_CN.get(action, action)}」无效。"
                                 "请先点「开始讨论」/「发送」。",
                     })
-                elif session.mode == "chat":
+                elif s.mode == "chat":
                     await broadcast({
                         "type": "error",
                         "text": f"单 agent 对话模式下「{ACTION_CN.get(action, action)}」不适用——"
                                 "直接在输入框发下一条消息即可。",
                     })
                 elif action == "stop":
-                    session.stop()
+                    s.stop()
                 elif action == "pause":
-                    session.pause()
+                    s.pause()
                 elif action == "resume":
-                    session.resume()
+                    s.resume()
                 elif action == "inject":
                     text = (msg.get("text") or "").strip()
                     if not text:
                         await broadcast({"type": "error", "text": "介入内容为空。"})
                     else:
-                        await session.inject(text)
+                        await s.inject(text)
                         await broadcast({"type": "system", "msg": "已排队人工介入，将在本轮结束后插入。"})
             elif action == "config" and msg.get("op") == "reload":
                 await ws.send_text(json.dumps(await get_config(), ensure_ascii=False))
@@ -262,6 +267,15 @@ async def get_prompt_log(pid: str, sid: str):
     if not proj:
         return {"prompts": []}
     return {"prompts": store.read_prompt_log(proj["path"], sid)}
+
+
+@app.get("/api/session/{pid}/{sid}/tools")
+async def get_tool_log(pid: str, sid: str):
+    """返回该会话的工具调用日志（end_discussion 每次调用：rejected/proposed/repeat/confirmed）。"""
+    proj = store.get_project(pid)
+    if not proj:
+        return {"tools": []}
+    return {"tools": store.read_tool_log(proj["path"], sid)}
 
 
 # 全局会话列表（跨项目扁平化），供前端左侧「会话」主导航使用；

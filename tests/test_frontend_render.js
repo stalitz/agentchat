@@ -285,14 +285,27 @@ setTimeout(async () => {
     check(doc.getElementById('btnStart').textContent.indexOf('讨论') >= 0, '辩论模式主按钮文案应含「讨论」');
 
     // ---- run_end 事件：结束后有议题则按钮恢复可点；空议题仍禁用（避免 agent 空跑）----
-    dom.window.running = true; dom.window.refreshSendBtn();
+    dom.window.curSid = 's_test';
+    dom.window.runningBySid = { s_test: true }; dom.window.refreshSendBtn();
     check(doc.getElementById('btnStart').disabled === true, '运行中主按钮应禁用');
     doc.getElementById('task').value = '下一代架构怎么定';   // 有议题才允许继续
-    dom.window.handleEvent({ type: 'run_end', mode: 'debate' });
+    dom.window.handleEvent({ type: 'run_end', mode: 'debate', sid: 's_test' });
     check(doc.getElementById('btnStart').disabled === false, '收到 run_end 且输入议题后主按钮应恢复可点');
     doc.getElementById('task').value = '';
     dom.window.refreshSendBtn();
     check(doc.getElementById('btnStart').disabled === true, '辩论模式空议题时主按钮应禁用（达成一致后空点继续不应让 agent 空跑）');
+
+    // ---- 多会话并行：其他会话在跑时当前会话按钮不受影响；其他会话事件不渲染到当前聊天区 ----
+    dom.window.curSid = 's_b';
+    dom.window.runningBySid = { s_a: true };   // 会话 A 正在跑，当前是 B
+    doc.getElementById('task').value = 'B 的议题';
+    dom.window.refreshSendBtn();
+    check(doc.getElementById('btnStart').disabled === false, '其他会话运行时，当前会话主按钮应可点（并行）');
+    dom.window.chat.innerHTML = '';
+    dom.window.handleEvent({ type: 'token', agent: 'A', text: 'A 的发言', sid: 's_a' });
+    check(doc.getElementById('chat').innerHTML === '', '其他会话的流式事件不应渲染到当前聊天区');
+    dom.window.handleEvent({ type: 'run_end', mode: 'debate', sid: 's_a' });
+    check(dom.window.runningBySid['s_a'] === false, '其他会话 run_end 应更新其 running 状态');
 
     // ---- 布局拖拽：列宽 + 聊天/输入区高度可调 ----
     const fire = (el, type, props) => el.dispatchEvent(new dom.window.MouseEvent(type, Object.assign({ bubbles: true }, props)));

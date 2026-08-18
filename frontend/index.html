@@ -215,6 +215,7 @@
         <div class="ctx-meta" id="ctxMeta"></div>
       </div>
       <button class="ghost" onclick="openPromptLog()">提示词</button>
+      <button class="ghost" onclick="openToolLog()">工具</button>
     </div>
     <div id="chat"></div>
     <div class="hsplit" id="splitChat" title="拖动调整聊天区 / 输入区高度"></div>
@@ -276,7 +277,8 @@ var curPid = null;          // 当前选中的项目 id
 var curTid = null;          // 当前会话所用 Team id（composer 下拉 / 单 agent 判定）
 var curProjSessions = [];   // 当前项目的会话列表
 var curMsgCount = 0;        // 当前会话已有消息条数（决定主按钮文案）
-var running = false;        // 是否有会话正在跑（跑的时候禁用主按钮）
+var runningBySid = {};   // sid -> bool：各会话是否正在跑（多会话并行，只禁用正在跑的会话）
+function isRunning(sid) { return sid ? !!runningBySid[sid] : false; }
 var expanded = { projects: {}, teams: {} };  // 树展开状态
 
 WS.onopen = function () { setStatus('已连接', true); };
@@ -365,19 +367,30 @@ makeHsplit('splitChat', '--composer-h');
 function setStatus(t, ok) { document.getElementById('status').textContent = t; }
 
 function handleEvent(ev) {
+  // 多会话并行：事件带 sid，只渲染当前选中会话的流式内容；
+  // 其他会话的事件仅更新其 running 状态（run_end 时刷新列表），不渲染到当前聊天区。
+  if (ev.sid && ev.sid !== curSid) {
+    if (ev.type === 'run_end') {
+      runningBySid[ev.sid] = false;
+      refreshSendBtn();
+      if (curPid) refreshSessionList(curPid);
+    }
+    return;
+  }
   switch (ev.type) {
     case 'system': addRow('sys', '系统', ev.msg); break;
     // 一次运行结束：对话模式只刷新会话列表（不重载聊天，免得滚动跳走）；
     // 辩论模式重载为持久化后的权威内容。
     case 'run_end':
-      running = false; refreshSendBtn();
+      if (ev.sid) runningBySid[ev.sid] = false;
+      refreshSendBtn();
       if (!curPid) break;
-      if (ev.mode === 'chat') { refreshSessionList(curPid); }
-      else {
-        setTimeout(function () {
-          loadProjectSessions(curPid).then(function () { if (curSid) openSession(curSid); });
-        }, 250);
-      }
+      refreshSessionList(curPid);
+      if (!ev.sid || ev.mode === 'chat') break;  // chat 模式只刷新列表；无 sid 的旧事件兼容
+      // 辩论模式：当前会话自己跑完，重载为持久化后的权威内容
+      setTimeout(function () {
+        loadProjectSessions(curPid).then(function () { if (curSid) openSession(curSid); });
+      }, 250);
       break;
     case 'human': addRow('human', ev.role || '人工介入', ev.text); break;
     case 'error': addRow('sys', '错误', ev.text); break;
@@ -745,7 +758,7 @@ function applyMode() {
 function refreshSendBtn() {
   var b = document.getElementById('btnStart');
   if (!b) return;
-  if (running) { b.disabled = true; b.textContent = isChatMode() ? '回复中…' : '讨论进行中…'; return; }
+  if (isRunning(curSid)) { b.disabled = true; b.textContent = isChatMode() ? '回复中…' : '讨论进行中…'; return; }
   // 输入为空时禁用：对话模式不能发空消息；辩论模式不能发起/继续空议题
   // （达成一致后若想继续，必须输入新议题；空点「继续讨论」不应再让 agent 空跑）
   var empty = !document.getElementById('task').value.trim();
@@ -756,7 +769,7 @@ function refreshSendBtn() {
 }
 
 function startSession() {
-  if (running) return;
+  if (isRunning(curSid)) return;
   if (!curPid) { alert('请先在左侧选择一个项目'); return; }
   var tid = document.getElementById('selTeam').value;
   if (!tid) { alert('该项目暂无 Team，请先创建并挂到项目'); return; }
@@ -767,16 +780,16 @@ function startSession() {
   var ready = curSid ? Promise.resolve(curSid) : createSessionOnServer((task.trim() || '新会话').slice(0, 24), tid);
   ready.then(function (sid) {
     curSid = sid;
-    running = true; refreshSendBtn();
+    runningBySid[sid] = true; refreshSendBtn();
     WS.send(JSON.stringify({ action: 'start', project_id: curPid, team_id: tid, session_id: sid, task: task, max_rounds: mr }));
     document.getElementById('task').value = '';  // 内容已作为消息回显，输入框清空
-  }).catch(function (e) { running = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
+  }).catch(function (e) { if (curSid) runningBySid[curSid] = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
 }
-function ctrl(a) { WS.send(JSON.stringify({ action: a })); }
+function ctrl(a) { WS.send(JSON.stringify({ action: a, session_id: curSid })); }
 function doInject() {
   var x = document.getElementById('inject').value.trim();
   if (!x) { setStatus('介入内容为空', false); return; }
-  WS.send(JSON.stringify({ action: 'inject', text: x }));
+  WS.send(JSON.stringify({ action: 'inject', text: x, session_id: curSid }));
   document.getElementById('inject').value = '';
 }
 function composeClear() {
@@ -988,6 +1001,38 @@ function openPromptLog() {
     .catch(function (e) { c.innerHTML = '<h3>提示词日志</h3><div class="ctx-meta">加载失败: ' + esc(e.message) + '</div>'; });
 }
 function closePromptLog() { document.getElementById('promptModal').classList.remove('show'); }
+// 工具调用日志：end_discussion 每次调用（被拒/提议/重复/确认）的落盘记录
+var TOOL_ACTION_CN = { rejected: '被拒（未达最小轮数）', proposed: '提议终止', repeat: '重复提议', confirmed: '对方确认·终止' };
+function openToolLog() {
+  if (!curSid) { alert('请先选择一个会话'); return; }
+  var c = document.getElementById('promptCard');
+  c.innerHTML = '<h3>工具调用日志</h3><div class="ctx-meta">加载中…</div>';
+  document.getElementById('promptModal').classList.add('show');
+  fetch('/api/session/' + curPid + '/' + curSid + '/tools', { cache: 'no-store' })
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var ts = d.tools || [];
+      if (!ts.length) {
+        c.innerHTML = '<h3>工具调用日志</h3><div class="ctx-meta">该会话暂无 end_discussion 调用记录（辩论中 agent 未调用过终止工具）。</div>' +
+          '<div style="display:flex;gap:8px;margin-top:10px;"><button onclick="closePromptLog()">关闭</button></div>';
+        return;
+      }
+      var html = '<h3>工具调用日志（' + ts.length + ' 条）</h3>';
+      ts.forEach(function (t, i) {
+        var color = t.action === 'confirmed' ? '#2f9e63' : (t.action === 'rejected' ? '#d33' : '#3b6fd4');
+        html += '<div style="margin-top:12px; border:1px solid #eee; border-radius:8px; padding:10px;">' +
+          '<div class="ctx-meta">#' + (i + 1) + ' · 第' + (t.round_i + 1) + '轮 · ' + esc(t.agent) +
+          ' · ' + esc(t.ts || '') + '</div>' +
+          '<div style="margin:6px 0;"><span style="color:' + color + ';font-weight:500;">' +
+          esc(TOOL_ACTION_CN[t.action] || t.action) + '</span></div>' +
+          '<div class="prompt-text" style="white-space:pre-wrap;">' + esc(t.reason || '') + '</div>' +
+          '<div class="ctx-meta">' + esc(t.msg || '') + '</div></div>';
+      });
+      html += '<div style="display:flex;gap:8px;margin-top:14px;"><button onclick="closePromptLog()">关闭</button></div>';
+      c.innerHTML = html;
+    })
+    .catch(function (e) { c.innerHTML = '<h3>工具调用日志</h3><div class="ctx-meta">加载失败: ' + esc(e.message) + '</div>'; });
+}
 function cfg_agents_by_name(name) {
   var keys = Object.keys(cfg.agents);
   for (var i = 0; i < keys.length; i++) { if (cfg.agents[keys[i]].name === name) return cfg.agents[keys[i]].type; }
