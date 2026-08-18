@@ -79,23 +79,21 @@ class TestStore(unittest.TestCase):
         store.append_message(str(p), s["id"], {"round": 1, "speaker": "A", "content": "回", "ts": "2026-08-17 16:00:00"})
         self.assertEqual(store.read_session(str(p), s["id"])["messages"][1]["ts"], "2026-08-17 16:00:00")
 
-    def test_reconcile_agent_messages_overwrites_and_appends(self):
-        # 打开会话时：CLI transcript 的 agent 回合应以 agent 为准覆盖本地；CLI 多出的回合追加
+    def test_reconcile_overwrites_when_count_matches(self):
+        # 数量一致（CLI 回合数 == 本地该 agent 消息数）：按顺序覆盖 content/thinking（以 agent 为准）
         p = TMP / "rec"
         s = store.create_session(str(p), "对账会话")
-        # 本地：A 两条（其中一条内容过时/与 agent 不一致），B 一条
+        # 本地：A 两条（内容过时/与 agent 不一致），B 一条
         store.append_message(str(p), s["id"], {"round": 0, "speaker": "A", "role": "甲", "content": "本地旧答案A1"})
         store.append_message(str(p), s["id"], {"round": 1, "speaker": "B", "role": "乙", "content": "B的回答"})
         store.append_message(str(p), s["id"], {"round": 2, "speaker": "A", "role": "甲", "content": "本地旧答案A2"})
-        # CLI transcript 里 A 的真实回合：A1 更新、A2 多了一段思考、且多出一个 A3（本地漏存）
         cli_turns = [
             {"content": "agent真实答案A1", "thinking": "A1的思考"},
             {"content": "agent真实答案A2", "thinking": "A2的思考"},
-            {"content": "agent真实答案A3", "thinking": ""},
         ]
         res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
         self.assertEqual(res["changed"], 4)   # A1 content+thinking, A2 content+thinking 被覆盖
-        self.assertEqual(res["appended"], 1)  # A3 追加
+        self.assertEqual(res["appended"], 0)
         msgs = store.read_session(str(p), s["id"])["messages"]
         # B 不受影响
         self.assertEqual([m for m in msgs if m["speaker"] == "B"][0]["content"], "B的回答")
@@ -103,7 +101,23 @@ class TestStore(unittest.TestCase):
         self.assertEqual(a_msgs[0]["content"], "agent真实答案A1")
         self.assertEqual(a_msgs[0]["thinking"], "A1的思考")
         self.assertEqual(a_msgs[1]["content"], "agent真实答案A2")
-        self.assertEqual(a_msgs[2]["content"], "agent真实答案A3")
+        self.assertEqual(a_msgs[1]["thinking"], "A2的思考")
+
+    def test_reconcile_appends_cli_only_when_no_match(self):
+        # 数量不一致且本地无内容匹配：CLI 多出的回合追加（崩写/掉轮恢复）；本地旧内容保留
+        p = TMP / "rec5"
+        s = store.create_session(str(p), "掉轮恢复")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "A", "role": "甲", "content": "本地已有回答"})
+        cli_turns = [
+            {"content": "agent真实答案A1", "thinking": "A1的思考"},
+            {"content": "agent真实答案A2", "thinking": ""},
+        ]
+        res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        self.assertEqual(res["appended"], 2)
+        a_msgs = [m for m in store.read_session(str(p), s["id"])["messages"] if m["speaker"] == "A"]
+        self.assertEqual(a_msgs[0]["content"], "本地已有回答", "本地内容不与 cli 匹配时保留（不顺序覆盖）")
+        self.assertEqual(a_msgs[1]["content"], "agent真实答案A1")
+        self.assertEqual(a_msgs[2]["content"], "agent真实答案A2")
 
     def test_reconcile_skips_when_no_cli_turns(self):
         # 找不到 transcript（离线 / 全新会话）→ 不动本地，作为回退
@@ -132,13 +146,12 @@ class TestStore(unittest.TestCase):
         res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
         msgs = store.read_session(str(p), s["id"])["messages"]
         a_msgs = [m for m in msgs if m["speaker"] == "A"]
-        # 覆盖：A1 不变；think-only「思考2残留」被合并覆盖为 完整回答2+思考2；两条 think-only 残留被删；
-        # 「完整回答2」（有 content）保守保留 → 共 3 条，不丢数据
-        self.assertEqual(len(a_msgs), 3, "think-only 残留删除；有 content 的条目保守保留")
+        # 内容匹配覆盖：完整回答1 ↔ 本地第1条；完整回答2 ↔ 本地「完整回答2」（而非空位的思考2残留）；
+        # 两条 think-only 残留（思考2残留/思考2残留2）被删 → 收敛为 2 条，无重复无丢失
+        self.assertEqual(len(a_msgs), 2, "think-only 残留删除；内容匹配不覆盖空位")
         self.assertEqual(a_msgs[0]["content"], "完整回答1")
         self.assertEqual(a_msgs[1]["content"], "完整回答2")
         self.assertEqual(a_msgs[1]["thinking"], "思考2")
-        self.assertEqual(a_msgs[2]["content"], "完整回答2")
         # B 不受影响
         self.assertEqual([m for m in msgs if m["speaker"] == "B"][0]["content"], "B的回答")
         self.assertTrue(res["appended"] == 0)
@@ -163,9 +176,10 @@ class TestStore(unittest.TestCase):
         res = store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
         msgs = store.read_session(str(p), s["id"])["messages"]
         a_msgs = [m for m in msgs if m["speaker"] == "A"]
-        # 覆盖前 3 条（思考3残留被合并覆盖）；回答4 有 content → 保留
-        self.assertEqual(len(a_msgs), 4, "有 content 的多出条目必须保留（防 transcript 不完整误删）")
-        self.assertEqual(a_msgs[3]["content"], "回答4")
+        # 覆盖：回答1/回答2 内容匹配；思考3残留（think-only 未匹配）按残留删除；
+        # 回答4 有 content → 保留（防 transcript 不完整误删）
+        self.assertEqual(len(a_msgs), 3, "think-only 残留删除；有 content 的多出条目必须保留")
+        self.assertEqual(a_msgs[2]["content"], "回答4")
         # B 不受影响
         self.assertEqual([m for m in msgs if m["speaker"] == "B"][0]["content"], "B的回答")
 

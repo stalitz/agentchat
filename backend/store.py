@@ -299,15 +299,29 @@ def get_agent_sessions(project_path: str, sid: str) -> dict:
     return s.get("agent_sessions", {}) if s else {}
 
 
+def _similar_content(a: str, b: str) -> bool:
+    """宽松内容相似：去 '---' 分隔符噪声后，任一方前 30 字出现在对方里。
+
+    用于数量不一致时把 CLI 回合匹配到本地同内容条目（gemma 模板答案重复也能正确配对，
+    避免按顺序覆盖把 CLI 回合塞进无关空位）。"""
+    a = (a or "").strip().lstrip("-").strip()
+    b = (b or "").strip().lstrip("-").strip()
+    if not a or not b:
+        return False
+    return b[:30] in a or a[:30] in b
+
+
 def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_turns: list) -> dict:
     """用 CLI transcript 的 agent 回合（cli_turns: 有序 [{content, thinking}]）覆盖本地该 agent 的消息。
 
-    对齐规则（agent 为准）：按本地 `speaker==agent_name` 的顺序逐条对齐 CLI 回合——
-    - CLI 第 k 条有内容：覆盖本地第 k 条的 content/thinking（冲突以 agent 为准）；
-    - CLI 多出本地没有的回合：追加到末尾（崩写/掉轮恢复）；
-    - CLI 回合少于本地：仅删除本地末尾多余的「think-only 残留」（content 为空、thinking 非空，
-      拆条修复后的典型残留）；**有 content 的条目一律保留**——transcript 可能因 auto-compact /
-      截断而不完整（实测 s_2289e1cf：cli 仅 3 条 vs 本地 7 条真实回复，盲删会丢历史）。
+    对齐规则（agent 为准）：
+    - **数量一致**（CLI 回合数 == 本地该 agent 消息数）：按顺序覆盖 content/thinking（冲突以 agent 为准）；
+    - **数量不一致**：**严禁顺序覆盖**（会把 CLI 回合复制进本地无关空位造成重复——实测 s_2289e1cf
+      cli 3 条 vs 本地 7 条，顺序覆盖后 T1/T2/T3 各出现 2 次）。改为**内容匹配覆盖**：CLI 回合只覆盖
+      本地**内容相同**的条目；CLI 多出本地没有的（且本地无匹配）→ 追加（崩写/掉轮恢复）；
+      CLI 少于本地时，未匹配的 CLI 回合跳过、本地多余条目仅删「think-only 残留」（content 空、
+      thinking 非空），**有 content 的条目一律保留**（transcript 可能因 auto-compact / 截断而不完整，
+      盲删会丢真实历史）。
     仅当 cli_turns 非空才落盘；cli_turns 为 None/空（找不到 transcript = 离线）则保持本地不动。
     """
     if not cli_turns:
@@ -321,10 +335,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
         msgs = s.setdefault("messages", [])
         idxs = [i for i, m in enumerate(msgs) if m.get("speaker") == agent_name]
         role = msgs[idxs[0]].get("role", "") if idxs else ""
-        for k, turn in enumerate(cli_turns):
-            new_content = turn.get("content", "") or ""
-            new_think = turn.get("thinking", "") or ""
-            if k < len(idxs):
+        if len(cli_turns) == len(idxs):
+            # 数量一致：按顺序覆盖（原语义，以 agent 为准修正内容/思考）
+            for k, turn in enumerate(cli_turns):
+                new_content = turn.get("content", "") or ""
+                new_think = turn.get("thinking", "") or ""
                 m = msgs[idxs[k]]
                 if (m.get("content") or "") != new_content:
                     m["content"] = new_content
@@ -332,21 +347,48 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
                     changed += 1
-            else:
-                msgs.append({
-                    "round": len(msgs), "speaker": agent_name, "role": role,
-                    "content": new_content, "thinking": new_think,
-                })
-                appended += 1
-        # CLI 回合少于本地：只删除「think-only 残留」（content 空、thinking 非空）——
-        # 拆条修复后本地多出的"思考空答案"一半。有 content 的条目是真实历史，
-        # 可能因 transcript 不完整（auto-compact/截断）而比 cli 多，绝不盲删（reverse 保下标正确）。
-        if len(cli_turns) < len(idxs):
-            for i in sorted(idxs[len(cli_turns):], reverse=True):
-                m = msgs[i]
-                if (m.get("thinking") or "") and not (m.get("content") or ""):
-                    msgs.pop(i)
+        else:
+            # 数量不一致：严禁顺序覆盖（会把 CLI 回合复制进本地无关空位造成重复——
+            # s_2289e1cf 实测 cli 3 vs 本地 7，顺序覆盖后 T1/T2/T3 各出现 2 次）。
+            # 只做内容匹配覆盖；CLI 多出且本地无匹配才追加；未匹配的 CLI 回合跳过。
+            matched: set = set()
+            for turn in cli_turns:
+                new_content = turn.get("content", "") or ""
+                new_think = turn.get("thinking", "") or ""
+                hit = None
+                if new_content:
+                    for j in idxs:
+                        if j in matched:
+                            continue
+                        if _similar_content(msgs[j].get("content") or "", new_content):
+                            hit = j
+                            break
+                if hit is None:
+                    if len(cli_turns) > len(idxs):
+                        msgs.append({
+                            "round": len(msgs), "speaker": agent_name, "role": role,
+                            "content": new_content, "thinking": new_think,
+                        })
+                        appended += 1
+                    continue
+                m = msgs[hit]
+                if (m.get("content") or "") != new_content:
+                    m["content"] = new_content
                     changed += 1
+                if (m.get("thinking") or "") != new_think:
+                    m["thinking"] = new_think
+                    changed += 1
+                matched.add(hit)
+            # CLI 回合少于本地：删除「未被匹配的 think-only 残留」（content 空、thinking 非空）——
+            # 拆条修复后本地多出的"思考空答案"一半。有 content 的条目是真实历史，
+            # 可能因 transcript 不完整（auto-compact/截断）而比 cli 多，绝不盲删（reverse 保下标正确）。
+            if len(cli_turns) < len(idxs):
+                unmatched = [i for i in idxs if i not in matched]
+                for i in sorted(unmatched, reverse=True):
+                    m = msgs[i]
+                    if (m.get("thinking") or "") and not (m.get("content") or ""):
+                        msgs.pop(i)
+                        changed += 1
         if changed or appended:
             s["updated_at"] = _now()
             _save_sessions(project_path, sessions)
