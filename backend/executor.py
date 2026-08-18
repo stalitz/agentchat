@@ -15,6 +15,36 @@ def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_" else "_" for c in (name or "agent"))
 
 
+_MCP_SERVER_CONFIG = {
+    "mcpServers": {
+        "terminate-signal": {
+            "command": "/usr/local/bin/python3",
+            "args": ["{root}/backend/terminate_signal_mcp.py"],
+            "env": {"TERMINATE_STATE_FILE": "/tmp/agentchat_terminate_state.json"},
+        }
+    }
+}
+
+
+def _ensure_project_mcp(cwd: str) -> None:
+    """确保项目目录存在 `.mcp.json`（claude 的项目级 MCP 配置来源）。
+
+    claude-code 不读 settings.json 的 mcpServers（实测 2.1.212），只读项目级 `.mcp.json`
+    与 `~/.claude.json`；end_discussion 工具依赖此文件被加载。已存在则不动（用户自定义优先）。
+    """
+    try:
+        f = Path(cwd) / ".mcp.json"
+        if f.exists():
+            return
+        root = Path(__file__).resolve().parent.parent
+        cfg = json.loads(json.dumps(_MCP_SERVER_CONFIG))
+        cfg["mcpServers"]["terminate-signal"]["args"][0] = str(
+            root / "backend" / "terminate_signal_mcp.py")
+        f.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class AgentRuntime:
     """每个 agent 在某一 app 会话内的「持续 CLI 会话」运行时。
 
@@ -172,13 +202,12 @@ class AgentRuntime:
             "我的模拟建议：① 澄清需求边界；② 给出最小可行方案；③ 标注风险点。",
         ]
         if self.agent.fake_terminate_round and (round_index + 1) >= self.agent.fake_terminate_round:
-            lines.append("TERMINATE")
+            # 收敛标记改为结构化工具调用（end_discussion）——编排层据此走两阶段终止状态机；
+            # 不再输出 TERMINATE 文本（字符串不可靠）
+            yield ("tool_use", {"name": "end_discussion",
+                                "input": {"reason": f"双方已达成一致（fake 调试，第 {round_index + 1} 轮）"}})
 
         for ln in lines:
-            if ln == "TERMINATE":  # 收敛标记必须独占一行，不含句点
-                yield ("text", "TERMINATE")
-                yield ("text", "\n")
-                continue
             for chunk in ln.split("。"):
                 if chunk:
                     yield ("text", chunk + "。")
@@ -202,6 +231,8 @@ class AgentRuntime:
     async def _run_claude_once(self, prompt: str, cwd: str, timeout: int):
         cmd = self._claude_cmd(prompt)
         env = self._claude_env()
+        # 确保项目 .mcp.json（end_discussion 工具经此加载；已存在则不动）
+        _ensure_project_mcp(cwd)
         self._section = None  # 新一轮：重置思考/答案归属状态
         async for kind, payload in _stream_subprocess(cmd, cwd, timeout, parse="claude", env=env, runtime=self):
             # text / thinking 整块回放为逐字流（claude 外壳对本地模型整块输出时的兜底）
@@ -367,6 +398,12 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
                 out.append(("thinking", item["thinking"]))
             elif item.get("type") == "text" and item.get("text"):
                 out += _classify_text(runtime, item["text"])
+            elif item.get("type") == "tool_use":
+                # 结构化工具调用（如 end_discussion）：透传给编排层做终止状态机
+                out.append(("tool_use", {
+                    "name": item.get("name", ""),
+                    "input": item.get("input", {}) or {},
+                }))
         if out:
             return out
     # result 事件：失败透出错误；成功不重复产出（文本已由 assistant 事件给出）

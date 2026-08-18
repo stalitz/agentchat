@@ -33,16 +33,22 @@ class TestExecutorFake(unittest.TestCase):
         self.assertFalse(any(k == "error" for k, _ in out))
 
     def test_fake_terminate_at_round(self):
+        # fake 收敛改为结构化工具调用（end_discussion），不再输出 TERMINATE 文本
         a = models.AgentConfig(name="F", type="fake", fake_terminate_round=2)
         out = collect(a, "任务", meta={"round_index": 1, "max_rounds": 5})
         full = "".join(t for k, t in out if k == "text")
-        self.assertIn("TERMINATE", full)
+        self.assertNotIn("TERMINATE", full)
+        tools = [t for k, t in out if k == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["name"], "end_discussion")
+        self.assertIn("reason", tools[0]["input"])
 
     def test_fake_no_terminate_before_round(self):
         a = models.AgentConfig(name="F", type="fake", fake_terminate_round=3)
         out = collect(a, "任务", meta={"round_index": 0, "max_rounds": 5})
         full = "".join(t for k, t in out if k == "text")
         self.assertNotIn("TERMINATE", full)
+        self.assertEqual([t for k, t in out if k == "tool_use"], [], "未到轮次不应发出 end_discussion")
 
     def test_fake_is_stateful_across_turns(self):
         # 同一 AgentRuntime 实例跨轮应记住前文（模拟有状态 CLI 会话），用作 1:1 续接的忠实性校验

@@ -1,9 +1,15 @@
 import asyncio
+import json
 import re
+from pathlib import Path
 
 from . import store
 from .executor import AgentRuntime
 from .models import AgentConfig
+
+# MCP 共享状态文件：end_discussion 工具（backend/terminate_signal_mcp.py）读取它做
+# 最小轮数 gate 与两阶段确认判定；编排层每轮启动 claude 前写入（app 单会话串行，无竞态）。
+TERMINATE_STATE_FILE = "/tmp/agentchat_terminate_state.json"
 
 
 def _clean_answer(text: str) -> str:
@@ -58,6 +64,10 @@ class Session:
         self.resume_event.set()
         self.inject_queue: asyncio.Queue = asyncio.Queue()
         self.running = False
+        # end_discussion 两阶段终止状态：提议方 / 理由 / 是否已获对方确认（确认后整场收敛）
+        self.terminate_proposed_by = None
+        self.terminate_reason = ""
+        self.terminate_confirm = False
 
     async def _emit(self, **kw):
         await self.broadcast(kw)
@@ -95,7 +105,7 @@ class Session:
                 parts.append(inject)
             else:
                 parts.append("（请基于我们之前的对话继续）")
-            parts.append("请以对话方式直接回复。这是人机对话，不要输出 TERMINATE。")
+            parts.append("请以对话方式直接回复。这是人机对话，不要调用 end_discussion 工具（辩论模式专用）。")
             return "\n\n".join(parts)
 
         # 多 agent 辩论：只把「对手上一句」作为 delta 回传；首轮（round_i==0）没有对手句，
@@ -116,14 +126,33 @@ class Session:
             parts.append(f"人工介入 / 任务：\n{inject}")
         parts.append(
             "请基于以上继续推进。\n"
-            "【共识终止的精确条件】只有当以下全部满足时，才可在回复末尾单独成行写 `TERMINATE` 结束本场：\n"
+            "【共识终止（调用工具，不要输出 TERMINATE 文本）】只有当以下条件**全部**满足时，\n"
+            "才可调用 `end_discussion` 工具（reason 参数用一两句话凝练双方达成的一致结论）来表达终止：\n"
             "  1) 你已认真阅读并理解上一位 agent 的观点，而非自说自话、各说各话；\n"
             "  2) 你真正接受（认同或采纳）上一位 agent 的结论，而不是为了早点结束而草草收尾；\n"
-            "  3) 在 `TERMINATE` 之前，用一两句话凝练总结出双方已达成的一致结论。\n"
-            "只要你仍有不同意见、想补充或反驳，就不要写 `TERMINATE`，继续正常讨论。\n"
-            "另外：本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。"
+            "  3) 本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。\n"
+            "调用 end_discussion 后还需对方 agent 确认才会真正终止——若本轮只是你提议，对方可能继续讨论，\n"
+            "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
         )
         return "\n\n".join(parts)
+
+    def _write_terminate_state(self, agent: AgentConfig, round_i: int):
+        """把本轮终止状态写入 MCP 共享文件（terminate-signal 服务读取，做 gate 判定）。
+
+        每轮启动 claude 之前调用；提议状态（proposed_by/reason）由 _run_turn 状态机更新后
+        立即重写，供下一轮对方 claude 进程的 MCP 实例读取。
+        """
+        try:
+            Path(TERMINATE_STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
+            Path(TERMINATE_STATE_FILE).write_text(json.dumps({
+                "round_i": round_i,
+                "agent_count": len(self.agents),
+                "current_agent": agent.name,
+                "proposed_by": self.terminate_proposed_by or "",
+                "reason": self.terminate_reason or "",
+            }, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     # ---------------- 单轮执行（两种模式共用） ----------------
     async def _record_human(self, text: str, role: str):
@@ -175,9 +204,12 @@ class Session:
             pass
         await self._emit(type="turn_start", agent=agent.name, role=agent.role, atype=agent.type)
         runtime = self.runtimes[agent.name]
+        # 写 MCP 共享状态（本轮轮次/调用者/提议状态）——claude 启动后其 MCP 实例读它做判定
+        self._write_terminate_state(agent, round_i)
         collected = []
         thinking_parts = []
         errors: list[str] = []
+        tool_uses: list[dict] = []
         async for kind, text in runtime.run(
             prompt, self.project_path, self.timeout,
             meta={"round_index": round_i, "max_rounds": self.max_rounds},
@@ -192,6 +224,8 @@ class Session:
             elif kind == "error":
                 errors.append(text)
                 await self._emit(type="error", agent=agent.name, text=text)
+            elif kind == "tool_use":
+                tool_uses.append(text)
             # done: 忽略
         full = "".join(collected).strip()
         # 剥离 gemma 等推理模型在 reasoning/answer 之间输出的 '---' 分隔符噪声
@@ -211,6 +245,21 @@ class Session:
             # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止
             await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
             return "", errors
+        # end_discussion 两阶段终止状态机（与 MCP server 判定配合）：
+        # 未达最小轮数时 MCP 已返回 isError 拒绝（这里不记录）；达标后：无提议→记提议（写状态文件
+        # 供下一轮对方读取）；对方已提议→确认达成（terminate_confirm 由 _debate 据此收敛）。
+        floor = 2 * len(self.agents) - 1
+        for tu in tool_uses:
+            if not isinstance(tu, dict) or tu.get("name") != "end_discussion" or round_i < floor:
+                continue
+            reason = (tu.get("input") or {}).get("reason", "") or ""
+            if self.terminate_proposed_by is None:
+                self.terminate_proposed_by = agent.name
+                self.terminate_reason = reason
+                self._write_terminate_state(agent, round_i)  # 立即落盘，下一轮对方 MCP 可读到
+            elif self.terminate_proposed_by != agent.name:
+                self.terminate_confirm = True
+                self.terminate_reason = reason or self.terminate_reason
         thinking_text = "\n\n".join(thinking_parts).strip()
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。
@@ -278,7 +327,15 @@ class Session:
             if errors:
                 break
 
-            # 共识终止：至少完成两轮完整往返（每个 agent 都发过两次言），
+            # end_discussion 两阶段确认收敛：对方已确认（terminate_confirm）→ 结束整场，
+            # reason 作共识结论（若确认方未给 reason 用提议方的）。
+            if self.terminate_confirm:
+                conclusion = self.terminate_reason or self._format_conclusion()
+                store.set_discussion_conclusion(self.project_path, self.session_id, conclusion)
+                await self._record_system(f"双方通过 end_discussion 达成一致，会话收敛。结论：{conclusion}")
+                break
+
+            # 共识终止（旧机制，保留为兜底）：至少完成两轮完整往返（每个 agent 都发过两次言），
             # 否则把 TERMINATE 当普通文本忽略，继续讨论——
             # 避免第二个 agent 在第一轮就 TERMINATE 腰斩、首轮 agent 没机会再发言。
             if any(line.strip() == "TERMINATE" for line in full.splitlines()) \

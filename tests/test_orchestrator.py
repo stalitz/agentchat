@@ -215,7 +215,7 @@ class TestOrchestrator(unittest.TestCase):
         prompt = s2._build_prompt(a1, "第二句")
         self.assertIn("第二句", prompt)
         self.assertNotIn("第一句", prompt, "状态式设计下不应把历史重新搬运进 prompt（token 浪费）")
-        self.assertNotIn("TERMINATE", prompt.replace("不要输出 TERMINATE", ""))
+        self.assertNotIn("end_discussion", prompt.replace("不要调用 end_discussion 工具", ""))
 
     def test_debate_mode_records_task_as_human(self):
         a1 = models.AgentConfig(name="A", type="fake")
@@ -256,7 +256,7 @@ class TestOrchestrator(unittest.TestCase):
         a2 = models.AgentConfig(name="B", type="fake")
         s, _ = make_session([a1, a2], self.proj, self.sid)
         p = s._build_prompt(a1, "设计登录")
-        self.assertIn("共识终止的精确条件", p)
+        self.assertIn("end_discussion", p)
         self.assertIn("两轮完整往返", p)
         self.assertNotIn("首次发言特别要求", p, "已移除首轮「不可讨论就终止」诱导指令")
         self.assertNotIn("是否适合展开多 agent 讨论", p)
@@ -294,14 +294,14 @@ class TestOrchestrator(unittest.TestCase):
         a2 = models.AgentConfig(name="B", type="fake")
         s, _ = make_session([a1, a2], self.proj, self.sid)
         p = s._build_prompt(a1, "设计登录")
-        self.assertIn("共识终止的精确条件", p)
+        self.assertIn("end_discussion", p)
         self.assertNotIn("首次发言特别要求", p)
         self.assertNotIn("是否适合展开多 agent 讨论", p)
 
     def test_conclusion_recorded_on_convergence(self):
-        # 收敛（TERMINATE 且 round_i>0）时应格式化结论并存盘，供续开新议题回传
-        a1 = models.AgentConfig(name="A", type="fake")
-        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=1)  # B 第 2 轮收敛
+        # 收敛（end_discussion 两阶段：B 提议 + A 确认）时应把 reason 作结论存盘，供续开新议题回传
+        a1 = models.AgentConfig(name="A", type="fake", fake_terminate_round=5)  # A 第 5 轮（round4）发
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=4)  # B 第 4 轮（round3）提议
         s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
         self.run_session(s, task="设计登录")
         ctx = store.get_discussion_context(self.proj, self.sid)
@@ -309,19 +309,46 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(ctx["original_topic"], "设计登录", "应记录最初议题")
         sys = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
         self.assertTrue(any("结论" in m for m in sys), "收敛系统消息应带结论")
+        self.assertTrue(any("end_discussion" in m for m in sys), "收敛系统消息应注明 end_discussion 达成")
+
+    def test_end_discussion_two_phase_requires_confirmation(self):
+        # 两阶段确认：只有一方提议（无对方确认）不收敛；双方都发才收敛
+        # 轮次：round0 A、round1 B、round2 A、round3 B（B 提议，≥floor=3）、round4 A（确认）
+        a1 = models.AgentConfig(name="A", type="fake", fake_terminate_round=5)
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=4)
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
+        self.run_session(s, task="讨论方案")
+        starts = [e["agent"] for e in rec.events if e.get("type") == "turn_start"]
+        # B 在 round3 提议后，A 在 round4 确认 → 共 5 次发言后收敛
+        self.assertEqual(starts, ["A", "B", "A", "B", "A"], "提议后需对方确认才收敛")
+        sys = " ".join(e.get("msg", "") for e in rec.events if e.get("type") == "system")
+        self.assertIn("end_discussion", sys)
+
+    def test_end_discussion_proposal_alone_does_not_converge(self):
+        # 单方提议（对方从不调用）：不收敛，继续讨论到上限
+        a1 = models.AgentConfig(name="A", type="fake")  # A 从不发
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=4)  # B round3 起每轮提议
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=3)
+        self.run_session(s, task="讨论方案")
+        starts = [e["agent"] for e in rec.events if e.get("type") == "turn_start"]
+        # max_rounds=3 → 每 agent 3 次 = 6 次发言，跑满不收敛
+        self.assertEqual(starts, ["A", "B", "A", "B", "A", "B"], "单方提议无确认应跑满上限")
+        sys = " ".join(e.get("msg", "") for e in rec.events if e.get("type") == "system")
+        self.assertNotIn("end_discussion", sys)
+        self.assertIn("会话结束", sys)
 
     def test_new_topic_prompt_does_not_reinject_context(self):
         # 状态式 agent：续开新议题时不再手动回传「上轮结论 + 最初议题」
         # （agent 自身 CLI 会话已记住历次讨论）；辩论提示词含共识条件但不含旧上下文块。
-        a1 = models.AgentConfig(name="A", type="fake")
-        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=1)
+        a1 = models.AgentConfig(name="A", type="fake", fake_terminate_round=5)
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=4)
         s1, _ = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
         self.run_session(s1, task="设计登录")
         ctx1 = store.get_discussion_context(self.proj, self.sid)
         self.assertTrue(ctx1["conclusion"])
         s2, _ = make_session([a1, a2], self.proj, self.sid, max_rounds=10)
         p = s2._build_prompt(a1, "新议题：支付集成")
-        self.assertIn("共识终止的精确条件", p, "新议题提示词应含共识条件")
+        self.assertIn("end_discussion", p, "新议题提示词应含共识条件")
         self.assertNotIn("上一轮讨论", p, "状态式设计下不手动回传上轮结论块（agent 自身会话已记住）")
         self.assertNotIn(ctx1["conclusion"], p, "不应把上轮结论文本重新塞进 prompt（token 浪费）")
         self.assertNotIn("设计登录", p, "不应把最初议题重新塞进 prompt（agent 自身会话已记住）")
@@ -348,7 +375,7 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(len(log), 4)
         first = log[0]
         self.assertTrue(first.get("first_turn"), "首轮 first_turn 标志应为 True")
-        self.assertIn("共识终止的精确条件", first["prompt"], "辩论首轮提示词应含共识条件")
+        self.assertIn("end_discussion", first["prompt"], "辩论首轮提示词应含共识条件")
         self.assertIn("评审这个设计", first["prompt"], "提示词应含任务文本")
         self.assertEqual(first["agent"], "A")
         # first_turn 标志仅标记每场讨论的开启轮（用于记录/排查），共识条件在所有轮都下发
