@@ -227,7 +227,7 @@ class Session:
                 )
             else:
                 parts.append(
-                    f"【轮次提醒】本场已讨论到第 {round_i + 1} / {self.max_rounds * len(self.agents)} 轮"
+                    f"【轮次提醒】本场已讨论到第 {round_i // len(self.agents) + 1} / {self.max_rounds} 轮"
                     "（达到最少轮数，可以收尾）。"
                     "若你认为双方已达一致，**请发起 end_discussion 终止**（reason 填共识结论；"
                     "可直接调用工具，无工具则输出 ```json 调用文本："

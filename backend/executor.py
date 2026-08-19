@@ -209,21 +209,22 @@ class AgentRuntime:
         agent_count = int(meta.get("agent_count", 2)) or 2
         self._fake_history.append(prompt.replace("\n", " ")[:120])
         n_prev = len(self._fake_history) - 1
-        note = f"（本 agent 持续会话已记住前 {n_prev} 轮上下文）" if n_prev > 0 else ""
-        # 口径统一（用户反馈「第 6 轮却显示上限 3 轮」歧义）：max_rounds = 每 agent 发言次数，
-        # 全局总轮 = max_rounds × agent 数；文本同时标清全局轮次与本 agent 发言序号。
+        note = f"（本 agent 持续会话已记住前 {n_prev} 次发言上下文）" if n_prev > 0 else ""
+        # 口径（用户明确）：轮 = 回合 = 每个 agent 各发言一次算一轮。
+        # max_rounds = 轮数上限（每轮内每个 agent 各发言一次），全局发言条数 = max_rounds × agent 数。
+        # 本 agent 第 my_turn 次发言 = 第 my_turn 轮（每轮每 agent 各一次，两者同号）。
         my_turn = round_index // agent_count + 1
-        total = max_rounds * agent_count
         lines = [
             f"[FAKE:{self.agent.name}] 我是「{self.agent.role or '未定义角色'}」，调试用假 agent。{note}",
-            f"本轮：全局第 {round_index + 1} / {total} 轮（本 agent 第 {my_turn} 次发言 / 上限 {max_rounds} 次）。",
+            f"本轮：第 {my_turn} 轮 / 上限 {max_rounds} 轮。",
             "我的模拟建议：① 澄清需求边界；② 给出最小可行方案；③ 标注风险点。",
         ]
+        # 注意：fake_terminate_round 语义 = 全局发言序号（round_index+1），测试精确控制时序用，勿改
         if self.agent.fake_terminate_round and (round_index + 1) >= self.agent.fake_terminate_round:
             # 收敛标记改为结构化工具调用（end_discussion）——编排层据此走两阶段终止状态机；
             # 不再输出 TERMINATE 文本（字符串不可靠）
             yield ("tool_use", {"name": "end_discussion",
-                                "input": {"reason": f"双方已达成一致（fake 调试，第 {round_index + 1} 轮）"}})
+                                "input": {"reason": f"双方已达成一致（fake 调试，第 {my_turn} 轮）"}})
 
         for ln in lines:
             for chunk in ln.split("。"):
