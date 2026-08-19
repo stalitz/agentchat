@@ -440,6 +440,24 @@ def set_session_tone(project_path: str, sid: str, tone: str) -> None:
     _save_sessions(project_path, sessions)
 
 
+def set_session_title(project_path: str, sid: str, title: str) -> bool:
+    """修改会话标题；返回是否找到该会话。"""
+    title = (title or "").strip()
+    if not title:
+        return False
+    sessions = _load_sessions(project_path)
+    found = False
+    for s in sessions:
+        if s["id"] == sid:
+            s["title"] = title[:60]  # 防超长标题撑爆 UI
+            s["updated_at"] = _now()
+            found = True
+            break
+    if found:
+        _save_sessions(project_path, sessions)
+    return found
+
+
 def get_original_topic(project_path: str, sid: str) -> str:
     """最初议题 = 第一条 role=='任务' 的 human 消息内容（续开新议题时回传给首个 agent 锚定）。"""
     s = read_session(project_path, sid)

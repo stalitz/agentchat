@@ -52,6 +52,18 @@ class TestStore(unittest.TestCase):
         store.delete_session(str(p), s["id"])
         self.assertIsNone(store.read_session(str(p), s["id"]))
 
+    def test_set_session_title(self):
+        p = TMP / "stitle"
+        s = store.create_session(str(p), "会话一")
+        # 改名成功
+        self.assertTrue(store.set_session_title(str(p), s["id"], "重命名"))
+        self.assertEqual(store.read_session(str(p), s["id"])["title"], "重命名")
+        # 空标题拒绝（返回 False，且原标题不变）
+        self.assertFalse(store.set_session_title(str(p), s["id"], "   "))
+        self.assertEqual(store.read_session(str(p), s["id"])["title"], "重命名")
+        # 不存在的会话返回 False
+        self.assertFalse(store.set_session_title(str(p), "nope", "x"))
+
     def test_agent_session_persist_roundtrip(self):
         p = TMP / "smp"
         s = store.create_session(str(p), "会话二")

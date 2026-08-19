@@ -86,6 +86,7 @@
   .sess-card:hover { background:#eef2f8; }
   .sess-card.active { border-color:var(--claude); background:#eaf1ff; }
   .sess-title { font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:34px; }
+  .sess-title-edit { font-size:13px; font-weight:600; width:100%; box-sizing:border-box; border:1px solid #4a9eff; border-radius:3px; padding:1px 4px; outline:none; background:#fff; color:#111; }
   .sess-meta { font-size:11px; color:var(--muted); margin-top:2px; }
   .sess-badges { margin-top:4px; display:flex; gap:4px; flex-wrap:wrap; }
   .sess-badges .badge { margin:0; }
@@ -858,6 +859,43 @@ function renderSessions() {
     card.className = 'sess-card' + (s.id === curSid ? ' active' : '');
     card.onclick = function () { openSession(s.id); };
     var title = document.createElement('div'); title.className = 'sess-title'; title.textContent = s.title || '会话';
+    title.title = '双击修改标题';
+    title.ondblclick = (function (s) {
+      return function (e) {
+        e.stopPropagation();
+        var input = document.createElement('input');
+        input.className = 'sess-title-edit';
+        input.value = s.title || '';
+        input.maxLength = 60;
+        title.replaceWith(input);
+        input.focus(); input.select();
+        var finished = false;
+        function commit() {
+          if (finished) return;
+          finished = true;
+          var v = input.value.trim();
+          if (v && v !== (s.title || '')) {
+            fetch('/api/session/' + curPid + '/' + s.id + '/title', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ title: v }),
+            }).then(function (r) { return r.json(); })
+              .then(function (d) {
+                if (d.ok) {
+                  s.title = v;
+                  for (var i = 0; i < curProjSessions.length; i++) if (curProjSessions[i].id === s.id) curProjSessions[i].title = v;
+                  renderSessions();
+                  if (curSid === s.id) updateCtxHead(s);
+                } else { renderSessions(); }
+              }).catch(function () { renderSessions(); });
+          } else { renderSessions(); }
+        }
+        input.onkeydown = function (ev) {
+          if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+          else if (ev.key === 'Escape') { ev.preventDefault(); finished = true; renderSessions(); }
+        };
+        input.onblur = function () { commit(); };
+      };
+    })(s);
     var meta = document.createElement('div'); meta.className = 'sess-meta';
     meta.textContent = (s.updated_at ? s.updated_at : '') + (s.message_count != null ? ' · ' + s.message_count + ' 条' : '');
     card.appendChild(title); card.appendChild(meta);

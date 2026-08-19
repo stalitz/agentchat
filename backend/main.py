@@ -302,6 +302,20 @@ async def get_tool_log(pid: str, sid: str):
     return {"tools": store.read_tool_log(proj["path"], sid)}
 
 
+@app.post("/api/session/{pid}/{sid}/title")
+async def rename_session(pid: str, sid: str, body: dict | None = None):
+    """修改会话标题（行内编辑保存）。"""
+    proj = store.get_project(pid)
+    if not proj:
+        return {"ok": False, "error": "项目不存在"}
+    title = (body or {}).get("title", "")
+    if not (title or "").strip():
+        return {"ok": False, "error": "标题不能为空"}
+    if store.set_session_title(proj["path"], sid, title):
+        return {"ok": True, "title": (title or "").strip()[:60]}
+    return {"ok": False, "error": "会话不存在"}
+
+
 # 全局会话列表（跨项目扁平化），供前端左侧「会话」主导航使用；
 # 每条附带 project_id / project_name / team_id / team_name，按 updated_at 倒序。
 @app.get("/api/sessions")

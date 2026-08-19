@@ -102,6 +102,22 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/session/{self.pr_id}/{sid}").status_code, 200)
         self.assertEqual(self.client.get(f"/api/sessions/{self.pr_id}").json()["sessions"], [])
 
+    def test_rename_session(self):
+        c = self.client.post(f"/api/sessions/{self.pr_id}", json={"title": "旧标题"})
+        sid = c.json()["session"]["id"]
+        # 改名成功并落盘
+        r = self.client.post(f"/api/session/{self.pr_id}/{sid}/title", json={"title": "新标题"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["title"], "新标题")
+        self.assertEqual(self.client.get(f"/api/session/{self.pr_id}/{sid}").json()["title"], "新标题")
+        # 空标题拒绝（ok=False，标题不变）
+        r2 = self.client.post(f"/api/session/{self.pr_id}/{sid}/title", json={"title": "  "})
+        self.assertEqual(r2.status_code, 200)
+        self.assertFalse(r2.json()["ok"])
+        self.assertEqual(self.client.get(f"/api/session/{self.pr_id}/{sid}").json()["title"], "新标题")
+        # 清理
+        self.client.delete(f"/api/session/{self.pr_id}/{sid}")
+
     def test_global_sessions_endpoint(self):
         # 全局 /api/sessions 跨项目扁平化，附带 project/team 名称
         c = self.client.post(f"/api/sessions/{self.pr_id}", json={"title": "会话甲", "team_id": self.tm_id})
