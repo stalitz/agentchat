@@ -51,12 +51,31 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         self.assertEqual(oa["messages"][2], {"role": "tool", "tool_call_id": "t1", "content": "file content"})
 
     def test_tools_not_translated(self):
-        # 2026-08-19：工具不再转发/注入——tools 参数不进 OpenAI 请求（模型纯文本输出）
+        # 2026-08-19：只转发「含 end_discussion 的 MCP 工具」给模型，不转发 claude 内置工具；
+        # 且转发时去 mcp__ 前缀（模型见干净名 end_discussion）
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [],
-            "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object", "properties": {}}}],
+            "tools": [
+                {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "mcp__terminate-signal__end_discussion", "description": "d",
+                 "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}},
+            ],
         })
-        self.assertNotIn("tools", oa, "claude 内置 tools 不应转发给 Ollama")
+        tools = oa.get("tools") or []
+        names = [t["function"]["name"] for t in tools]
+        self.assertEqual(names, ["end_discussion"], "只转发 end_discussion 且去前缀")
+        self.assertNotIn("Bash", names, "claude 内置工具不得转发")
+        self.assertNotIn("mcp__", names[0], "模型侧应为干净名")
+
+    def test_mcp_name_mapping(self):
+        # 双向映射：转发去前缀（模型侧干净名）、翻译还原前缀（claude 侧原名）
+        self.assertEqual(gateway._strip_mcp_prefix("mcp__terminate-signal__end_discussion"), "end_discussion")
+        self.assertEqual(gateway._strip_mcp_prefix("end_discussion"), "end_discussion")
+        self.assertEqual(gateway._strip_mcp_prefix("Bash"), "Bash")
+        self.assertEqual(gateway._restore_mcp_name("end_discussion"), "mcp__terminate-signal__end_discussion")
+        self.assertEqual(gateway._restore_mcp_name("anthropic:end_discussion"), "mcp__terminate-signal__end_discussion")
+        self.assertEqual(gateway._restore_mcp_name("mcp__terminate-signal__end_discussion"), "mcp__terminate-signal__end_discussion")
+        self.assertEqual(gateway._restore_mcp_name("Bash"), "Bash")
 
     def test_unknown_fields_dropped(self):
         oa = gateway.anthropic_to_openai({
@@ -69,17 +88,13 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         # 受支持的通用字段应保留
         self.assertEqual(oa["temperature"], 0.7)
 
-    def test_tools_not_forwarded_or_injected(self):
-        # 2026-08-19：工具统一走「prompt 文本 json + 编排层兜底解析」——
-        # 网关不再转发 claude 内置 tools、也不再注入 end_discussion schema。
-        # 原因：claude 侧无 end_discussion 实现（gemma 每次调用必报 No such tool available），
-        # deepseek-r1:14b 又不产出 tool_calls（R1 不支持 function calling）。
-        # 请求即使带 tools，也不进 OpenAI 请求（模型纯文本输出，无乱调副作用）。
+    def test_internal_tools_not_forwarded(self):
+        # claude 内置工具（Bash 等）不转发给模型（防乱调）；无 end_discussion 的请求不带 tools 字段
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [],
             "tools": [{"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
         })
-        self.assertNotIn("tools", oa, "不应转发 claude 内置工具，也不应注入 end_discussion")
+        self.assertNotIn("tools", oa, "claude 内置工具不应转发")
         # 无 tools 请求同样不带 tools 字段
         oa3 = gateway.anthropic_to_openai({"model": "gemma", "messages": []})
         self.assertNotIn("tools", oa3)

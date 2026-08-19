@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from tests.base import models, orch, store
-from backend.orchestrator import _clean_answer, _extract_text_tool_call
+from backend.orchestrator import _clean_answer, _extract_text_tool_call, _is_end_discussion
 
 
 class Recorder:
@@ -51,6 +51,14 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(_clean_answer("正常无分隔符文本"), "正常无分隔符文本")
         # 中间的正文 --- 不误删
         self.assertEqual(_clean_answer("先说结论 --- 然后解释"), "先说结论 --- 然后解释")
+
+    def test_is_end_discussion_compat_mcp_prefix(self):
+        # MCP 原名（mcp__terminate-signal__end_discussion，经网关还原）与干净名都应识别
+        self.assertTrue(_is_end_discussion("end_discussion"))
+        self.assertTrue(_is_end_discussion("mcp__terminate-signal__end_discussion"))
+        self.assertFalse(_is_end_discussion("Bash"))
+        self.assertFalse(_is_end_discussion(""))
+        self.assertFalse(_is_end_discussion(None))
 
     def test_extract_text_tool_call_parses_fenced_json(self):
         # deepseek 等未拿工具 schema 的模型：end_discussion 调用写成 ```json 文本，
@@ -268,7 +276,7 @@ class TestOrchestrator(unittest.TestCase):
         prompt = s2._build_prompt(a1, "第二句")
         self.assertIn("第二句", prompt)
         self.assertNotIn("第一句", prompt, "状态式设计下不应把历史重新搬运进 prompt（token 浪费）")
-        self.assertNotIn("end_discussion", prompt.replace("不要输出 end_discussion 调用文本", ""))
+        self.assertNotIn("end_discussion", prompt.replace("不要调用 end_discussion 工具或输出其调用文本", ""))
 
     def test_debate_mode_records_task_as_human(self):
         a1 = models.AgentConfig(name="A", type="fake")

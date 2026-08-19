@@ -114,28 +114,45 @@ class TestClaudeGatewayEnv(unittest.TestCase):
         a = models.AgentConfig(name="G", type="claude-code", model="ollama/gemma",
                                 base_url="http://localhost:4000")
         rt = executor.AgentRuntime(a)
-        cmd = rt._claude_cmd("议题：X")
+        cmd = rt._claude_cmd()
         self.assertIn("--model", cmd)
         self.assertEqual(cmd[cmd.index("--model") + 1], "ollama/gemma")
-        # 首次启动（cli_session_id 为 None）：用 --session-id 注册新 claude 会话；prompt 在末尾
+        # 首次启动（cli_session_id 为 None）：用 --session-id 注册新 claude 会话
         self.assertIn("--session-id", cmd)
-        self.assertEqual(cmd[-1], "议题：X")
+        # stream-json 模式（2026-08-19）：-p 旧模式 MCP 不通信（2.1.212 bug），
+        # 须用 SDK 同款 --output-format/--input-format stream-json + --verbose；
+        # prompt 经 stdin 传入，不再作位置参数
+        self.assertNotIn("-p", cmd, "不得用 -p 旧模式（MCP 不通信）")
+        self.assertIn("--output-format", cmd)
+        self.assertIn("--input-format", cmd)
+        self.assertIn("--verbose", cmd)
+        self.assertIn("stream-json", cmd)
+        self.assertNotEqual(cmd[-1], "议题：X", "prompt 不应再作位置参数（走 stdin 帧）")
 
     def test_cmd_uses_resume_when_continuing(self):
         # 续接（含历史会话恢复 / 同会话后续轮）：必须用 --resume，而非复用 --session-id
         a = models.AgentConfig(name="G", type="claude-code", model="ollama/gemma",
                                 base_url="http://localhost:4000")
         rt = executor.AgentRuntime(a, cli_session_id="11111111-2222-3333-4444-555555555555")
-        cmd = rt._claude_cmd("议题：X")
+        cmd = rt._claude_cmd()
         self.assertIn("--resume", cmd)
         self.assertNotIn("--session-id", cmd)
         self.assertEqual(cmd[cmd.index("--resume") + 1], "11111111-2222-3333-4444-555555555555")
+        self.assertNotIn("-p", cmd)
 
     def test_cmd_without_model_has_no_model_flag(self):
         a = models.AgentConfig(name="C", type="claude-code")
         rt = executor.AgentRuntime(a)
-        cmd = rt._claude_cmd("hi")
+        cmd = rt._claude_cmd()
         self.assertNotIn("--model", cmd)
+
+    def test_user_frame_stream_json(self):
+        # stdin 输入帧：SDK 同款 user 消息格式（stream-json input 要求）
+        frame = executor._user_frame("议题：X")
+        import json as _json
+        d = _json.loads(frame.decode())
+        self.assertEqual(d["type"], "user")
+        self.assertEqual(d["message"]["content"][0]["text"], "议题：X")
 
 
 class TestParseClaudeLine(unittest.TestCase):

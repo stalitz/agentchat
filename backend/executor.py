@@ -26,6 +26,14 @@ _MCP_SERVER_CONFIG = {
 }
 
 
+def _user_frame(prompt: str) -> bytes:
+    """stream-json 输入帧：把一轮 prompt 封装为 user 消息（SDK 同款格式）。"""
+    return json.dumps({
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+    }, ensure_ascii=False).encode("utf-8")
+
+
 def _ensure_project_mcp(cwd: str) -> None:
     """确保项目目录存在 `.mcp.json`（claude 的项目级 MCP 配置来源）。
 
@@ -153,8 +161,14 @@ class AgentRuntime:
             projects_link.symlink_to(target, target_is_directory=True)
         return str(root)
 
-    def _claude_cmd(self, prompt: str) -> list[str]:
-        cmd = ["claude", "-p", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+    def _claude_cmd(self) -> list[str]:
+        # stream-json 模式（2026-08-19，对齐 Claude Agent SDK / 实测结论）：
+        # -p（--print 旧模式）在 2.1.212 下 MCP 客户端有 bug——spawn 项目级 .mcp.json 的
+        # stdio server 后从不通信（30s EOF）；`--output-format stream-json --input-format
+        # stream-json --verbose`（SDK 同款）下 MCP 正常加载、end_discussion 工具可达。
+        # prompt 经 stdin 以 user 帧传入（见 _user_frame），不再作位置参数。
+        cmd = ["claude", "--output-format", "stream-json", "--input-format", "stream-json",
+               "--verbose", "--dangerously-skip-permissions"]
         if self.cli_session_id is None or self._force_new_session:
             # 本 app 会话中该 agent 首次启动（或自愈换新 id）：生成新 id 并注册为 claude 会话
             self.cli_session_id = str(uuid.uuid4())
@@ -168,7 +182,6 @@ class AgentRuntime:
             cmd += ["--model", self.agent.model]
         if self.agent.cli_args:
             cmd += self.agent.cli_args.split()
-        cmd.append(prompt)
         return cmd
 
     async def run(self, prompt: str, cwd: str, timeout: int, meta: dict | None = None):
@@ -229,12 +242,13 @@ class AgentRuntime:
 
 
     async def _run_claude_once(self, prompt: str, cwd: str, timeout: int):
-        cmd = self._claude_cmd(prompt)
+        cmd = self._claude_cmd()
         env = self._claude_env()
         # 确保项目 .mcp.json（end_discussion 工具经此加载；已存在则不动）
         _ensure_project_mcp(cwd)
         self._section = None  # 新一轮：重置思考/答案归属状态
-        async for kind, payload in _stream_subprocess(cmd, cwd, timeout, parse="claude", env=env, runtime=self):
+        async for kind, payload in _stream_subprocess(cmd, cwd, timeout, parse="claude", env=env,
+                                                      runtime=self, stdin_data=_user_frame(prompt)):
             # text / thinking 整块回放为逐字流（claude 外壳对本地模型整块输出时的兜底）
             if kind in ("text", "thinking") and payload:
                 async for seg in _replay(kind, payload):
@@ -256,21 +270,54 @@ class AgentRuntime:
 
 
 # ---------------- 通用子进程流式读取 ----------------
-async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runtime=None, env=None):
+async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runtime=None, env=None,
+                             stdin_data: bytes | None = None):
     """启动子进程并按行产出 ("text", str) 或 ("error", str)。
 
     env：显式传入则完全覆盖子进程环境变量（用于 per-agent 网关隔离）；
     为 None 时继承当前进程环境（默认行为）。
+    stdin_data：非空时写入子进程 stdin 后关闭（stream-json 输入帧用）。
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd, env=env,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
     except Exception as e:  # 命令不存在 / 权限问题
         yield ("error", f"启动失败: {e}")
         return
     assert proc.stdout is not None
+    # --verbose 会把调试信息大量写入 stderr，不消费会撑满管道阻塞 claude 子进程；
+    # 这里异步排空，仅保留尾部（错误报告时用）。
+    stderr_tail: list[bytes] = []
+
+    async def _drain_stderr():
+        if proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = await proc.stderr.readline()
+                if not chunk:
+                    break
+                stderr_tail.append(chunk)
+                if len(stderr_tail) > 40:
+                    stderr_tail.pop(0)
+        except Exception:
+            pass
+
+    drain_task = asyncio.create_task(_drain_stderr())
+    if stdin_data is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_data)
+            await proc.stdin.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
     try:
         while True:
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
@@ -289,18 +336,24 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
         await proc.wait()
         if proc.returncode not in (0, None):
             err = ""
-            if proc.stderr:
-                err = (await proc.stderr.read()).decode(errors="replace")
+            if stderr_tail:
+                err = b"".join(stderr_tail).decode(errors="replace")
             yield ("error", f"退出码 {proc.returncode}: {err[:800]}")
+        if not drain_task.done():
+            drain_task.cancel()
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        if not drain_task.done():
+            drain_task.cancel()
         yield ("error", f"单轮超时（>{timeout}s）已终止")
     except Exception as e:
         try:
             proc.kill()
         except Exception:
             pass
+        if not drain_task.done():
+            drain_task.cancel()
         yield ("error", f"执行异常: {e}")
 
 

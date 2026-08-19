@@ -28,6 +28,12 @@ TONE_STYLES: dict[str, str] = {
 }
 
 
+def _is_end_discussion(name) -> bool:
+    """判定是否为 end_discussion 调用——兼容干净名（end_discussion）与
+    MCP 原名（mcp__terminate-signal__end_discussion，经网关转发/还原后出现）。"""
+    return isinstance(name, str) and name.endswith("end_discussion")
+
+
 def _now_str() -> str:
     """本地时间，与 store._now 同格式（工具日志 ts 用）。"""
     import time as _t
@@ -165,7 +171,7 @@ class Session:
                 parts.append(inject)
             else:
                 parts.append("（请基于我们之前的对话继续）")
-            parts.append("请以对话方式直接回复。这是人机对话，不要输出 end_discussion 调用文本（辩论模式专用）。")
+            parts.append("请以对话方式直接回复。这是人机对话，不要调用 end_discussion 工具或输出其调用文本（辩论模式专用）。")
             return "\n\n".join(parts)
 
         # 多 agent 辩论：只把「对手上一句」作为 delta 回传；首轮（round_i==0）没有对手句，
@@ -187,17 +193,19 @@ class Session:
         parts.append(
             "请基于以上继续推进。\n"
             "【共识终止：唯一表达方式是输出 end_discussion 调用文本】\n"
-            "如果你想结束本场讨论，**唯一的表达方式**是输出以下格式的代码块"
+            "如果你想结束本场讨论，**唯一的表达方式**是发起 end_discussion 调用"
             "（reason 参数用一两句话凝练双方达成的一致结论）：\n"
+            "- **首选：直接调用 end_discussion 工具**（你所在环境已注册该工具，可直接调用）；\n"
+            "- **若你的环境没有该工具可调**，则输出以下格式的代码块（与调用等价）：\n"
             '```json\n{"tool": "end_discussion", "reason": "双方达成的一致结论（一两句话）"}\n```\n'
             "**禁止**用普通文字表达终止意图——例如「我同意结束」「可以收尾了」"
             "「我认为已达成一致」等文字不会被当作终止信号，对方收不到你的结束意图，讨论会继续。\n"
-            "输出前提（必须**全部**满足才可输出）：\n"
+            "调用前提（必须**全部**满足才可调用）：\n"
             "  1) 你已认真阅读并理解上一位 agent 的观点，而非自说自话、各说各话；\n"
             "  2) 你真正接受（认同或采纳）上一位 agent 的结论，而不是为了早点结束而草草收尾；\n"
             "  3) 本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。\n"
-            "输出后还需对方 agent 也输出 end_discussion 调用文本确认才会真正终止——若本轮只是你提议，对方可能继续讨论，"
-            "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要输出它，继续正常讨论。"
+            "调用后还需对方 agent 也发起 end_discussion 确认才会真正终止——若本轮只是你提议，对方可能继续讨论，"
+            "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
         )
         # 达到最少轮数（双方各发言 2 次）后的每轮硬提醒：推着模型主动决策收尾，而非等它想起。
         # 本地弱工具调用模型（gemma/r1）在长辩论中几乎不主动调用工具（实测跑满轮次），
@@ -206,22 +214,24 @@ class Session:
         if round_i >= floor:
             if self.terminate_proposed_by and self.terminate_proposed_by != agent.name:
                 parts.append(
-                    f"【对方已提议终止】{self.terminate_proposed_by} 已输出 end_discussion 调用提议终止"
+                    f"【对方已提议终止】{self.terminate_proposed_by} 已发起 end_discussion 提议终止"
                     f"（理由：{self.terminate_reason or '未说明'}）。"
-                    "若你认同该结论，请**输出 end_discussion 调用文本确认**（reason 填你的确认意见），"
+                    "若你认同该结论，请**发起 end_discussion 确认**（reason 填你的确认意见；"
+                    "可直接调用工具，无工具则输出 ```json 调用文本），"
                     "双方确认后讨论即终止；若仍有异议，继续正常讨论即可。"
                 )
             elif self.terminate_proposed_by == agent.name:
                 parts.append(
-                    "【你已提议终止】你已输出 end_discussion 调用提议终止，正在等待对方确认。"
-                    "请继续正常参与讨论；若对方也输出 end_discussion 调用确认，讨论即终止。"
+                    "【你已提议终止】你已发起 end_discussion 提议终止，正在等待对方确认。"
+                    "请继续正常参与讨论；若对方也发起 end_discussion 确认，讨论即终止。"
                 )
             else:
                 parts.append(
                     f"【轮次提醒】本场已讨论到第 {round_i + 1} 轮（达到最少轮数，可以收尾）。"
-                    "若你认为双方已达一致，**请输出 end_discussion 调用文本终止**（reason 填共识结论，"
-                    '格式：```json\n{"tool": "end_discussion", "reason": "..."}\n```）；'
-                    "不输出该文本的文字总结不会被当作终止信号，讨论会继续。若仍有分歧，继续讨论。"
+                    "若你认为双方已达一致，**请发起 end_discussion 终止**（reason 填共识结论；"
+                    "可直接调用工具，无工具则输出 ```json 调用文本："
+                    '```json\n{"tool": "end_discussion", "reason": "..."}\n```）；'
+                    "普通文字总结不会被当作终止信号，讨论会继续。若仍有分歧，继续讨论。"
                 )
         return "\n\n".join(parts)
 
@@ -303,7 +313,7 @@ class Session:
                 tool_uses.append(text)
                 # 记录首个 end_discussion 调用的到达时刻（≈模型发出调用时刻）：
                 # 日志 ts 应为「调用时间」，而非「整轮跑完的写入时间」（后者可能晚数分钟）
-                if tool_use_ts is None and isinstance(text, dict) and text.get("name") == "end_discussion":
+                if tool_use_ts is None and isinstance(text, dict) and _is_end_discussion(text.get("name")):
                     tool_use_ts = _now_str()
             # done: 忽略
         full = "".join(collected).strip()
@@ -331,7 +341,7 @@ class Session:
         # end_discussion 终止状态机（编排层权威判定）——必须先于 errors 检查：
         # 工具由网关注入、claude 侧无对应实现，模型调用后 claude 会因「未知工具」报错退出；
         # 若先查 errors 会把工具轮误判为失败而中止。工具轮的错误应忽略（意图已被捕获）。
-        tool_intent = any(isinstance(tu, dict) and tu.get("name") == "end_discussion" for tu in tool_uses)
+        tool_intent = any(isinstance(tu, dict) and _is_end_discussion(tu.get("name")) for tu in tool_uses)
         floor = 2 * len(self.agents) - 1
         # 工具日志统一携带：调用时刻 ts（非写入时刻）、执行结果 exec_ok/exec_error——
         # 意图捕获与执行结果分离，日志能直接看出「调用是否真的成功」
@@ -339,7 +349,7 @@ class Session:
         exec_ok = not tool_use_errors
         exec_err = "; ".join(dict.fromkeys(tool_use_errors))[:300]
         for tu in tool_uses:
-            if not isinstance(tu, dict) or tu.get("name") != "end_discussion":
+            if not isinstance(tu, dict) or not _is_end_discussion(tu.get("name")):
                 continue
             reason = (tu.get("input") or {}).get("reason", "") or ""
             if round_i < floor:

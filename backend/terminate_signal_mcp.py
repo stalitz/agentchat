@@ -55,19 +55,39 @@ def _handle_call(params: dict) -> dict:
 
 
 def _read_frame() -> str | None:
-    """从 stdin 读一个 Content-Length 帧，返回 JSON 字符串；EOF 返回 None。"""
+    """从 stdin 读一帧 JSON 消息，返回 JSON 字符串；EOF 返回 None。
+
+    支持两种传输（实测 claude-code 2.1.212 用 **JSONL**——每行一个 JSON，
+    首字符即 `{`；标准 MCP 客户端用 Content-Length 帧）：
+    - 首行以 `{` 开头 → JSONL，整行即一条消息；
+    - 否则按 Content-Length 帧解析（header 行 + 空行 + body）。
+    此前只支持 Content-Length 帧，导致 claude 的 JSONL 被当 header 行解析失败、
+    表现为「server 从不通信」（实测多轮排查的根因）。
+    """
+    first = sys.stdin.buffer.readline()
+    if not first:
+        return None  # EOF
+    if first.startswith(b"{"):
+        # JSONL：整行即一条 JSON-RPC 消息
+        return first.decode("utf-8", "replace")
+
     headers: dict[str, str] = {}
+
+    def _parse_header(line: bytes) -> None:
+        try:
+            key, _, value = line.decode("utf-8").partition(":")
+            headers[key.strip().lower()] = value.strip()
+        except Exception:
+            pass
+
+    _parse_header(first)
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
             return None  # EOF
         if line in (b"\r\n", b"\n"):
             break
-        try:
-            key, _, value = line.decode("utf-8").partition(":")
-            headers[key.strip().lower()] = value.strip()
-        except Exception:
-            pass
+        _parse_header(line)
     length = int(headers.get("content-length", "0") or 0)
     if length <= 0:
         return ""
@@ -79,9 +99,10 @@ def _read_frame() -> str | None:
 
 
 def _write_frame(obj: dict) -> None:
-    body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    out = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8") + body
-    sys.stdout.buffer.write(out)
+    # JSONL 输出（claude-code 2.1.x 的 stdio MCP 读响应按行解析，与请求侧对称）；
+    # 标准 MCP 客户端也接受裸 JSON 行（部分客户端按行容错）。
+    body = json.dumps(obj, ensure_ascii=False)
+    sys.stdout.buffer.write(body.encode("utf-8") + b"\n")
     sys.stdout.buffer.flush()
 
 

@@ -123,12 +123,12 @@ def anthropic_to_openai(body: dict) -> dict:
             oa[f] = body[f]
     # 工具转发（2026-08-19 终版）：只转发「MCP 注册的 end_discussion」给模型——
     # 不转发 claude 内置工具（Bash/Read 等，避免模型乱调产生副作用），也不再手工注入 schema。
-    # 链路：claude-code 通过 HTTP MCP 注册 end_discussion（terminate_signal_mcp.py 的
-    # streamable HTTP 版）→ 请求 tools 里出现该工具（名含 end_discussion）→ 网关仅转发它
-    # → Ollama 模型（gemma 等支持 function calling 的）看到真 schema、产出真 tool_calls
-    # → 网关翻译 tool_use 回 claude → claude 执行 MCP 工具返回**成功**（不再 No such tool available）。
-    # 不支持工具调用的模型（deepseek-r1 实测 tools=Y 仍 NONE）自然回落到 prompt 文本 json，
-    # 由编排层 _extract_text_tool_call 兜底解析——两条路径并存，互不干扰。
+    # 链路：claude-code 通过项目级 .mcp.json（stdio）注册 end_discussion（terminate_signal_mcp.py）
+    # → 请求 tools 里出现该工具（名 mcp__terminate-signal__end_discussion）→ 网关仅转发它（去前缀）
+    # → Ollama 模型（gemma 等支持 function calling 的）看到干净名 end_discussion、产出真 tool_calls
+    # → 网关翻译 tool_use 回 claude 时**还原** mcp__ 前缀 → claude 匹配 MCP server 执行返回**成功**
+    # （不再 No such tool available）。不支持工具调用的模型（deepseek-r1 实测 tools=Y 仍 NONE）
+    # 自然回落到 prompt 文本 json，由编排层 _extract_text_tool_call 兜底解析——两条路径并存。
     tools = body.get("tools")
     if tools:
         keep = [t for t in tools if "end_discussion" in (t.get("name") or "")]
@@ -136,12 +136,37 @@ def anthropic_to_openai(body: dict) -> dict:
             oa["tools"] = [{
                 "type": "function",
                 "function": {
-                    "name": t.get("name"),
+                    "name": _strip_mcp_prefix(t.get("name")),
                     "description": t.get("description", ""),
                     "parameters": t.get("input_schema", {}),
                 },
             } for t in keep]
     return oa
+
+
+def _strip_mcp_prefix(name: str) -> str:
+    """mcp__terminate-signal__end_discussion → end_discussion（给模型侧的干净名）。
+
+    claude 对 MCP 工具加 mcp__<server>__ 前缀，而本地模型（gemma）对长前缀名不稳定
+    （实测会把原名改写成 end_discussion / anthropic:end_discussion 等变体），
+    故转发 tools 时剥掉前缀，让模型始终看到稳定的简单名。
+    """
+    if name and name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            return parts[2]
+    return name
+
+
+def _restore_mcp_name(name: str) -> str:
+    """end_discussion（或任意 *:end_discussion 变体）→ mcp__terminate-signal__end_discussion。
+
+    模型可能以干净名或带其他前缀的名调用，claude 侧只注册了 MCP 原名——
+    翻译 tool_calls 时必须还原，否则 claude 报「No such tool available」。
+    """
+    if name and name.endswith("end_discussion") and not name.startswith("mcp__"):
+        return "mcp__terminate-signal__end_discussion"
+    return name
 
 
 def _map_stop(reason: str | None) -> str:
@@ -276,7 +301,7 @@ class _AnthropicTranslator:
                 self.tool_blocks[idx] = {
                     "our": len(self.tool_blocks) + 2,
                     "id": tc.get("id") or ("tool_" + str(idx)),
-                    "name": func.get("name", ""),
+                    "name": _restore_mcp_name(func.get("name", "")),
                 }
                 events.append({"type": "content_block_start", "index": self.tool_blocks[idx]["our"],
                                "content_block": {"type": "tool_use", "id": self.tool_blocks[idx]["id"],
@@ -339,7 +364,7 @@ def _non_stream_response(body: dict, oa_resp: dict) -> dict:
             inp = json.loads(func.get("arguments") or "{}")
         except Exception:
             inp = {}
-        content.append({"type": "tool_use", "id": tc.get("id"), "name": func.get("name"), "input": inp})
+        content.append({"type": "tool_use", "id": tc.get("id"), "name": _restore_mcp_name(func.get("name", "")), "input": inp})
     usage = oa_resp.get("usage") or {}
     return {
         "id": oa_resp.get("id", "msg_" + os.urandom(8).hex()),
