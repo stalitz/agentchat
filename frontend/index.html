@@ -584,7 +584,50 @@ function mdToHtml(src) {
     out.push('<pre><code' + (codeLang ? ' class="lang-' + escHtml(codeLang) + '"' : '') + '>' + escHtml(codeBuf.join('\n')) + '</code></pre>');
   }
   flushPara(para);
-  return out.join('');
+  return renderLatex(out.join(''));
+}
+
+// 轻量 LaTeX → Unicode 渲染（2026-08-19）：模型输出数学符号常用 $...$ 包裹的 LaTeX 命令
+// （如 $\neq$、$\rightarrow$），把常见命令替换为 Unicode 字符、去掉 $ 包裹，零依赖离线可用。
+// 复杂公式（分数/根号/矩阵等）保留原样文本，后续引入 KaTeX 再升级（已记入未来需求）。
+// 保护 pre/code 块内的内容（代码里的 $...$ 不做替换）。
+var LATEX_MAP = {
+  // 关系
+  'neq': '≠', 'ne': '≠', 'rightarrow': '→', 'to': '→', 'leftarrow': '←',
+  'geq': '≥', 'ge': '≥', 'leq': '≤', 'le': '≤', 'approx': '≈', 'equiv': '≡',
+  'sim': '∼', 'propto': '∝', 'subset': '⊂', 'subseteq': '⊆', 'supset': '⊃',
+  'supseteq': '⊇', 'in': '∈', 'notin': '∉', 'perp': '⊥', 'parallel': '∥',
+  'Rightarrow': '⇒', 'Leftarrow': '⇐', 'Leftrightarrow': '⇔',
+  'Longrightarrow': '⟹', 'Longleftrightarrow': '⟺',
+  // 运算
+  'times': '×', 'cdot': '·', 'div': '÷', 'pm': '±', 'mp': '∓',
+  'oplus': '⊕', 'otimes': '⊗', 'sum': '∑', 'prod': '∏', 'int': '∫', 'sqrt': '√',
+  // 逻辑
+  'land': '∧', 'lor': '∨', 'neg': '¬', 'forall': '∀', 'exists': '∃',
+  // 希腊字母
+  'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε',
+  'theta': 'θ', 'lambda': 'λ', 'mu': 'μ', 'pi': 'π', 'sigma': 'σ',
+  'phi': 'φ', 'omega': 'ω', 'Delta': 'Δ', 'Pi': 'Π', 'Sigma': 'Σ', 'Omega': 'Ω',
+  // 其他
+  'infty': '∞', 'partial': '∂', 'nabla': '∇', 'dots': '…', 'ldots': '…',
+  'prime': '′', 'circ': '°', 'degree': '°', 'angle': '∠', 'therefore': '∴', 'because': '∵',
+  // 常见转义字符（非字母命令）
+  '_': '_', '%': '%', '&': '&', '#': '#', '{': '{', '}': '}',
+};
+function renderLatex(html) {
+  if (!html || html.indexOf('$') < 0) return html;
+  var ph = [], n = 0;
+  html = html.replace(/<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>/g, function (m) { ph.push(m); return '\u0000L' + (n++) + 'L\u0000'; });
+  html = html.replace(/\${1,2}([^$]+?)\${1,2}/g, function (_, inner) {
+    var t = inner.trim();
+    t = t.replace(/\\([a-zA-Z]+)/g, function (__, name) {
+      return Object.prototype.hasOwnProperty.call(LATEX_MAP, name) ? LATEX_MAP[name] : ('\\' + name);
+    });
+    t = t.replace(/\\([_%&#{}])/g, '$1');
+    return t.replace(/\s+/g, ' ').trim();
+  });
+  html = html.replace(/\u0000L(\d+)L\u0000/g, function (_, i) { return ph[+i]; });
+  return html;
 }
 
 function loadConfig() {
