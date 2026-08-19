@@ -104,6 +104,10 @@
   #chat { flex:1; min-height:0; overflow:auto; padding:16px 20px; }
   .row { display:flex; margin:10px 0; }
   .row.human { justify-content:flex-end; }
+  /* agent 响应中的加载占位（发问后无内容时的"在跑"反馈） */
+  .loading-row { align-items:center; gap:8px; color:var(--muted); font-size:12.5px; padding:4px 2px; }
+  .spinner { width:14px; height:14px; border:2px solid rgba(128,128,140,.2); border-top-color:var(--muted); border-radius:50%; display:inline-block; animation:spin .8s linear infinite; flex:none; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   .bubble { max-width:78%; padding:10px 13px; border-radius:12px; white-space:pre-wrap; word-break:break-word; }
   .bubble.claude-code { background:#eaf1ff; border:1px solid #cfe0ff; }
   .bubble.codex { background:#e6f6ec; border:1px solid #c7ecd4; }
@@ -439,6 +443,9 @@ function handleEvent(ev) {
     case 'turn_start':
       agentNameColor[ev.agent] = ev.atype || 'claude-code';
       curTurnAgent = ev.agent;
+      // 立即显示「正在思考…」加载占位——agent 响应可能需数十秒（CLI 启动 / 本地模型
+      // 冷启动 prefill），期间无 thinking/token 事件，没有占位用户会以为卡死。
+      showLoading(ev.agent);
       break;  // 气泡懒建：第一个 thinking / token 事件来时再建
     case 'thinking':
       curTurnAgent = ev.agent || curTurnAgent;
@@ -449,6 +456,7 @@ function handleEvent(ev) {
       appendToken(ev.agent, ev.text, agentNameColor[ev.agent] || 'claude-code');
       break;
     case 'turn_end':
+      hideLoading();  // 防御：确保加载占位被撤（内容流正常时已在 thinking/token 撤掉）
       // 只有思考、无正文时也要建气泡（承载思考子块）
       if (!cur && curThinking && curThinkingBody && curThinkingBody.textContent.trim()) {
         openTurn(curTurnAgent || ev.agent || 'Agent', agentNameColor[curTurnAgent || ev.agent] || 'claude-code');
@@ -473,7 +481,21 @@ var curAnswer = null;        // 当前正文 div
 var curThinking = null;      // 当前思考 <details>
 var curThinkingBody = null;
 var curThinkingCnt = 0;
+var curLoading = null;       // 当前「正在思考…」加载占位行
+function showLoading(name) {
+  hideLoading();
+  var row = document.createElement('div'); row.className = 'row loading-row';
+  var spin = document.createElement('span'); spin.className = 'spinner';
+  var txt = document.createElement('span'); txt.textContent = '「' + (name || 'Agent') + '」正在思考…';
+  row.appendChild(spin); row.appendChild(txt);
+  chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+  curLoading = row;
+}
+function hideLoading() {
+  if (curLoading) { curLoading.remove(); curLoading = null; }
+}
 function appendThinking(name, text, atype) {
+  hideLoading();  // 首个内容到达：撤加载占位，进入真实气泡
   if (!cur) openTurn(name, atype);
   if (!curThinking) {
     curThinking = makeThinkingBlock(name, '', atype, true);
@@ -492,6 +514,7 @@ function endThinking() {
   curThinking = null; curThinkingBody = null; curThinkingCnt = 0;
 }
 function appendToken(name, text, atype) {
+  hideLoading();  // 首个内容到达：撤加载占位
   if (!cur) openTurn(name, atype);
   if (!curAnswer) { curAnswer = document.createElement('div'); curAnswer.className = 'turn-answer'; cur.appendChild(curAnswer); }
   curAnswer.textContent += text; chat.scrollTop = chat.scrollHeight;
@@ -988,7 +1011,8 @@ function openTurn(name, atype, ts) {
   var b = document.createElement('div'); b.className = 'bubble ' + (atype || 'claude-code');
   b.innerHTML = '<div class="who">' + esc(name) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '') + '</div><div class="turn-body"></div>';
   row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
-  return b.querySelector('.turn-body');
+  cur = b.querySelector('.turn-body');  // 修复：懒建必须挂到全局 cur（此前漏赋，实时流 appendThinking/appendToken 会崩）
+  return cur;
 }
 function makeThinkingBlock(name, text, atype, open_) {
   var det = document.createElement('details'); det.className = 'turn-block thinking' + (atype ? ' ' + atype : '');
