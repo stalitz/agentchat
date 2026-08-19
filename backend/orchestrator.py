@@ -195,8 +195,10 @@ class Session:
             "【共识终止：唯一表达方式是输出 end_discussion 调用文本】\n"
             "如果你想结束本场讨论，**唯一的表达方式**是发起 end_discussion 调用"
             "（reason 参数用一两句话凝练双方达成的一致结论）：\n"
-            "- **首选：直接调用 end_discussion 工具**（你所在环境已注册该工具，可直接调用）；\n"
-            "- **若你的环境没有该工具可调**，则输出以下格式的代码块（与调用等价）：\n"
+            "- **首选（必须优先）：调用 end_discussion 工具**——该工具在你的 tools 工具列表中"
+            "（名称可能是 `end_discussion` 或带前缀如 `mcp__terminate-signal__end_discussion`）。"
+            "**只要工具列表中能看到它，就必须直接调用工具**，绝不用代码块代替；\n"
+            "- **仅当你的工具列表里确实没有该工具**时，才输出以下格式的代码块（与调用等价）：\n"
             '```json\n{"tool": "end_discussion", "reason": "双方达成的一致结论（一两句话）"}\n```\n'
             "**禁止**用普通文字表达终止意图——例如「我同意结束」「可以收尾了」"
             "「我认为已达成一致」等文字不会被当作终止信号，对方收不到你的结束意图，讨论会继续。\n"
@@ -216,8 +218,8 @@ class Session:
                 parts.append(
                     f"【对方已提议终止】{self.terminate_proposed_by} 已发起 end_discussion 提议终止"
                     f"（理由：{self.terminate_reason or '未说明'}）。"
-                    "若你认同该结论，请**发起 end_discussion 确认**（reason 填你的确认意见；"
-                    "可直接调用工具，无工具则输出 ```json 调用文本），"
+                    "若你认同该结论，请**调用 end_discussion 工具确认**（reason 填你的确认意见；"
+                    "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本），"
                     "双方确认后讨论即终止；若仍有异议，继续正常讨论即可。"
                 )
             elif self.terminate_proposed_by == agent.name:
@@ -229,8 +231,8 @@ class Session:
                 parts.append(
                     f"【轮次提醒】本场已讨论到第 {round_i // len(self.agents) + 1} / {self.max_rounds} 轮"
                     "（达到最少轮数，可以收尾）。"
-                    "若你认为双方已达一致，**请发起 end_discussion 终止**（reason 填共识结论；"
-                    "可直接调用工具，无工具则输出 ```json 调用文本："
+                    "若你认为双方已达一致，**请调用 end_discussion 工具终止**（reason 填共识结论；"
+                    "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本："
                     '```json\n{"tool": "end_discussion", "reason": "..."}\n```）；'
                     "普通文字总结不会被当作终止信号，讨论会继续。若仍有分歧，继续讨论。"
                 )

@@ -101,6 +101,9 @@ class TestClaudeGatewayEnv(unittest.TestCase):
         self.assertEqual(s["env"]["ANTHROPIC_BASE_URL"], "http://localhost:8777")
         # 去掉插件，避免临时目录缺失插件文件导致 claude 加载报错
         self.assertNotIn("enabledPlugins", s)
+        # 项目级 .mcp.json 的 MCP 自动加载总开关（end_discussion 工具可达；
+        # 缺失实测「夏朝存在吗」会话：gemma 看不到工具、只能输出 json 文本兜底）
+        self.assertTrue(s.get("enableAllProjectMcpServers"), "隔离 settings 应允许项目级 MCP 自动加载")
         env = rt._claude_env()
         self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), cfg)
         # 隔离目录的 projects/ 必须软链到标准 ~/.claude/projects，使按目录的会话可被裸 claude 恢复、跨模型 resume
@@ -109,6 +112,32 @@ class TestClaudeGatewayEnv(unittest.TestCase):
         self.assertEqual(os.path.realpath(link), os.path.realpath(os.path.join(os.path.expanduser("~"), ".claude", "projects")))
         # 无 base_url 的 agent 不应进入隔离逻辑
         self.assertIsNone(executor.AgentRuntime(models.AgentConfig(name="C", type="claude-code"))._claude_config_dir())
+
+    def test_ensure_project_mcp_writes_trust_for_config_dir(self):
+        # 隔离配置目录（CLAUDE_CONFIG_DIR）下必须有 .claude.json 的项目 trust + MCP 启用，
+        # 否则 claude 以隔离目录为准时不信任项目、不加载 .mcp.json（gemma 看不到 end_discussion 工具）
+        import tempfile
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as cfg_dir:
+            executor._ensure_project_mcp(cwd, cfg_dir)
+            # 项目 .mcp.json 生成
+            mcp = os.path.join(cwd, ".mcp.json")
+            self.assertTrue(os.path.exists(mcp), "应生成项目 .mcp.json")
+            with open(mcp, encoding="utf-8") as f:
+                self.assertIn("terminate-signal", json.load(f)["mcpServers"])
+            # 隔离目录 .claude.json 的 trust + 启用
+            cj = os.path.join(cfg_dir, ".claude.json")
+            self.assertTrue(os.path.exists(cj), "应生成隔离目录 .claude.json")
+            with open(cj, encoding="utf-8") as f:
+                d = json.load(f)
+            entry = d["projects"][os.path.realpath(cwd)]
+            self.assertTrue(entry.get("hasTrustDialogAccepted"))
+            self.assertIn("terminate-signal", entry.get("enabledMcpjsonServers", []))
+            # 幂等：再次调用不报错、不重复启用
+            executor._ensure_project_mcp(cwd, cfg_dir)
+            with open(cj, encoding="utf-8") as f:
+                d2 = json.load(f)
+            self.assertEqual(
+                d2["projects"][os.path.realpath(cwd)]["enabledMcpjsonServers"].count("terminate-signal"), 1)
 
     def test_cmd_includes_model_flag(self):
         a = models.AgentConfig(name="G", type="claude-code", model="ollama/gemma",

@@ -34,21 +34,37 @@ def _user_frame(prompt: str) -> bytes:
     }, ensure_ascii=False).encode("utf-8")
 
 
-def _ensure_project_mcp(cwd: str) -> None:
+def _ensure_project_mcp(cwd: str, config_dir: str | None = None) -> None:
     """确保项目目录存在 `.mcp.json`（claude 的项目级 MCP 配置来源）。
 
     claude-code 不读 settings.json 的 mcpServers（实测 2.1.212），只读项目级 `.mcp.json`
     与 `~/.claude.json`；end_discussion 工具依赖此文件被加载。已存在则不动（用户自定义优先）。
+
+    config_dir：per-agent 隔离配置目录（CLAUDE_CONFIG_DIR）。claude 以 `CLAUDE_CONFIG_DIR`
+    为准时，项目 trust 与 MCP 启用状态读**该目录下的 `.claude.json`**（而非 ~/.claude.json）；
+    缺失时项目 .mcp.json 的 MCP 不会被加载（实测「夏朝存在吗」会话 gemma 看不到
+    end_discussion 工具、只能输出 json 文本兜底）。故在此补齐：
+    projects[realpath(cwd)].hasTrustDialogAccepted=true + enabledMcpjsonServers 含
+    terminate-signal。
     """
     try:
         f = Path(cwd) / ".mcp.json"
-        if f.exists():
-            return
-        root = Path(__file__).resolve().parent.parent
-        cfg = json.loads(json.dumps(_MCP_SERVER_CONFIG))
-        cfg["mcpServers"]["terminate-signal"]["args"][0] = str(
-            root / "backend" / "terminate_signal_mcp.py")
-        f.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        if not f.exists():
+            root = Path(__file__).resolve().parent.parent
+            cfg = json.loads(json.dumps(_MCP_SERVER_CONFIG))
+            cfg["mcpServers"]["terminate-signal"]["args"][0] = str(
+                root / "backend" / "terminate_signal_mcp.py")
+            f.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        if config_dir:
+            cf = Path(config_dir) / ".claude.json"
+            d = json.loads(cf.read_text(encoding="utf-8")) if cf.exists() else {}
+            projs = d.setdefault("projects", {})
+            entry = projs.setdefault(os.path.realpath(cwd), {})
+            entry["hasTrustDialogAccepted"] = True
+            enabled = entry.setdefault("enabledMcpjsonServers", [])
+            if "terminate-signal" not in enabled:
+                enabled.append("terminate-signal")
+            cf.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -135,7 +151,19 @@ class AgentRuntime:
             if self.agent.model:
                 d["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"] = self.agent.model
                 d["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = self.agent.model
+            # 允许项目级 .mcp.json 的 MCP 服务器自动加载（end_discussion 工具可达）。
+            # 缺失实测（「夏朝存在吗」会话）：gemma 看不到工具、只能输出 json 文本兜底。
+            d["enableAllProjectMcpServers"] = True
             sfile.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+        else:
+            # 旧生成的隔离配置：补齐 enableAllProjectMcpServers（若缺）
+            try:
+                d = json.loads(sfile.read_text(encoding="utf-8"))
+                if not d.get("enableAllProjectMcpServers"):
+                    d["enableAllProjectMcpServers"] = True
+                    sfile.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
         # projects/ 软链到标准 ~/.claude/projects：transcript 按目录汇聚，跨模型可 resume
         projects_link = root / "projects"
         target = Path.home() / ".claude" / "projects"
@@ -250,8 +278,8 @@ class AgentRuntime:
     async def _run_claude_once(self, prompt: str, cwd: str, timeout: int):
         cmd = self._claude_cmd()
         env = self._claude_env()
-        # 确保项目 .mcp.json（end_discussion 工具经此加载；已存在则不动）
-        _ensure_project_mcp(cwd)
+        # 确保项目 .mcp.json + 隔离配置目录的 trust/MCP 启用（end_discussion 工具可达）
+        _ensure_project_mcp(cwd, self._claude_config_dir())
         self._section = None  # 新一轮：重置思考/答案归属状态
         async for kind, payload in _stream_subprocess(cmd, cwd, timeout, parse="claude", env=env,
                                                       runtime=self, stdin_data=_user_frame(prompt)):
