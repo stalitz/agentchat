@@ -121,16 +121,26 @@ def anthropic_to_openai(body: dict) -> dict:
     for f in _OA_FORWARD_FIELDS:
         if body.get(f) is not None:
             oa[f] = body[f]
-    # 工具统一走「prompt 文本 json 约定 + 编排层兜底解析」（2026-08-19，commit e3597c5 配套）：
-    # - 原方案：网关注入 end_discussion schema，模型发真 tool_use。实测暴露两问题——
-    #   ① claude-code 侧无 end_discussion 工具实现，gemma 每次调用必报
-    #      「No such tool available」（MCP 已否决：-p 非交互 Pending approval / Failed to connect）；
-    #   ② deepseek-r1:14b 模型本身不产出 tool_calls（R1 不支持 function calling，Ollama 实测
-    #      tools=Y 仍返回 NONE），只会按提示词输出文本 json。
-    # - 现方案：不注入 schema、也不转发 claude 内置 tools（模型纯文本输出，无乱调副作用）；
-    #   两模型统一按 prompt 指令输出 ```json {"tool":"end_discussion","reason":...}```，
-    #   编排层 _extract_text_tool_call 兜底解析驱动终止状态机——行为一致、无失败噪音。
-    # （terminate_signal_mcp.py 保留为备用，不再必需。）
+    # 工具转发（2026-08-19 终版）：只转发「MCP 注册的 end_discussion」给模型——
+    # 不转发 claude 内置工具（Bash/Read 等，避免模型乱调产生副作用），也不再手工注入 schema。
+    # 链路：claude-code 通过 HTTP MCP 注册 end_discussion（terminate_signal_mcp.py 的
+    # streamable HTTP 版）→ 请求 tools 里出现该工具（名含 end_discussion）→ 网关仅转发它
+    # → Ollama 模型（gemma 等支持 function calling 的）看到真 schema、产出真 tool_calls
+    # → 网关翻译 tool_use 回 claude → claude 执行 MCP 工具返回**成功**（不再 No such tool available）。
+    # 不支持工具调用的模型（deepseek-r1 实测 tools=Y 仍 NONE）自然回落到 prompt 文本 json，
+    # 由编排层 _extract_text_tool_call 兜底解析——两条路径并存，互不干扰。
+    tools = body.get("tools")
+    if tools:
+        keep = [t for t in tools if "end_discussion" in (t.get("name") or "")]
+        if keep:
+            oa["tools"] = [{
+                "type": "function",
+                "function": {
+                    "name": t.get("name"),
+                    "description": t.get("description", ""),
+                    "parameters": t.get("input_schema", {}),
+                },
+            } for t in keep]
     return oa
 
 
@@ -232,8 +242,11 @@ class _AnthropicTranslator:
             self._reasoning_acc += reasoning
         text = delta.get("content") or ""
         if text:
-            if self.text_started and self.cur_block == 0 and not self._think_closed:
-                # reasoning 块已开，先收口思考块，再开 answer 块（index 1）
+            # 思考块开着（_think_started 且未收口）时，正文到来先收口思考块再开 answer 块；
+            # 必须校验 _think_started——纯 text（无 reasoning，如 gemma 对工具结果的短回复）
+            # 时 text_started/cur_block==0 也会满足旧条件，误发 signature_delta+stop 并把
+            # 后续文本切到 index 1，块序错乱 → claude 判「empty or malformed (HTTP 200)」
+            if self._think_started and not self._think_closed and self.cur_block == 0:
                 self._close_thinking(events)
                 self.cur_block = 1
                 self._text_started = True
@@ -250,6 +263,15 @@ class _AnthropicTranslator:
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
             if idx not in self.tool_blocks:
+                # 开工具块前必须先收口已开的 thinking / text 块——否则 thinking start 后
+                # 未 stop 就 start tool_use，违反 Anthropic 流式块序（块须 start→stop 配对、
+                # 按序创建），claude 会把响应判为「empty or malformed (HTTP 200)」（实测：
+                # gemma 先 reasoning 后直接 tool_calls 时复现）。
+                if self._think_started and not self._think_closed:
+                    self._close_thinking(events)
+                elif self._text_started and self.cur_block == 1:
+                    events.append({"type": "content_block_stop", "index": 1})
+                    self._text_started = False  # 已中途收口，finish() 不再重复 stop
                 func = tc.get("function") or {}
                 self.tool_blocks[idx] = {
                     "our": len(self.tool_blocks) + 2,

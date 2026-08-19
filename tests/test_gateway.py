@@ -119,6 +119,59 @@ class TestStreamTranslator(unittest.TestCase):
         md = [e for e in evs if e["type"] == "message_delta"][-1]
         self.assertEqual(md["delta"]["stop_reason"], "tool_use")
 
+    def test_plain_text_without_thinking_keeps_block0(self):
+        # 纯 text（无 reasoning，如 gemma 对工具结果的短回复）：text 块全程 index 0，
+        # 不得误发 signature_delta / 切到 index 1——否则块序错乱 claude 判 malformed
+        t = gateway._AnthropicTranslator(model="gemma")
+        evs = []
+        evs += t.feed({"content": "No"})
+        evs += t.feed({"content": " input provided"})
+        evs += t.feed({"content": "。"})
+        evs += t.finish()
+        seq = []
+        for e in evs:
+            t2 = e["type"]
+            if t2 == "content_block_start":
+                seq.append(("start", e.get("index"), e.get("content_block", {}).get("type")))
+            elif t2 == "content_block_delta":
+                d = e.get("delta", {})
+                seq.append(("delta", e.get("index"), d.get("type")))
+            elif t2 == "content_block_stop":
+                seq.append(("stop", e.get("index")))
+        # 全程只有 index 0 的 text 块，无 signature_delta，无 index 1
+        self.assertEqual(seq, [
+            ("start", 0, "text"),
+            ("delta", 0, "text_delta"),
+            ("delta", 0, "text_delta"),
+            ("delta", 0, "text_delta"),
+            ("stop", 0),
+        ], "纯 text 不得误触发 thinking 收口或切块")
+        self.assertNotIn(1, [x[1] for x in seq], "不应出现 index 1 块")
+        self.assertNotIn("signature_delta", [x[2] for x in seq if len(x) > 2], "text 块不应有 signature_delta")
+
+    def test_tool_use_after_thinking_closes_thinking_first(self):
+        # gemma 先 reasoning 后直接 tool_calls（无 text 答案）时：thinking 块必须在
+        # tool_use 块 start 之前收口（signature_delta + content_block_stop），否则违反
+        # Anthropic 流式块序、claude 判「empty or malformed (HTTP 200)」（实测复现）
+        t = gateway._AnthropicTranslator(model="gemma")
+        evs = []
+        evs += t.feed({"reasoning": "我需要调用工具收尾"})
+        evs += t.feed({"tool_calls": [{"index": 0, "id": "t1",
+                                       "function": {"name": "end_discussion", "arguments": "{\"reason\":\"x\"}"}}]})
+        t.stop_reason = "tool_use"
+        evs += t.finish()
+        # 找到 thinking stop 与 tool_use start 的位置，断言顺序
+        seq = []
+        for e in evs:
+            if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "signature_delta":
+                seq.append("thinking_sig")
+            elif e["type"] == "content_block_stop" and e.get("index") == 0:
+                seq.append("thinking_stop")
+            elif e["type"] == "content_block_start" and e.get("content_block", {}).get("type") == "tool_use":
+                seq.append("tool_start")
+        self.assertEqual(seq, ["thinking_sig", "thinking_stop", "tool_start"],
+                         "thinking 块须先收口（signature+stop）再开 tool_use 块")
+
     def test_message_start_uses_estimated_input_tokens(self):
         # message_start 的 input_tokens 用请求估算值（Ollama 真实值流末才返回），避免恒为 0
         t = gateway._AnthropicTranslator(model="gemma", est_input_tokens=88)
