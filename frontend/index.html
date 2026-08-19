@@ -92,6 +92,8 @@
   .sess-badges .badge { margin:0; }
   .sess-prev { font-size:12px; color:var(--muted); margin-top:4px; max-height:32px; overflow:hidden; }
   .sess-del { position:absolute; top:6px; right:6px; font-size:11px; padding:1px 6px; color:#c33; border-color:#e88; }
+  .sess-edit { position:absolute; top:6px; right:50px; font-size:12px; line-height:1; padding:1px 5px; color:#4a9eff; background:rgba(255,255,255,.92); border:1px solid #bcd8ff; border-radius:5px; opacity:0; transition:opacity .12s; cursor:pointer; }
+  .sess-card:hover .sess-edit { opacity:1; }
   .sess-empty { padding:14px 10px; color:var(--muted); font-size:12px; line-height:1.6; }
 
   /* ---- 右栏 ---- */
@@ -859,46 +861,24 @@ function renderSessions() {
     card.className = 'sess-card' + (s.id === curSid ? ' active' : '');
     card.onclick = function () { openSession(s.id); };
     var title = document.createElement('div'); title.className = 'sess-title'; title.textContent = s.title || '会话';
-    title.title = '双击修改标题';
-    title.ondblclick = (function (s) {
-      return function (e) {
-        e.stopPropagation();
-        var input = document.createElement('input');
-        input.className = 'sess-title-edit';
-        input.value = s.title || '';
-        input.maxLength = 60;
-        title.replaceWith(input);
-        input.focus(); input.select();
-        var finished = false;
-        function commit() {
-          if (finished) return;
-          finished = true;
-          var v = input.value.trim();
-          if (v && v !== (s.title || '')) {
-            fetch('/api/session/' + curPid + '/' + s.id + '/title', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ title: v }),
-            }).then(function (r) { return r.json(); })
-              .then(function (d) {
-                if (d.ok) {
-                  s.title = v;
-                  for (var i = 0; i < curProjSessions.length; i++) if (curProjSessions[i].id === s.id) curProjSessions[i].title = v;
-                  renderSessions();
-                  if (curSid === s.id) updateCtxHead(s);
-                } else { renderSessions(); }
-              }).catch(function () { renderSessions(); });
-          } else { renderSessions(); }
-        }
-        input.onkeydown = function (ev) {
-          if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
-          else if (ev.key === 'Escape') { ev.preventDefault(); finished = true; renderSessions(); }
-        };
-        input.onblur = function () { commit(); };
-      };
-    })(s);
+    title.title = '单击打开会话；双击标题或用 ✎ 修改标题';
+    var _clickTimer = null;
+    title.onclick = function (e) {
+      e.stopPropagation();
+      if (_clickTimer) return;
+      _clickTimer = setTimeout(function () { _clickTimer = null; openSession(s.id); }, 220);
+    };
+    title.ondblclick = function (e) {
+      e.stopPropagation();
+      if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
+      editTitle(s, title);
+    };
+    var editBtn = document.createElement('button'); editBtn.className = 'sess-edit'; editBtn.textContent = '✎';
+    editBtn.title = '修改标题';
+    editBtn.onclick = function (e) { e.stopPropagation(); editTitle(s, title); };
     var meta = document.createElement('div'); meta.className = 'sess-meta';
     meta.textContent = (s.updated_at ? s.updated_at : '') + (s.message_count != null ? ' · ' + s.message_count + ' 条' : '');
-    card.appendChild(title); card.appendChild(meta);
+    card.appendChild(title); card.appendChild(editBtn); card.appendChild(meta);
     var badges = document.createElement('div'); badges.className = 'sess-badges';
     if (s.team_name) badges.appendChild(badge('b-team', s.team_name));
     card.appendChild(badges);
@@ -911,6 +891,41 @@ function renderSessions() {
     card.appendChild(del);
     box.appendChild(card);
   });
+}
+
+function editTitle(s, titleEl) {
+  if (!titleEl || !titleEl.parentNode) return;
+  var input = document.createElement('input');
+  input.className = 'sess-title-edit';
+  input.value = s.title || '';
+  input.maxLength = 60;
+  titleEl.replaceWith(input);
+  input.focus(); input.select();
+  var finished = false;
+  function commit() {
+    if (finished) return;
+    finished = true;
+    var v = input.value.trim();
+    if (v && v !== (s.title || '')) {
+      fetch('/api/session/' + curPid + '/' + s.id + '/title', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: v }),
+      }).then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.ok) {
+            s.title = v;
+            for (var i = 0; i < curProjSessions.length; i++) if (curProjSessions[i].id === s.id) curProjSessions[i].title = v;
+            renderSessions();
+            if (curSid === s.id) updateCtxHead(s);
+          } else { renderSessions(); }
+        }).catch(function () { renderSessions(); });
+    } else { renderSessions(); }
+  }
+  input.onkeydown = function (ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); finished = true; renderSessions(); }
+  };
+  input.onblur = function () { commit(); };
 }
 
 function openSession(sid) {
