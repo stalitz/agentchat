@@ -312,28 +312,34 @@ class Session:
             await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
             return "", errors
         thinking_text = "\n\n".join(thinking_parts).strip()
-        # 工具轮的错误（如 Claude 对注入工具报「No such tool available」）不得吞掉，
-        # 否则前端把 content 为空的工具轮显示成「本轮未输出独立结论」，用户看不到真实失败原因。
-        # 把错误拼入正文，既在 UI 可见，也作为上下文喂给对手 agent；仍返回空 errors 让 _debate 继续。
+        # 工具调用失败（如 Claude 对注入工具报「No such tool available」）不得吞掉，
+        # 否则前端把工具轮显示成「本轮未输出独立结论」，用户看不到真实失败原因。
+        # 按 Option A：失败作为结构化 tool_results 子块随本轮落盘（同一气泡内渲染），
+        # 不再拼进正文（正文保持干净结论）；会话仍继续（返回空 errors，_debate 据此不中止）。
+        tool_calls = [tu for tu in tool_uses if isinstance(tu, dict)]
+        tool_results = []
         if tool_intent and errors:
-            err_text = "\n".join(e for e in errors if e not in full)
-            if err_text:
-                full = (full + "\n\n[工具调用失败] " + err_text).strip()
+            for e in errors:
+                if e not in full:
+                    tool_results.append({"is_error": True, "content": e})
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
-        # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。
-        # 空轮（无正文、无思考、无工具意图）：本地模型偶发空响应，不落空 agent 发言占位，
-        # 否则刷新后会话里出现一串空气泡、对话显错乱；广播一条提示即可，不持久化。
-        if not full and not thinking_text and not tool_intent:
+        # 避免历史/实时把整段思考重复渲染到结论气泡。
+        # 空轮判定：无正文、无思考、且无任何工具调用/工具结果 → 本地模型偶发空响应，
+        # 不落空 agent 发言（避免刷新后一串空气泡）；仅广播提示，不持久化。
+        # 纯工具轮（仅 tool_calls / tool_results）则保留为气泡，工具调用与失败可见。
+        if not full and not thinking_text and not tool_calls and not tool_results:
             await self._emit(type="system", msg=f"{agent.name} 本轮未输出可显示内容，已跳过。")
             return "", errors
         entry = {
             "round": len(self.history), "speaker": agent.name, "role": agent.role,
             "content": full,
             "thinking": thinking_text,
+            "tool_calls": tool_calls,
+            "tool_results": tool_results,
         }
-        # 纯工具轮（模型只调 end_discussion、无正文无思考）：意图与状态已入工具日志，
-        # 不落空 agent 发言（避免「本轮未输出独立结论」占位噪声）。
-        if not (tool_intent and not full and not thinking_text):
+        # 纯工具轮（仅工具调用/失败、无正文无思考）：意图与状态已入工具日志，但工具调用
+        # 与失败结果须保留为可折叠子块可见，故仍落盘（不造假「未输出结论」占位）。
+        if full or thinking_text or tool_calls or tool_results:
             self.history.append(entry)
             store.append_message(self.project_path, self.session_id, entry)
         # 工具轮的错误已由状态机消化（claude 对注入工具报「未知工具」是预期行为），

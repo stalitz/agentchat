@@ -371,8 +371,9 @@ class TestCliTranscriptParse(unittest.TestCase):
         self.assertEqual(turns[1]["thinking"], "")
 
     def test_parse_claude_transcript_tool_result_error_attached(self):
-        # assistant 调用工具后，user 事件里的 tool_result is_error 应拼入刚结束的回复，
-        # 否则 reconcile 打开会话时看不到「No such tool available」等报错。
+        # assistant 调用工具后，user 事件里的 tool_result is_error 应作为结构化 tool_results
+        # 随当前气泡落盘（不新开气泡），否则 reconcile 打开会话时看不到「No such tool available」。
+        # 同时该 assistant 的 tool_use 块须收集进 tool_calls（之前被忽略，导致调用输出在 UI 消失）。
         p = self._write([
             json.dumps({"type": "user", "message": {"role": "user", "content": "问题"}}),
             json.dumps({"type": "assistant", "message": {"role": "assistant",
@@ -383,10 +384,58 @@ class TestCliTranscriptParse(unittest.TestCase):
                  "content": "<tool_use_error>Error: No such tool available: end_discussion</tool_use_error>"}]}}),
         ])
         turns = executor._parse_claude_transcript(p)
-        self.assertEqual(len(turns), 1)
-        self.assertIn("No such tool available", turns[0]["content"])
-        self.assertIn("[工具调用失败]", turns[0]["content"])
+        self.assertEqual(len(turns), 1, "工具回执不新开气泡，合并为同一回合")
         self.assertEqual(turns[0]["thinking"], "我调用工具")
+        # tool_use 收集进 tool_calls
+        self.assertEqual(len(turns[0]["tool_calls"]), 1)
+        self.assertEqual(turns[0]["tool_calls"][0]["name"], "end_discussion")
+        self.assertEqual(turns[0]["tool_calls"][0]["input"], {"reason": "测试"})
+        # 工具失败进 tool_results（结构化，不再拼进正文）
+        self.assertEqual(len(turns[0]["tool_results"]), 1)
+        self.assertTrue(turns[0]["tool_results"][0]["is_error"])
+        self.assertIn("No such tool available", turns[0]["tool_results"][0]["content"])
+        self.assertNotIn("No such tool available", turns[0]["content"], "报错不应进正文")
+
+    def test_parse_claude_transcript_merges_tool_loop_one_bubble(self):
+        # Option A：一个 agent 回合内「思考 → 工具调用 → 工具失败 → 续写结论」合并为一个气泡，
+        # tool_result(user) 之后 assistant 的续写仍属同一回合，不新开气泡。
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "thinking", "thinking": "先调用 end_discussion 收尾"},
+                            {"type": "tool_use", "name": "end_discussion", "input": {"reason": "R"}}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_x", "is_error": True,
+                 "content": "<tool_use_error>Error: No such tool available: end_discussion</tool_use_error>"}]}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "工具不可用，我直接给出结论：讨论达成收敛。"}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 1, "工具循环合并为一个气泡")
+        self.assertIn("讨论达成收敛", turns[0]["content"], "工具失败后的续写应并入同一气泡正文")
+        self.assertEqual(len(turns[0]["tool_calls"]), 1)
+        self.assertEqual(len(turns[0]["tool_results"]), 1)
+        self.assertTrue(turns[0]["tool_results"][0]["is_error"])
+
+    def test_parse_claude_transcript_next_round_prompt_splits_bubble(self):
+        # 下一轮真实 prompt（user 文本）才是新气泡边界：工具循环后的新回合应隔开
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "第一轮"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "第一轮结论"}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c", "is_error": False, "content": "ok"}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": "第二轮"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "text", "text": "第二轮结论"}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 2, "跨轮 prompt 分隔为两个气泡")
+        self.assertIn("第一轮结论", turns[0]["content"])
+        self.assertIn("第二轮结论", turns[1]["content"])
+        # 第一轮的成功 tool_result 也应随之带入（同气泡）
+        self.assertEqual(len(turns[0]["tool_results"]), 1)
+        self.assertFalse(turns[0]["tool_results"][0]["is_error"])
 
     def test_parse_codex_transcript_best_effort(self):
         # codex 格式多变：尽力解析出 assistant 文本，解析不出返回空（对账时跳过）

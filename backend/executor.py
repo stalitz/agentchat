@@ -514,8 +514,8 @@ def _codex_transcript_path(cli_session_id: str):
     return None
 
 
-def _normalize_turn(content: str, thinking: str) -> dict:
-    """归一化一次 assistant 回合的 content / thinking。
+def _normalize_turn(content: str, thinking: str, tool_calls=None, tool_results=None) -> dict:
+    """归一化一次 assistant 回合的 content / thinking / tool_calls / tool_results。
 
     原则（用户明确）：思考就是思考，绝不因为正文为空就把思考提升为正文——
     那样会造成「同一段内容既当思考又当正文」的重复显示。
@@ -523,35 +523,75 @@ def _normalize_turn(content: str, thinking: str) -> dict:
     - 只有 thinking、answer 为空（如 gemma 把结论也吐在 reasoning 流里）：
       content 保持为空，thinking 保留原样；前端正文为空时显示
       「（本轮未输出独立结论，见上方思考过程）」占位，不造假正文。
+    - tool_calls / tool_results：同一 agent 回合内（含多次工具调用、失败、重试、
+      最终结论）合并为「一个气泡」的元数据，前端在同一气泡内以可折叠子块渲染
+      （对齐 WorkBuddy / claude.ai：工具调用失败不新开 message，后续说明仍在同气泡）。
     """
     content = (content or "").strip()
     thinking = (thinking or "").strip()
-    return {"content": content, "thinking": thinking}
+    return {
+        "content": content,
+        "thinking": thinking,
+        "tool_calls": tool_calls or [],
+        "tool_results": tool_results or [],
+    }
 
 
 def _parse_claude_transcript(path: str) -> list:
-    """解析 claude JSONL：返回有序 [{content, thinking}]，每个 = 一次 assistant 回复。
+    """解析 claude JSONL：返回有序 [{content, thinking, tool_calls, tool_results}]，每个 = 一个 agent 气泡。
 
-    - claude-code 外壳会把「一次回复（原生 thinking 块 + text 块）」**拆成多个独立
-      assistant 事件**（实测 2.1.212：thinking-only 与 text-only 各占一条、中间无 user 事件）。
-      若逐事件各当一条回合，reconcile 对账时会把一次回复拆成「思考空答案 + 无思考答案」两条，
-      历史错乱。故这里以 `user` 事件为回复单元分界：同一 user 之后的所有 assistant 内容
-      合并为一次回复（thinking 与 answer 不再被拆开）。
-    - 网关 agent（gemma 等）经外壳落盘的 text 块可能带 `\x01THINK\x01`/`\x01ANSW\x01` 哨兵，
-      按 _classify_text 切分（思考/答案）。其他元数据事件（queue-operation/last-prompt 等）忽略。
+    气泡粒度 = **一个 agent 回合**（对齐 WorkBuddy / claude.ai）：同一回合内「思考 → 工具调用 →
+    工具结果（失败）→ 重试/最终结论」合并为**一个气泡**，工具调用与失败作可折叠子块内联，
+    不新开 message。判定规则：
+    - `user` 事件若含 `tool_result` 块（工具回执，用户方）：拼入当前气泡的 tool_results，**不 flush**，
+      故 tool_result 之后 assistant 的续写仍属同一气泡（工具失败后换工具/直接说明都在同气泡）。
+    - `user` 事件含真实文本（下一轮 prompt / 人工输入）：收口当前气泡，开新单元。
+    - `assistant` 事件：thinking/text 照旧归集；`tool_use` 块收集进 tool_calls（之前被忽略，
+      导致「Claude 发出的调用输出」在 UI 消失——本次修复）。
+    - claude-code 把「一次回复（原生 thinking + text）」拆成多个 assistant 事件（中间无 user 事件），
+      仍按 user 分界合并，不拆开。
+    - 网关 agent（gemma 等）text 块带 `\x01THINK\x01`/`\x01ANSW\x01` 哨兵，按 _classify_text 切分。
     """
     import re as _re
     turns = []
-    pending = None  # 当前回复单元：{"think": [...], "ans": [...]}
+    pending = None  # 当前气泡单元：{"think": [...], "ans": [], "tc": [], "tr": [], "ts": None}
+
+    def _extract_tool_results(msg):
+        out = []
+        for item in (msg.get("content") or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_result":
+                err = item.get("content", "") or ""
+                if isinstance(err, str):
+                    err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
+                out.append({"is_error": bool(item.get("is_error")), "content": err})
+        return out
+
+    def _has_real_text(msg):
+        c = msg.get("content")
+        if isinstance(c, str):
+            return bool(c.strip())
+        if isinstance(c, list):
+            for item in c:
+                if isinstance(item, dict) and item.get("type") == "text" and (item.get("text") or "").strip():
+                    return True
+        return False
 
     def flush():
         nonlocal pending
         if pending is None:
             return
-        content = _re.sub(r"^\s*---\s*", "", _re.sub(r"\s*---\s*$", "", _clean_sentinels("".join(pending["ans"]).strip()))).strip()
+        content = _re.sub(r"^\s*---\s*", "", _re.sub(r"\s*---\s*$", "", _clean_sentinels("\n\n".join(pending["ans"]).strip()))).strip()
         thinking = _clean_sentinels("\n\n".join(pending["think"])).strip()
-        if content or thinking:
-            turns.append(_normalize_turn(content, thinking))
+        tc = pending["tc"]
+        tr = pending["tr"]
+        # 气泡非空条件：正文 / 思考 / 工具调用 / 工具结果 任一存在（纯工具失败轮也有 tc+tr，须保留）
+        if content or thinking or tc or tr:
+            t = _normalize_turn(content, thinking, tc, tr)
+            if pending.get("ts"):
+                t["ts"] = pending["ts"]
+            turns.append(t)
         pending = None
 
     with open(path, encoding="utf-8") as fh:
@@ -564,27 +604,28 @@ def _parse_claude_transcript(path: str) -> list:
             except json.JSONDecodeError:
                 continue
             t = o.get("type")
+            ev_ts = o.get("timestamp")
             if t == "user":
-                # 若 assistant 本轮调用的工具返回错误，把错误拼入刚结束的 assistant 回复，
-                # 否则 reconcile 后打开会话时看不到「No such tool available」等报错。
-                if pending is not None:
-                    msg = o.get("message", {})
-                    for item in (msg.get("content") or []):
-                        if not isinstance(item, dict):
-                            continue
-                        if item.get("type") == "tool_result" and item.get("is_error"):
-                            err = item.get("content", "") or ""
-                            if isinstance(err, str):
-                                err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
-                            if err:
-                                pending["ans"].append("[工具调用失败] " + err)
-                flush()  # 新回复单元：先收口上一条（若存在）
-                pending = {"think": [], "ans": []}
+                msg = o.get("message", {})
+                trs = _extract_tool_results(msg)
+                if trs:
+                    if pending is None:
+                        pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}
+                    pending["tr"].extend(trs)
+                    # 工具回执为「用户方回传」，不新开气泡；但若同消息还带真实文本
+                    # （下一轮 prompt），则收口当前气泡、开新单元
+                    if _has_real_text(msg):
+                        flush()
+                        pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}
+                    continue
+                # 纯真实文本 user 事件：收口当前气泡，开新单元
+                flush()
+                pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}
                 continue
             if t != "assistant":
                 continue
             if pending is None:
-                pending = {"think": [], "ans": []}  # 容错：无 user 前置（历史/测试数据）
+                pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}  # 容错：无 user 前置
             msg = o.get("message", {})
             blocks = msg.get("content")
             if not isinstance(blocks, list):
@@ -604,7 +645,11 @@ def _parse_claude_transcript(path: str) -> list:
                             (pending["think"] if kind == "thinking" else pending["ans"]).append(txt)
                     else:
                         pending["ans"].append(t2)
-    flush()  # 文件尾收口最后一条回复单元
+                elif bt == "tool_use":
+                    # 结构化工具调用（如 end_discussion）：收集进 tool_calls，UI 同气泡内渲染
+                    # （之前漏解析，导致 Claude 发出的调用输出/reason 参数在界面消失）
+                    pending["tc"].append({"name": b.get("name", ""), "input": b.get("input", {}) or {}})
+    flush()  # 文件尾收口最后一条气泡
     return turns
 
 

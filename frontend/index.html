@@ -136,6 +136,22 @@
   .bubble.thinking.claude-code summary .th-title { color:#3b6fd4; }
   .bubble.thinking.codex summary .th-title { color:#2f9e63; }
   .bubble.thinking.fake summary .th-title { color:#e8851a; }
+  /* 同轮工具调用 / 结果：气泡内的可折叠子块（Option A：一个 agent 回合 = 一个气泡） */
+  .tool-wrap { max-width:84%; display:flex; flex-direction:column; gap:6px; margin:2px 0 2px 44px; }
+  .tool-wrap.codex { margin-left:44px; }
+  .bubble.tool-card { background:#fbfbfe; border:1px solid #e6e6ef; border-left:3px solid #c4c4d4; border-radius:10px; max-width:100%; font-size:12.5px; }
+  .bubble.tool-card > summary { cursor:pointer; list-style:none; padding:4px 10px; color:#6b6b76; display:flex; align-items:center; gap:6px; user-select:none; }
+  .bubble.tool-card > summary::-webkit-details-marker { display:none; }
+  .bubble.tool-card > summary code { background:#ededf3; padding:1px 5px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:#3b3b46; }
+  .bubble.tool-card .tool-body { margin:0 10px 8px; padding:8px 10px; background:#fff; border:1px solid #ededf3; border-radius:8px; }
+  .bubble.tool-card .tool-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.92em; }
+  .bubble.tool-card.tool-call { border-left-color:#8a8ad1; }
+  .bubble.tool-card.tool-call > summary { color:#5b5bb0; }
+  .bubble.tool-card.tool-result.err { border-left-color:#e06b6b; background:#fdf3f3; }
+  .bubble.tool-card.tool-result.err > summary { color:#c0392b; }
+  .bubble.tool-card.tool-result .err-tag { color:#fff; background:#c0392b; border-radius:4px; padding:0 5px; font-size:10px; margin-left:2px; }
+  .bubble.tool-card.tool-result:not(.err) { border-left-color:#5bbd86; }
+  .bubble.tool-card.tool-result:not(.err) > summary { color:#2f9e63; }
   .who { font-size:11px; color:var(--muted); margin-bottom:3px; }
   .who .ts { margin-left:8px; color:#c6c6d2; font-size:10px; font-weight:400; }
   #composer { border-top:1px solid var(--line); padding:10px 14px; background:var(--panel); height:var(--composer-h); overflow:auto; }
@@ -989,6 +1005,33 @@ function renderHistoryEntry(h) {
     cur.innerHTML = mdToHtml(body);
   }
   endBubble();
+  // 同轮工具调用 / 工具结果：作为可折叠子块内联在本气泡之后（Option A：一个 agent 回合 = 一个气泡）
+  renderToolBlocks(h.speaker, type, h.tool_calls, h.tool_results);
+}
+
+function renderToolBlocks(name, atype, tcs, trs) {
+  if ((!tcs || !tcs.length) && (!trs || !trs.length)) return;
+  var row = document.createElement('div'); row.className = 'row';
+  var wrap = document.createElement('div'); wrap.className = 'tool-wrap' + (atype ? ' ' + atype : '');
+  (tcs || []).forEach(function (tc) {
+    var card = document.createElement('details'); card.className = 'bubble tool-card tool-call';
+    var sum = document.createElement('summary');
+    sum.innerHTML = '🔧 调用工具 <code>' + esc(tc.name || '') + '</code>';
+    var body = document.createElement('div'); body.className = 'tool-body';
+    body.innerHTML = '<pre>' + esc(JSON.stringify(tc.input || {}, null, 2)) + '</pre>';
+    card.appendChild(sum); card.appendChild(body);
+    wrap.appendChild(card);
+  });
+  (trs || []).forEach(function (tr) {
+    var card = document.createElement('details'); card.className = 'bubble tool-card tool-result' + (tr.is_error ? ' err' : '');
+    var sum = document.createElement('summary');
+    sum.innerHTML = '↩️ 工具结果' + (tr.is_error ? ' <span class="err-tag">失败</span>' : '');
+    var body = document.createElement('div'); body.className = 'tool-body';
+    body.textContent = tr.content || (tr.is_error ? '(空)' : '(成功)');
+    card.appendChild(sum); card.appendChild(body);
+    wrap.appendChild(card);
+  });
+  row.appendChild(wrap); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
 }
 function renderThinkingBlock(name, text, atype) {
   var row = document.createElement('div'); row.className = 'row';

@@ -313,14 +313,17 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("proposed", actions, "floor 后调用应记 proposed")
         sys_msgs = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
         self.assertFalse(any("执行出错" in m for m in sys_msgs), "工具轮错误不应中止会话")
-        # 纯工具轮（无正文无思考）不落 agent 发言——A 的 6 轮中 3 轮是纯工具轮
+        # 纯工具轮（无正文无思考）仍须落盘为气泡（含 tool_calls/tool_results，工具调用与失败可见）
         msgs = store.read_session(self.proj, self.sid)["messages"]
         a_msgs = [m for m in msgs if m.get("speaker") == "A"]
-        self.assertTrue(all((m.get("content") or "") or (m.get("thinking") or "") for m in a_msgs),
-                        "纯工具轮不应落空消息")
+        self.assertTrue(all(
+            (m.get("content") or "") or (m.get("thinking") or "")
+            or (m.get("tool_calls") or []) or (m.get("tool_results") or [])
+            for m in a_msgs), "纯工具轮也应落盘（不丢调用/失败信息）")
 
-    def test_tool_round_error_preserved_in_content(self):
-        # 工具调用失败报错（如 No such tool available）不得被吞掉，应落入该轮 content 让 UI 可见
+    def test_tool_round_error_preserved_in_tool_results(self):
+        # 工具调用失败报错（如 No such tool available）不得被吞掉，应作为结构化 tool_results
+        # 随该轮落盘（Option A：同气泡内渲染），不再拼进正文
         a1 = models.AgentConfig(name="A", type="fake")
         a2 = models.AgentConfig(name="B", type="fake")
         s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=3)
@@ -334,8 +337,16 @@ class TestOrchestrator(unittest.TestCase):
         self.run_session(s, task="测试工具报错")
         msgs = store.read_session(self.proj, self.sid)["messages"]
         a_msgs = [m for m in msgs if m.get("speaker") == "A"]
-        self.assertTrue(any("No such tool available" in (m.get("content") or "") for m in a_msgs),
-                        "工具调用失败报错应出现在 A 的发言 content 中")
+        # 工具调用进 tool_calls
+        self.assertTrue(any((m.get("tool_calls") or []) for m in a_msgs),
+                        "end_discussion 调用应出现在 tool_calls")
+        # 失败进 tool_results（结构化），不在正文
+        self.assertTrue(any(
+            any("No such tool available" in (tr.get("content") or "")
+                for tr in (m.get("tool_results") or []))
+            for m in a_msgs), "工具调用失败报错应出现在 tool_results")
+        self.assertFalse(any("No such tool available" in (m.get("content") or "") for m in a_msgs),
+                         "报错不应拼进正文")
         sys_msgs = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
         self.assertFalse(any("执行出错" in m for m in sys_msgs), "工具轮错误不应导致会话中止")
 

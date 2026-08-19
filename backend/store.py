@@ -363,6 +363,14 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
                     changed += 1
+                new_tc = turn.get("tool_calls", []) or []
+                new_tr = turn.get("tool_results", []) or []
+                if (m.get("tool_calls") or []) != new_tc:
+                    m["tool_calls"] = new_tc
+                    changed += 1
+                if (m.get("tool_results") or []) != new_tr:
+                    m["tool_results"] = new_tr
+                    changed += 1
         else:
             # 数量不一致：严禁顺序覆盖（会把 CLI 回合复制进本地无关空位造成重复——
             # s_2289e1cf 实测 cli 3 vs 本地 7，顺序覆盖后 T1/T2/T3 各出现 2 次）。
@@ -384,6 +392,8 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                         msgs.append({
                             "round": len(msgs), "speaker": agent_name, "role": role,
                             "content": new_content, "thinking": new_think,
+                            "tool_calls": turn.get("tool_calls", []) or [],
+                            "tool_results": turn.get("tool_results", []) or [],
                         })
                         appended += 1
                     continue
@@ -393,6 +403,14 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                     changed += 1
                 if (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
+                    changed += 1
+                new_tc = turn.get("tool_calls", []) or []
+                new_tr = turn.get("tool_results", []) or []
+                if (m.get("tool_calls") or []) != new_tc:
+                    m["tool_calls"] = new_tc
+                    changed += 1
+                if (m.get("tool_results") or []) != new_tr:
+                    m["tool_results"] = new_tr
                     changed += 1
                 matched.add(hit)
             # CLI 回合少于本地：删除「未被匹配的 think-only 残留」（content 空、thinking 非空）——
