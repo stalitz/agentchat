@@ -27,6 +27,12 @@ TONE_STYLES: dict[str, str] = {
 }
 
 
+def _now_str() -> str:
+    """本地时间，与 store._now 同格式（工具日志 ts 用）。"""
+    import time as _t
+    return _t.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _clean_answer(text: str) -> str:
     """清洗 agent 答案文本：剥离 gemma 等推理模型在 reasoning/answer 之间输出的
     '---' 分隔符噪声（Ollama 常把 --- 作为思考与答案的分界，原样落库会被前端显示成一条横线）。"""
@@ -242,6 +248,8 @@ class Session:
         thinking_parts = []
         errors: list[str] = []
         tool_uses: list[dict] = []
+        tool_use_ts: str | None = None      # 首个 end_discussion tool_use 到达时刻（≈调用时刻）
+        tool_use_errors: list[str] = []     # 工具执行失败文本（「有调用意图」≠「调用成功」）
         async for kind, text in runtime.run(
             prompt, self.project_path, self.timeout,
             meta={"round_index": round_i, "max_rounds": self.max_rounds},
@@ -256,8 +264,16 @@ class Session:
             elif kind == "error":
                 errors.append(text)
                 await self._emit(type="error", agent=agent.name, text=text)
+                # 工具执行失败（如 claude 对注入工具报「No such tool available」）单独收集，
+                # 写工具日志时据此标 exec_ok=false，避免「意图已记录」掩盖「调用失败」的事实
+                if "tool" in text.lower():
+                    tool_use_errors.append(text)
             elif kind == "tool_use":
                 tool_uses.append(text)
+                # 记录首个 end_discussion 调用的到达时刻（≈模型发出调用时刻）：
+                # 日志 ts 应为「调用时间」，而非「整轮跑完的写入时间」（后者可能晚数分钟）
+                if tool_use_ts is None and isinstance(text, dict) and text.get("name") == "end_discussion":
+                    tool_use_ts = _now_str()
             # done: 忽略
         full = "".join(collected).strip()
         # 剥离 gemma 等推理模型在 reasoning/answer 之间输出的 '---' 分隔符噪声
@@ -278,6 +294,11 @@ class Session:
         # 若先查 errors 会把工具轮误判为失败而中止。工具轮的错误应忽略（意图已被捕获）。
         tool_intent = any(isinstance(tu, dict) and tu.get("name") == "end_discussion" for tu in tool_uses)
         floor = 2 * len(self.agents) - 1
+        # 工具日志统一携带：调用时刻 ts（非写入时刻）、执行结果 exec_ok/exec_error——
+        # 意图捕获与执行结果分离，日志能直接看出「调用是否真的成功」
+        log_ts = tool_use_ts or _now_str()
+        exec_ok = not tool_use_errors
+        exec_err = "; ".join(dict.fromkeys(tool_use_errors))[:300]
         for tu in tool_uses:
             if not isinstance(tu, dict) or tu.get("name") != "end_discussion":
                 continue
@@ -286,6 +307,7 @@ class Session:
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "rejected", "agent": agent.name, "round_i": round_i,
                     "reason": reason, "msg": f"未达最小轮数（floor={floor}），终止被拒",
+                    "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                 })
                 continue
             if self.terminate_proposed_by is None:
@@ -294,11 +316,13 @@ class Session:
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "proposed", "agent": agent.name, "round_i": round_i,
                     "reason": reason, "msg": "已记录终止提议，等待对方确认",
+                    "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                 })
             elif self.terminate_proposed_by == agent.name:
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "repeat", "agent": agent.name, "round_i": round_i,
                     "reason": reason, "msg": "本方重复提议，仍在等待对方确认",
+                    "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                 })
             else:
                 self.terminate_confirm = True
@@ -306,6 +330,7 @@ class Session:
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "confirmed", "agent": agent.name, "round_i": round_i,
                     "reason": self.terminate_reason, "msg": "对方确认，讨论终止",
+                    "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                 })
         if errors and not tool_intent:
             # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止

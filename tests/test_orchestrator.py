@@ -350,6 +350,49 @@ class TestOrchestrator(unittest.TestCase):
         sys_msgs = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
         self.assertFalse(any("执行出错" in m for m in sys_msgs), "工具轮错误不应导致会话中止")
 
+    def test_tool_log_records_call_ts_and_exec_result(self):
+        # 工具日志必须带：调用时刻 ts（非整轮跑完的写入时刻）+ 执行结果 exec_ok/exec_error。
+        # 此前日志只有意图（proposed/rejected），看不出调用是否成功、时间还是轮次结束时刻
+        #（可能晚数分钟，如 s_963af87f 调用 09:55:39、日志却记 09:58:07）。
+        import re
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid, max_rounds=3)
+
+        async def tool_fail(prompt, cwd, timeout, meta=None):
+            yield "tool_use", {"name": "end_discussion", "input": {"reason": "测试"}}
+            yield "error", "Error: No such tool available: end_discussion"
+            yield "done", ""
+
+        s.runtimes["A"].run = tool_fail
+        self.run_session(s, task="测试工具日志")
+        logs = store.read_tool_log(self.proj, self.sid)
+        self.assertTrue(logs, "应产生工具日志")
+        entry = logs[-1]
+        self.assertIn(entry.get("action"), ("proposed", "rejected", "repeat", "confirmed"))
+        self.assertFalse(entry.get("exec_ok"), "工具执行失败时 exec_ok 应为 False")
+        self.assertIn("No such tool", entry.get("exec_error", ""), "exec_error 应含失败原因")
+        self.assertRegex(entry.get("ts", ""), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                         "ts 应为调用时刻（本地时间格式）")
+
+    def test_tool_log_success_exec_ok_true(self):
+        # 无工具错误事件（工具真执行成功）时，exec_ok=True、exec_error 为空
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid, max_rounds=3)
+
+        async def tool_ok(prompt, cwd, timeout, meta=None):
+            yield "tool_use", {"name": "end_discussion", "input": {"reason": "测试"}}
+            yield "done", ""
+
+        s.runtimes["A"].run = tool_ok
+        self.run_session(s, task="测试工具成功")
+        logs = store.read_tool_log(self.proj, self.sid)
+        self.assertTrue(logs, "应产生工具日志")
+        entry = logs[-1]
+        self.assertTrue(entry.get("exec_ok"), "工具无错误事件时 exec_ok 应为 True")
+        self.assertEqual(entry.get("exec_error", ""), "")
+
     def test_tone_injected_into_prompt(self):
         # 讨论调性：发起时选定的风格注入每轮 prompt（chat / debate 均生效），整场保持一致
         a1 = models.AgentConfig(name="A", type="fake")
