@@ -174,6 +174,21 @@ class TestParseClaudeLine(unittest.TestCase):
         line = json.dumps({"type": "result", "subtype": "success", "result": "final"})
         self.assertEqual(executor._parse_claude_line(line), [])
 
+    def test_user_tool_result_error_yields_error(self):
+        # claude-code 把失败工具结果以 user 事件里的 tool_result 块发出，必须解析为 error 事件
+        line = json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_xxx", "is_error": True,
+             "content": "<tool_use_error>Error: No such tool available: end_discussion</tool_use_error>"}]}})
+        self.assertEqual(executor._parse_claude_line(line),
+                         [("error", "Error: No such tool available: end_discussion")])
+
+    def test_user_tool_result_success_ignored(self):
+        # 成功的 tool_result 已在 assistant 文本中体现，不重复产出
+        line = json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_xxx", "is_error": False,
+             "content": "ok"}]}})
+        self.assertEqual(executor._parse_claude_line(line), [])
+
     def test_non_json_line_is_text(self):
         self.assertEqual(executor._parse_claude_line("plain text"), [("text", "plain text")])
 
@@ -354,6 +369,24 @@ class TestCliTranscriptParse(unittest.TestCase):
         self.assertEqual(turns[0]["thinking"], "第一次思考")
         self.assertEqual(turns[1]["content"], "第二次答案")
         self.assertEqual(turns[1]["thinking"], "")
+
+    def test_parse_claude_transcript_tool_result_error_attached(self):
+        # assistant 调用工具后，user 事件里的 tool_result is_error 应拼入刚结束的回复，
+        # 否则 reconcile 打开会话时看不到「No such tool available」等报错。
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "thinking", "thinking": "我调用工具"},
+                            {"type": "tool_use", "name": "end_discussion", "input": {"reason": "测试"}}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_x", "is_error": True,
+                 "content": "<tool_use_error>Error: No such tool available: end_discussion</tool_use_error>"}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 1)
+        self.assertIn("No such tool available", turns[0]["content"])
+        self.assertIn("[工具调用失败]", turns[0]["content"])
+        self.assertEqual(turns[0]["thinking"], "我调用工具")
 
     def test_parse_codex_transcript_best_effort(self):
         # codex 格式多变：尽力解析出 assistant 文本，解析不出返回空（对账时跳过）

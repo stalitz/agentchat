@@ -312,6 +312,13 @@ class Session:
             await self._record_system(f"{agent.name} 执行出错，会话中止：{errors[0][:200]}")
             return "", errors
         thinking_text = "\n\n".join(thinking_parts).strip()
+        # 工具轮的错误（如 Claude 对注入工具报「No such tool available」）不得吞掉，
+        # 否则前端把 content 为空的工具轮显示成「本轮未输出独立结论」，用户看不到真实失败原因。
+        # 把错误拼入正文，既在 UI 可见，也作为上下文喂给对手 agent；仍返回空 errors 让 _debate 继续。
+        if tool_intent and errors:
+            err_text = "\n".join(e for e in errors if e not in full)
+            if err_text:
+                full = (full + "\n\n[工具调用失败] " + err_text).strip()
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。
         # 空轮（无正文、无思考、无工具意图）：本地模型偶发空响应，不落空 agent 发言占位，

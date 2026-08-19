@@ -406,6 +406,22 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
                 }))
         if out:
             return out
+    # user 事件：可能是 tool_result（工具执行失败后的结果回传）。claude-code 把失败结果
+    # 以 user.message.content[].{type:tool_result, is_error:true} 发出，必须透传给编排层，
+    # 否则「No such tool available」这类错误会被完全吞掉。
+    if t == "user":
+        msg = ev.get("message") or {}
+        out = []
+        for item in (msg.get("content") or []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_result" and item.get("is_error"):
+                err = item.get("content", "") or ""
+                if isinstance(err, str):
+                    err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
+                if err:
+                    out.append(("error", err))
+        return out
     # result 事件：失败透出错误；成功不重复产出（文本已由 assistant 事件给出）
     if t == "result" and (ev.get("is_error") or ev.get("subtype") == "error"):
         return [("error", ev.get("result") or "执行失败")]
@@ -549,6 +565,19 @@ def _parse_claude_transcript(path: str) -> list:
                 continue
             t = o.get("type")
             if t == "user":
+                # 若 assistant 本轮调用的工具返回错误，把错误拼入刚结束的 assistant 回复，
+                # 否则 reconcile 后打开会话时看不到「No such tool available」等报错。
+                if pending is not None:
+                    msg = o.get("message", {})
+                    for item in (msg.get("content") or []):
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "tool_result" and item.get("is_error"):
+                            err = item.get("content", "") or ""
+                            if isinstance(err, str):
+                                err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
+                            if err:
+                                pending["ans"].append("[工具调用失败] " + err)
                 flush()  # 新回复单元：先收口上一条（若存在）
                 pending = {"think": [], "ans": []}
                 continue

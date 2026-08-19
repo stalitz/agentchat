@@ -319,6 +319,26 @@ class TestOrchestrator(unittest.TestCase):
         self.assertTrue(all((m.get("content") or "") or (m.get("thinking") or "") for m in a_msgs),
                         "纯工具轮不应落空消息")
 
+    def test_tool_round_error_preserved_in_content(self):
+        # 工具调用失败报错（如 No such tool available）不得被吞掉，应落入该轮 content 让 UI 可见
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=3)
+
+        async def tool_then_error(prompt, cwd, timeout, meta=None):
+            yield "tool_use", {"name": "end_discussion", "input": {"reason": "测试"}}
+            yield "error", "Error: No such tool available: end_discussion"
+            yield "done", ""
+
+        s.runtimes["A"].run = tool_then_error
+        self.run_session(s, task="测试工具报错")
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msgs = [m for m in msgs if m.get("speaker") == "A"]
+        self.assertTrue(any("No such tool available" in (m.get("content") or "") for m in a_msgs),
+                        "工具调用失败报错应出现在 A 的发言 content 中")
+        sys_msgs = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
+        self.assertFalse(any("执行出错" in m for m in sys_msgs), "工具轮错误不应导致会话中止")
+
     def test_tone_injected_into_prompt(self):
         # 讨论调性：发起时选定的风格注入每轮 prompt（chat / debate 均生效），整场保持一致
         a1 = models.AgentConfig(name="A", type="fake")
