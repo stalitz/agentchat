@@ -50,14 +50,13 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         # tool_result -> OpenAI tool role 消息
         self.assertEqual(oa["messages"][2], {"role": "tool", "tool_call_id": "t1", "content": "file content"})
 
-    def test_tools_translated(self):
+    def test_tools_not_translated(self):
+        # 2026-08-19：工具不再转发/注入——tools 参数不进 OpenAI 请求（模型纯文本输出）
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [],
             "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object", "properties": {}}}],
         })
-        self.assertEqual(oa["tools"][0]["type"], "function")
-        self.assertEqual(oa["tools"][0]["function"]["name"], "f")
-        self.assertEqual(oa["tools"][0]["function"]["parameters"], {"type": "object", "properties": {}})
+        self.assertNotIn("tools", oa, "claude 内置 tools 不应转发给 Ollama")
 
     def test_unknown_fields_dropped(self):
         oa = gateway.anthropic_to_openai({
@@ -70,29 +69,18 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         # 受支持的通用字段应保留
         self.assertEqual(oa["temperature"], 0.7)
 
-    def test_end_discussion_tool_injected(self):
-        # 网关向模型注入 end_discussion 工具（claude MCP 加载在 -p/隔离配置下不可靠，
-        # 注入后凡经网关的模型必可见工具、可主动收敛）——tools 无该工具时自动追加
+    def test_tools_not_forwarded_or_injected(self):
+        # 2026-08-19：工具统一走「prompt 文本 json + 编排层兜底解析」——
+        # 网关不再转发 claude 内置 tools、也不再注入 end_discussion schema。
+        # 原因：claude 侧无 end_discussion 实现（gemma 每次调用必报 No such tool available），
+        # deepseek-r1:14b 又不产出 tool_calls（R1 不支持 function calling）。
+        # 请求即使带 tools，也不进 OpenAI 请求（模型纯文本输出，无乱调副作用）。
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [],
             "tools": [{"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
         })
-        names = [t["function"]["name"] for t in oa["tools"]]
-        self.assertIn("end_discussion", names, "应自动注入 end_discussion 工具")
-        ed = next(t["function"] for t in oa["tools"] if t["function"]["name"] == "end_discussion")
-        self.assertIn("reason", ed["parameters"]["properties"])
-        self.assertIn("reason", ed["parameters"]["required"])
-        # 已存在则不重复注入
-        oa2 = gateway.anthropic_to_openai({
-            "model": "gemma", "messages": [],
-            "tools": [
-                {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
-                {"name": "end_discussion", "description": "d", "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}}},
-            ],
-        })
-        names2 = [t["function"]["name"] for t in oa2["tools"]]
-        self.assertEqual(names2.count("end_discussion"), 1, "已有 end_discussion 时不应重复注入")
-        # 无 tools 时不注入（纯文本请求不需要）
+        self.assertNotIn("tools", oa, "不应转发 claude 内置工具，也不应注入 end_discussion")
+        # 无 tools 请求同样不带 tools 字段
         oa3 = gateway.anthropic_to_openai({"model": "gemma", "messages": []})
         self.assertNotIn("tools", oa3)
 

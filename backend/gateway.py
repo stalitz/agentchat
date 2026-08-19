@@ -45,8 +45,10 @@ DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 
 # OpenAI Chat Completions 接受的字段白名单（避免把 Anthropic 专有字段透传导致 Ollama 报错）。
 # 仅保留 Ollama OpenAI 兼容端点普遍支持的字段，降低 400 风险。
+# 注：tools / tool_choice 不再转发（2026-08-19）——工具统一走「prompt 文本 json + 编排层
+# 兜底解析」，见 anthropic_to_openai 内的说明。
 _OA_FORWARD_FIELDS = (
-    "temperature", "top_p", "max_tokens", "stop", "tools", "tool_choice",
+    "temperature", "top_p", "max_tokens", "stop",
 )
 
 
@@ -119,40 +121,16 @@ def anthropic_to_openai(body: dict) -> dict:
     for f in _OA_FORWARD_FIELDS:
         if body.get(f) is not None:
             oa[f] = body[f]
-    tools = body.get("tools")
-    if tools:
-        oa["tools"] = [{
-            "type": "function",
-            "function": {
-                "name": t.get("name"),
-                "description": t.get("description", ""),
-                "parameters": t.get("input_schema", {}),
-            },
-        } for t in tools]
-    # 注入 end_discussion 工具：claude-code 的 MCP 加载在 -p 非交互/隔离配置下不可靠
-    # （实测 2.1.212：.mcp.json 服务器 Pending approval、claude mcp add 后 Failed to connect，
-    # 请求 tools 里 25 个全是内置工具、无 end_discussion → 模型看不到工具、无法主动收敛）。
-    # 改为在网关层直接向模型注入工具定义——凡经网关的模型（gemma/r1 等）必可见，
-    # 调用后网关把 tool_calls 翻译为 tool_use 事件，编排层据此走两阶段终止状态机；
-    # 不依赖 claude 的 MCP 机制（terminate_signal_mcp.py 保留为备用，不再必需）。
-    if tools and not any((t.get("name") or "") == "end_discussion" for t in tools):
-        oa["tools"].append({
-            "type": "function",
-            "function": {
-                "name": "end_discussion",
-                "description": (
-                    "结束当前多 agent 讨论。只有当本场讨论已充分进行（至少两轮完整往返）且你真正认为"
-                    "双方已达成一致、可以收尾时才调用；否则不要调用。reason 请用一两句话说明达成的一致结论。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {"type": "string", "description": "双方达成的一致结论（一两句话）"},
-                    },
-                    "required": ["reason"],
-                },
-            },
-        })
+    # 工具统一走「prompt 文本 json 约定 + 编排层兜底解析」（2026-08-19，commit e3597c5 配套）：
+    # - 原方案：网关注入 end_discussion schema，模型发真 tool_use。实测暴露两问题——
+    #   ① claude-code 侧无 end_discussion 工具实现，gemma 每次调用必报
+    #      「No such tool available」（MCP 已否决：-p 非交互 Pending approval / Failed to connect）；
+    #   ② deepseek-r1:14b 模型本身不产出 tool_calls（R1 不支持 function calling，Ollama 实测
+    #      tools=Y 仍返回 NONE），只会按提示词输出文本 json。
+    # - 现方案：不注入 schema、也不转发 claude 内置 tools（模型纯文本输出，无乱调副作用）；
+    #   两模型统一按 prompt 指令输出 ```json {"tool":"end_discussion","reason":...}```，
+    #   编排层 _extract_text_tool_call 兜底解析驱动终止状态机——行为一致、无失败噪音。
+    # （terminate_signal_mcp.py 保留为备用，不再必需。）
     return oa
 
 

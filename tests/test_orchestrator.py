@@ -268,7 +268,7 @@ class TestOrchestrator(unittest.TestCase):
         prompt = s2._build_prompt(a1, "第二句")
         self.assertIn("第二句", prompt)
         self.assertNotIn("第一句", prompt, "状态式设计下不应把历史重新搬运进 prompt（token 浪费）")
-        self.assertNotIn("end_discussion", prompt.replace("不要调用 end_discussion 工具", ""))
+        self.assertNotIn("end_discussion", prompt.replace("不要输出 end_discussion 调用文本", ""))
 
     def test_debate_mode_records_task_as_human(self):
         a1 = models.AgentConfig(name="A", type="fake")
