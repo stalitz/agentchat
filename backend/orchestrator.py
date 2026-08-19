@@ -314,8 +314,13 @@ class Session:
         thinking_text = "\n\n".join(thinking_parts).strip()
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。无答案时正文为空，前端显示提示。
+        # 空轮（无正文、无思考、无工具意图）：本地模型偶发空响应，不落空 agent 发言占位，
+        # 否则刷新后会话里出现一串空气泡、对话显错乱；广播一条提示即可，不持久化。
+        if not full and not thinking_text and not tool_intent:
+            await self._emit(type="system", msg=f"{agent.name} 本轮未输出可显示内容，已跳过。")
+            return "", errors
         entry = {
-            "round": round_i, "speaker": agent.name, "role": agent.role,
+            "round": len(self.history), "speaker": agent.name, "role": agent.role,
             "content": full,
             "thinking": thinking_text,
         }
