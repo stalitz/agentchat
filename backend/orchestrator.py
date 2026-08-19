@@ -227,7 +227,8 @@ class Session:
                 )
             else:
                 parts.append(
-                    f"【轮次提醒】本场已讨论到第 {round_i + 1} 轮（达到最少轮数，可以收尾）。"
+                    f"【轮次提醒】本场已讨论到第 {round_i + 1} / {self.max_rounds * len(self.agents)} 轮"
+                    "（达到最少轮数，可以收尾）。"
                     "若你认为双方已达一致，**请发起 end_discussion 终止**（reason 填共识结论；"
                     "可直接调用工具，无工具则输出 ```json 调用文本："
                     '```json\n{"tool": "end_discussion", "reason": "..."}\n```）；'
@@ -293,7 +294,8 @@ class Session:
         tool_use_errors: list[str] = []     # 工具执行失败文本（「有调用意图」≠「调用成功」）
         async for kind, text in runtime.run(
             prompt, self.project_path, self.timeout,
-            meta={"round_index": round_i, "max_rounds": self.max_rounds},
+            meta={"round_index": round_i, "max_rounds": self.max_rounds,
+                  "agent_count": len(self.agents)},
         ):
             if kind == "text":
                 collected.append(text)

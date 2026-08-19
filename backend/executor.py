@@ -206,12 +206,17 @@ class AgentRuntime:
         """
         round_index = int(meta.get("round_index", 0))
         max_rounds = int(meta.get("max_rounds", 12))
+        agent_count = int(meta.get("agent_count", 2)) or 2
         self._fake_history.append(prompt.replace("\n", " ")[:120])
         n_prev = len(self._fake_history) - 1
         note = f"（本 agent 持续会话已记住前 {n_prev} 轮上下文）" if n_prev > 0 else ""
+        # 口径统一（用户反馈「第 6 轮却显示上限 3 轮」歧义）：max_rounds = 每 agent 发言次数，
+        # 全局总轮 = max_rounds × agent 数；文本同时标清全局轮次与本 agent 发言序号。
+        my_turn = round_index // agent_count + 1
+        total = max_rounds * agent_count
         lines = [
             f"[FAKE:{self.agent.name}] 我是「{self.agent.role or '未定义角色'}」，调试用假 agent。{note}",
-            f"本轮：第 {round_index + 1} 轮 / 上限 {max_rounds} 轮。",
+            f"本轮：全局第 {round_index + 1} / {total} 轮（本 agent 第 {my_turn} 次发言 / 上限 {max_rounds} 次）。",
             "我的模拟建议：① 澄清需求边界；② 给出最小可行方案；③ 标注风险点。",
         ]
         if self.agent.fake_terminate_round and (round_index + 1) >= self.agent.fake_terminate_round:
