@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from tests.base import models, orch, store
-from backend.orchestrator import _clean_answer
+from backend.orchestrator import _clean_answer, _extract_text_tool_call
 
 
 class Recorder:
@@ -51,6 +51,59 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(_clean_answer("正常无分隔符文本"), "正常无分隔符文本")
         # 中间的正文 --- 不误删
         self.assertEqual(_clean_answer("先说结论 --- 然后解释"), "先说结论 --- 然后解释")
+
+    def test_extract_text_tool_call_parses_fenced_json(self):
+        # deepseek 等未拿工具 schema 的模型：end_discussion 调用写成 ```json 文本，
+        # 编排层必须能解析出来（方向 A：两种表达行为一致）
+        txt = ('```json\n{"tool": "end_discussion", "reason": "讨论达成一致结论"}\n```')
+        r = _extract_text_tool_call(txt)
+        self.assertIsNotNone(r)
+        self.assertEqual(r["name"], "end_discussion")
+        self.assertEqual(r["input"]["reason"], "讨论达成一致结论")
+
+    def test_extract_text_tool_call_robust(self):
+        # 各种非目标输入都不误报
+        self.assertIsNone(_extract_text_tool_call(""))
+        self.assertIsNone(_extract_text_tool_call("正常发言，没有 json"))
+        self.assertIsNone(_extract_text_tool_call('```json\n{"tool": "other", "reason": "x"}\n```'),
+                          "非 end_discussion 工具不应提取")
+        self.assertIsNone(_extract_text_tool_call('```json\n{"tool": end_discussion}\n```'),
+                          "损坏 json 不应提取")
+        # reason 缺失也容忍（空字符串）
+        r = _extract_text_tool_call('```json\n{"tool": "end_discussion"}\n```')
+        self.assertIsNotNone(r)
+        self.assertEqual(r["input"]["reason"], "")
+        # 无语言标记的 fenced 块也支持
+        r = _extract_text_tool_call('```\n{"tool": "end_discussion", "reason": "x"}\n```')
+        self.assertIsNotNone(r)
+
+    def test_text_json_tool_call_triggers_terminate(self):
+        # 方向 A 核心场景：模型（如 deepseek）只吐文本 json、无 tool_use 事件，
+        # 编排层兜底解析后应照常驱动终止状态机（不再靠轮次上限强停）
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid, max_rounds=6)
+
+        async def text_json(prompt, cwd, timeout, meta=None):
+            # 每次发言都以文本 json 提议终止（模拟 deepseek 行为）
+            yield "text", '```json\n{"tool": "end_discussion", "reason": "达成共识，提议终止"}\n```'
+            yield "done", ""
+
+        s.runtimes["A"].run = text_json
+        s.runtimes["B"].run = text_json
+        self.run_session(s, task="测试文本 json 终止")
+        logs = store.read_tool_log(self.proj, self.sid)
+        self.assertTrue(logs, "文本 json 应被识别并产生工具日志")
+        actions = [e.get("action") for e in logs]
+        self.assertIn("proposed", actions, "文本 json 提议应被识别为 proposed")
+        self.assertIn("confirmed", actions, "对方文本 json 确认后应真收敛（不再靠轮次上限强停）")
+        # 内容原文保留（json 作为正文落盘，前端按代码块渲染）
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msgs = [m for m in msgs if m.get("speaker") == "A"]
+        self.assertTrue(any('"tool": "end_discussion"' in (m.get("content") or "") for m in a_msgs),
+                        "文本 json 应原样保留在发言 content 中")
+        # 双向确认后终止已置位
+        self.assertTrue(s.terminate_confirm, "双向确认后应 terminate_confirm=True")
 
     def test_thinking_persisted_in_history(self):
         # 思考必须随答案一起落盘，刷新后仍可见；且思考块与结论块内容不重复

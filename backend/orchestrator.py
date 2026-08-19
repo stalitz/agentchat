@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 
 from . import store
@@ -31,6 +32,33 @@ def _now_str() -> str:
     """本地时间，与 store._now 同格式（工具日志 ts 用）。"""
     import time as _t
     return _t.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _extract_text_tool_call(full: str) -> dict | None:
+    """兜底解析：模型未拿到工具 schema 时（如 deepseek 走云端直连、不经本地网关），
+    会把 end_discussion 调用写成 prompt 指令约定的文本 json：
+
+        ```json
+        {"tool": "end_discussion", "reason": "..."}
+        ```
+
+    编排层解析后并入 tool_uses，让终止状态机对两种表达（真 tool_use 块 / 文本 json）
+    行为一致——否则 deepseek 的 json 不被识别、终止永不收敛、只能靠轮次上限强停。
+    返回 {"name": "end_discussion", "input": {"reason": ...}} 或 None。
+    """
+    if not full:
+        return None
+    for m in re.finditer(r"```(?:json)?\s*\n?(\{[\s\S]*?\})\s*```", full):
+        try:
+            data = json.loads(m.group(1))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get("tool") == "end_discussion":
+            reason = data.get("reason", "")
+            if not isinstance(reason, str):
+                reason = str(reason) if reason is not None else ""
+            return {"name": "end_discussion", "input": {"reason": reason}}
+    return None
 
 
 def _clean_answer(text: str) -> str:
@@ -289,6 +317,14 @@ class Session:
             self.agent_sessions[agent.name] = runtime.cli_session_id
             store.set_agent_session_id(self.project_path, self.session_id, agent.name, runtime.cli_session_id)
         await self._emit(type="turn_end", agent=agent.name)
+        # 兜底：模型未拿到工具 schema（deepseek 走云端直连）时会把 end_discussion 调用
+        # 写成文本 json（prompt 指令约定）。解析后并入 tool_uses，与真 tool_use 块等价，
+        # 否则 deepseek 的 json 不被识别、终止状态机永不收敛、只能靠轮次上限强停。
+        text_tool = _extract_text_tool_call(full)
+        if text_tool:
+            if tool_use_ts is None:
+                tool_use_ts = _now_str()   # 文本表达无独立时间戳，以解析时刻近似
+            tool_uses.append(text_tool)
         # end_discussion 终止状态机（编排层权威判定）——必须先于 errors 检查：
         # 工具由网关注入、claude 侧无对应实现，模型调用后 claude 会因「未知工具」报错退出；
         # 若先查 errors 会把工具轮误判为失败而中止。工具轮的错误应忽略（意图已被捕获）。
