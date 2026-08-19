@@ -120,8 +120,17 @@
   .turn-block > summary .tw { margin-left:auto; color:#bcbcc8; font-size:11px; }
   .turn-block > summary .tw::after { content:" ▸ 展开"; }
   .turn-block[open] > summary .tw::after { content:" ▾ 收起"; }
-  .turn-block .turn-block-body { margin:0 10px 8px; padding:8px 10px; background:#fff; border:1px solid #ededf3; border-radius:8px; white-space:pre-wrap; word-break:break-word; line-height:1.55; }
-  .turn-block .turn-block-body pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.92em; }
+  .turn-block .turn-block-body { margin:0 10px 8px; padding:8px 10px; background:#fff; border:1px solid #ededf3; border-radius:8px; white-space:pre-wrap; word-break:break-word; line-height:1.55; overflow-wrap:break-word; }
+  /* 代码块：明显视觉样式 + 中文/长行自动断行（之前 pre 默认 white-space:pre，长 reason 字段横向溢出气泡） */
+  .turn-block .turn-block-body pre,
+  .turn-answer pre {
+    margin:6px 0; padding:8px 12px; background:#f5f5fa; border:1px solid #e6e6ef; border-radius:6px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.92em; line-height:1.55;
+    white-space:pre-wrap; overflow-wrap:break-word; word-break:break-word;
+    max-width:100%; overflow-x:auto;
+  }
+  .turn-block .turn-block-body pre code,
+  .turn-answer pre code { background:transparent; padding:0; border:none; font-family:inherit; font-size:inherit; white-space:pre-wrap; overflow-wrap:break-word; }
   .turn-block .turn-block-body code { background:#ededf3; padding:1px 4px; border-radius:3px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .turn-block .turn-block-body a { color:#3b6fd4; }
   .turn-block .turn-block-body p { margin:0 0 6px; } .turn-block .turn-block-body p:last-child { margin-bottom:0; }
