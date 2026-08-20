@@ -693,5 +693,35 @@ class TestOrchestrator(unittest.TestCase):
         for e in log:
             self.assertTrue(e.get("agent") and e.get("round_i") is not None and e.get("ts"))
 
+    def test_peer_rejected_injected_into_next_agent_prompt(self):
+        # 某 agent 的 end_discussion 被拒后，下一轮**对方** agent 的 prompt 必须注入
+        # 「对方终止被拒·继续讨论」——弱模型（gemma）会把对方被拒的调用误读为
+        # 「对方已提议终止、等我确认」而盲目跟调（「谁聪明」实测 gemma 连调 2 次）。
+        a1 = models.AgentConfig(name="A", type="fake", fake_terminate_round=1)  # A round0 调 → 被拒
+        a2 = models.AgentConfig(name="B", type="fake")                          # B 正常发言
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=6)
+        self.run_session(s, task="被拒注入")
+        prompts = store.read_prompt_log(self.proj, self.sid)
+        # 找到 B 在 round_i=1（紧接 A round0 被拒之后）的 prompt
+        b_prompts = [p for p in prompts if p.get("agent") == "B"]
+        self.assertTrue(b_prompts, "B 应有 prompt 记录")
+        b1 = next(p for p in b_prompts if p.get("round") == 1)
+        self.assertIn("对方终止被拒", b1["prompt"], "B 下一轮应被告知 A 被拒")
+        self.assertIn("并非已提议终止", b1["prompt"], "必须排除「对方已提议、等我确认」的误读")
+        self.assertIn("轮次不足", b1["prompt"], "被拒原因要点名轮次不足")
+
+    def test_peer_rejected_not_injected_to_rejected_agent_itself(self):
+        # 被拒回执只注入给**对方**，不注入给被拒者本人（本人走 _reject_inject「终止被拒·请继续」）
+        a1 = models.AgentConfig(name="A", type="fake", fake_terminate_round=1)
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=6)
+        self.run_session(s, task="被拒注入")
+        prompts = store.read_prompt_log(self.proj, self.sid)
+        a_prompts = [p for p in prompts if p.get("agent") == "A"]
+        # A 自己的下一轮（round=2）应收到「终止被拒·请继续」而不是「对方终止被拒」
+        a2_p = next(p for p in a_prompts if p.get("round") == 2)
+        self.assertIn("终止被拒·请继续", a2_p["prompt"])
+        self.assertNotIn("对方终止被拒", a2_p["prompt"], "本人不应收到『对方被拒』提示")
+
 if __name__ == "__main__":
     unittest.main()

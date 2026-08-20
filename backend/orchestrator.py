@@ -128,6 +128,10 @@ class Session:
         # 最近一次「终止被拒」的回执待注入：被拒只记日志不够，必须把原因回传给模型，
         # 否则弱模型（gemma）把通用「请继续参与讨论」回执误解为「已终止·待命」。
         self._reject_inject = None
+        # 最近一次「对方被拒」待注入：某 agent 的 end_discussion 被拒后，下一轮**对方** agent
+        # 需知道「对方尝试终止但被系统拒绝」——否则弱模型把对方被拒的调用误读为「已提议终止、
+        # 等我确认」（实测「谁聪明」gemma 因此连调 2 次 end_discussion 去"确认"）。
+        self._peer_rejected = None
 
     async def _emit(self, **kw):
         # 所有事件带 sid（会话 id）：多会话并发时前端据此区分事件归属，
@@ -204,14 +208,30 @@ class Session:
                 "待双方充分交换意见后再考虑终止。"
             )
             self._reject_inject = None
+        # 对方被拒提示：上一轮对方尝试 end_discussion 被系统拒绝（未达最小轮数）——
+        # 弱模型（gemma）会把对方被拒的调用误读为「对方已提议终止、等我确认」，
+        # 进而盲目跟调 end_discussion（「谁聪明」实测连调 2 次去"确认"）。须明确告知。
+        if self._peer_rejected and self._peer_rejected[0] != agent.name:
+            peer, pr = self._peer_rejected
+            parts.append(
+                f"【对方终止被拒·继续讨论】{peer} 上一轮也尝试发起 end_discussion 终止，"
+                f"但被系统拒绝（原因：未达最小轮数，当时第 {pr // len(self.agents) + 1} 轮），"
+                "**并非已提议终止、也不是在等你确认**。请继续正常参与讨论、推进观点或反驳，"
+                "不要因为对方尝试过就跟着调用 end_discussion。"
+            )
+            self._peer_rejected = None
         # 门槛前每轮预吿：让 agent 明确知道当前轮次与最小轮数要求，避免它在未达门槛时
         # 误调用 end_discussion 后被拒、还把原因归咎于「对方未确认」（gemma 实测归因错误：
         # 当轮回执只收到 MCP 的无状态文案，而精确原因要下一轮才注入，须在此提前框定）。
         _floor = 2 * len(self.agents) - 1
         if round_i < _floor:
+            _n = len(self.agents)
+            _my_turn = round_i // _n + 1
+            _peer_turns = (round_i - 1) // _n + 1 if round_i > 0 else 0
             parts.append(
-                f"【轮次门槛提醒】当前是第 {round_i // len(self.agents) + 1} 轮发言"
-                f"（本场最小轮数：每位 agent 各发言至少 2 次）。"
+                f"【轮次门槛提醒】当前是第 {_my_turn} 轮发言，对方已发言 {_peer_turns} 次。"
+                f"本场最小轮数：**每位 agent 各完成第 2 次发言**——即你本次发言后，"
+                "还需对方也完成第 2 次发言才算达标。"
                 f"在未达门槛前调用 end_discussion 会被系统**拒绝**——被拒原因是**轮次不足**，"
                 "与对方是否确认**无关**。请继续正常讨论、推进观点或反驳对方，不要急于终止。"
             )
@@ -431,6 +451,9 @@ class Session:
                 # 把「被拒」回传给模型：下一轮该 agent 的 prompt 注入明确原因，
                 # 避免其把通用工具回执当「已终止」而进入待命状态
                 self._reject_inject = (agent.name, round_i)
+                # 同时让下一轮**对方** agent 知道「对方尝试终止但被拒」——弱模型会把
+                # 对方被拒的调用误读为「已提议终止、等我确认」，进而盲目跟调（「谁聪明」实测）。
+                self._peer_rejected = (agent.name, round_i)
                 continue
             if self.terminate_proposed_by is None:
                 self.terminate_proposed_by = agent.name
