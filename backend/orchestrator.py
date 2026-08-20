@@ -204,6 +204,17 @@ class Session:
                 "待双方充分交换意见后再考虑终止。"
             )
             self._reject_inject = None
+        # 门槛前每轮预吿：让 agent 明确知道当前轮次与最小轮数要求，避免它在未达门槛时
+        # 误调用 end_discussion 后被拒、还把原因归咎于「对方未确认」（gemma 实测归因错误：
+        # 当轮回执只收到 MCP 的无状态文案，而精确原因要下一轮才注入，须在此提前框定）。
+        _floor = 2 * len(self.agents) - 1
+        if round_i < _floor:
+            parts.append(
+                f"【轮次门槛提醒】当前是第 {round_i // len(self.agents) + 1} 轮发言"
+                f"（本场最小轮数：每位 agent 各发言至少 2 次）。"
+                f"在未达门槛前调用 end_discussion 会被系统**拒绝**——被拒原因是**轮次不足**，"
+                "与对方是否确认**无关**。请继续正常讨论、推进观点或反驳对方，不要急于终止。"
+            )
         parts.append(
             "请基于以上继续推进。\n"
             "【共识终止：先给出总结发言，再发起 end_discussion 调用】\n"

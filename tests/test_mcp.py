@@ -51,6 +51,21 @@ class TestReadFrame(unittest.TestCase):
         self.assertNotIn("Content-Length", data, "不应再输出 Content-Length 帧头")
         self.assertTrue(data.endswith("\n"))
 
+    def test_handle_call_rejection_reason_unambiguous(self):
+        # 被拒回执必须点名「轮次不足」是首要原因、并明确「与对方确认无关」——
+        # gemma 曾把未生效归因于「对方未确认」，实际是未达最小轮数被拒（1+1=2 会话实测）
+        resp = mcp._handle_call({
+            "name": "end_discussion",
+            "arguments": {"reason": "双方已达成一致"},
+        })
+        text = resp["content"][0]["text"]
+        self.assertIn("终止尚未生效", text)
+        self.assertIn("轮数不足", text, "必须点名被拒真实原因（未达最小轮数）")
+        self.assertIn("与对方是否确认无关", text, "必须排除「对方未确认」的误归因")
+        self.assertIn("简体中文继续参与讨论", text)
+        self.assertFalse(resp.get("isError"), "回执本身不算错误")
+        self.assertNotIn("The conversation has concluded", text, "不得出现英文待命语")
+
 
 if __name__ == "__main__":
     unittest.main()
