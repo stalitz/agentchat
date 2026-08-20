@@ -288,14 +288,18 @@ class _AnthropicTranslator:
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
             if idx not in self.tool_blocks:
-                # 开工具块前必须先收口已开的 thinking / text 块——否则 thinking start 后
-                # 未 stop 就 start tool_use，违反 Anthropic 流式块序（块须 start→stop 配对、
-                # 按序创建），claude 会把响应判为「empty or malformed (HTTP 200)」（实测：
-                # gemma 先 reasoning 后直接 tool_calls 时复现）。
+                # 开工具块前必须先收口已开的 thinking / text 块——否则块未 stop 就 start
+                # tool_use，违反 Anthropic 流式块序（块须 start→stop 配对、按序创建），
+                # claude 会把响应判为「empty or malformed (HTTP 200)」。三种场景：
+                # ① thinking 开着（先 reasoning 后直接 tool_calls，无 text）；② 正文 text 在
+                # index 1（有 thinking，正文在 answer 块）；③ **纯 text 总结 + tool_calls**
+                # （无 reasoning，正文 text 块在 index 0——「先总结发言再调用工具」的
+                # 两步表达引导下 gemma 常见，实测 s_8dac9d7c 触发 malformed）。
                 if self._think_started and not self._think_closed:
                     self._close_thinking(events)
-                elif self._text_started and self.cur_block == 1:
-                    events.append({"type": "content_block_stop", "index": 1})
+                elif self._text_started:
+                    events.append({"type": "content_block_stop",
+                                   "index": 1 if self._think_started else 0})
                     self._text_started = False  # 已中途收口，finish() 不再重复 stop
                 func = tc.get("function") or {}
                 self.tool_blocks[idx] = {

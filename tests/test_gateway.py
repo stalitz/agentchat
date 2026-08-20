@@ -187,6 +187,34 @@ class TestStreamTranslator(unittest.TestCase):
         self.assertEqual(seq, ["thinking_sig", "thinking_stop", "tool_start"],
                          "thinking 块须先收口（signature+stop）再开 tool_use 块")
 
+    def test_tool_use_after_text_closes_text_first(self):
+        # 「先总结发言再调用工具」两步表达（2026-08-20 新 prompt 引导）：纯 text 总结
+        # （无 reasoning，text 块在 index 0）后接 tool_calls——text 块必须在 tool_use
+        # start 之前收口（stop），否则块未 stop 就 start 违反块序，claude 判
+        # 「empty or malformed (HTTP 200)」（实测 s_8dac9d7c 光速会话 gemma 复现）
+        t = gateway._AnthropicTranslator(model="gemma")
+        evs = []
+        evs += t.feed({"content": "我们已达成一致，光速是局部时空约束。"})
+        evs += t.feed({"tool_calls": [{"index": 0, "id": "t1",
+                                       "function": {"name": "end_discussion", "arguments": "{\"reason\":\"x\"}"}}]})
+        t.stop_reason = "tool_use"
+        evs += t.finish()
+        seq = []
+        for e in evs:
+            t2 = e["type"]
+            if t2 == "content_block_start":
+                seq.append(("start", e.get("index"), e.get("content_block", {}).get("type")))
+            elif t2 == "content_block_delta":
+                seq.append(("delta", e.get("index"), e.get("delta", {}).get("type")))
+            elif t2 == "content_block_stop":
+                seq.append(("stop", e.get("index")))
+        # text(0) start → delta → stop(0) → tool_use(2) start → input_json_delta → stop
+        self.assertEqual(seq[0], ("start", 0, "text"), "纯 text 先开 index 0 的 text 块")
+        self.assertIn(("stop", 0), seq, "text 块必须在 tool_use 前收口")
+        self.assertLess(seq.index(("stop", 0)), next(i for i, x in enumerate(seq) if x[0] == "start" and x[2] == "tool_use"),
+                        "text 收口必须早于 tool_use start")
+        self.assertEqual(seq[-1], ("stop", 2), "tool_use 块正常收口")
+
     def test_message_start_uses_estimated_input_tokens(self):
         # message_start 的 input_tokens 用请求估算值（Ollama 真实值流末才返回），避免恒为 0
         t = gateway._AnthropicTranslator(model="gemma", est_input_tokens=88)
