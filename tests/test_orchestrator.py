@@ -392,7 +392,8 @@ class TestOrchestrator(unittest.TestCase):
 
         async def tool_then_error(prompt, cwd, timeout, meta=None):
             yield "tool_use", {"name": "end_discussion", "input": {"reason": "测试"}}
-            yield "error", "Error: No such tool available: end_discussion"
+            # 失败回执现在走 tool_result 事件（is_error=True），与成功结果统一为按时间线拼块
+            yield "tool_result", {"is_error": True, "content": "Error: No such tool available: end_discussion"}
             yield "done", ""
 
         s.runtimes["A"].run = tool_then_error
@@ -411,6 +412,36 @@ class TestOrchestrator(unittest.TestCase):
                          "报错不应拼进正文")
         sys_msgs = [e.get("msg", "") for e in rec.events if e.get("type") == "system"]
         self.assertFalse(any("执行出错" in m for m in sys_msgs), "工具轮错误不应导致会话中止")
+
+    def test_blocks_preserve_timeline_order(self):
+        # 同一气泡内思考/正文/工具调用/工具结果必须按发生顺序落盘（blocks），
+        # 不能像旧逻辑那样把思考全拼一起、正文全拼一起、工具单独成列而丢失时间线。
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=3)
+
+        async def interleaved(prompt, cwd, timeout, meta=None):
+            yield "thinking", "先想一下"
+            yield "text", "调用前正文"
+            yield "tool_use", {"name": "end_discussion", "input": {"reason": "x"}}
+            yield "tool_result", {"is_error": False, "content": "已收到"}
+            yield "thinking", "调用后继续想"
+            yield "text", "调用后正文"
+            yield "done", ""
+
+        s.runtimes["A"].run = interleaved
+        self.run_session(s, task="测试时间线")
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msg = next(m for m in msgs if m.get("speaker") == "A")
+        seq = [(b["type"], b.get("text") or b.get("name") or b.get("content") or "") for b in a_msg.get("blocks", [])]
+        self.assertEqual(seq, [
+            ("thinking", "先想一下"),
+            ("text", "调用前正文"),
+            ("tool_use", "end_discussion"),
+            ("tool_result", "已收到"),
+            ("thinking", "调用后继续想"),
+            ("text", "调用后正文"),
+        ], "blocks 必须按时间线顺序保留思考/正文/工具调用/工具结果的交错")
 
     def test_tool_log_records_call_ts_and_exec_result(self):
         # 工具日志必须带：调用时刻 ts（非整轮跑完的写入时刻）+ 执行结果 exec_ok/exec_error。

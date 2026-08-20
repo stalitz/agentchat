@@ -502,9 +502,10 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
         for item in (msg.get("content") or []):
             if not isinstance(item, dict):
                 continue
-            if item.get("type") == "tool_result" and item.get("is_error"):
+            if item.get("type") == "tool_result":
                 err = item.get("content", "") or ""
-                # 失败回执 content 同样可能是 [{type:text,text}] 列表，展平为字符串
+                # 回执 content 可能是 [{type:text,text}] 列表（claude 包法），或纯字符串，
+                # 统一展平为字符串，否则前端渲染成 [object Object]。
                 if isinstance(err, list):
                     err = "".join(
                         b.get("text", "") for b in err
@@ -514,8 +515,10 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
                     err = str(err)
                 if isinstance(err, str):
                     err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
+                # 成功与失败的工具回执都按时间线产出（不再丢弃成功结果）：
+                # 编排层据此把工具结果块插到对应工具调用之后，实时可见、无需刷新。
                 if err:
-                    out.append(("error", err))
+                    out.append(("tool_result", {"is_error": bool(item.get("is_error")), "content": err}))
         return out
     # result 事件：失败透出错误；成功不重复产出（文本已由 assistant 事件给出）
     if t == "result" and (ev.get("is_error") or ev.get("subtype") == "error"):

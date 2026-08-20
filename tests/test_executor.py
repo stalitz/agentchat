@@ -220,20 +220,24 @@ class TestParseClaudeLine(unittest.TestCase):
         line = json.dumps({"type": "result", "subtype": "success", "result": "final"})
         self.assertEqual(executor._parse_claude_line(line), [])
 
-    def test_user_tool_result_error_yields_error(self):
-        # claude-code 把失败工具结果以 user 事件里的 tool_result 块发出，必须解析为 error 事件
+    def test_user_tool_result_error_yields_tool_result(self):
+        # claude-code 把失败工具结果以 user 事件里的 tool_result 块发出，解析为 tool_result 事件
+        # （is_error=True），编排层据此把失败结果按时间线插到对应工具调用之后、并标 exec_ok=false
         line = json.dumps({"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call_xxx", "is_error": True,
              "content": "<tool_use_error>Error: No such tool available: end_discussion</tool_use_error>"}]}})
         self.assertEqual(executor._parse_claude_line(line),
-                         [("error", "Error: No such tool available: end_discussion")])
+                         [("tool_result", {"is_error": True,
+                                           "content": "Error: No such tool available: end_discussion"})])
 
-    def test_user_tool_result_success_ignored(self):
-        # 成功的 tool_result 已在 assistant 文本中体现，不重复产出
+    def test_user_tool_result_success_yields_tool_result(self):
+        # 成功的 tool_result 也按时间线产出（不再丢弃），编排层插到对应工具调用之后实时可见
         line = json.dumps({"type": "user", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "call_xxx", "is_error": False,
-             "content": "ok"}]}})
-        self.assertEqual(executor._parse_claude_line(line), [])
+             "content": "【重要·讨论尚未结束】..."}]}})
+        self.assertEqual(executor._parse_claude_line(line),
+                         [("tool_result", {"is_error": False,
+                                           "content": "【重要·讨论尚未结束】..."})])
 
     def test_non_json_line_is_text(self):
         self.assertEqual(executor._parse_claude_line("plain text"), [("text", "plain text")])

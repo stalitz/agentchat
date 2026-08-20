@@ -456,6 +456,14 @@ function handleEvent(ev) {
       curTurnAgent = ev.agent || curTurnAgent;
       appendToken(ev.agent, ev.text, agentNameColor[ev.agent] || 'claude-code');
       break;
+    case 'tool_use':
+      curTurnAgent = ev.agent || curTurnAgent;
+      appendToolCall(ev.name, ev.input, agentNameColor[ev.agent] || 'claude-code');
+      break;
+    case 'tool_result':
+      curTurnAgent = ev.agent || curTurnAgent;
+      appendToolResult(ev.is_error, ev.content, agentNameColor[ev.agent] || 'claude-code');
+      break;
     case 'turn_end':
       hideLoading();  // 防御：确保加载占位被撤（内容流正常时已在 thinking/token 撤掉）
       // 只有思考、无正文时也要建气泡（承载思考子块）
@@ -463,9 +471,11 @@ function handleEvent(ev) {
         openTurn(curTurnAgent || ev.agent || 'Agent', agentNameColor[curTurnAgent || ev.agent] || 'claude-code');
       }
       if (cur) {
-        if (curAnswer && curAnswer.textContent.trim()) {
-          curAnswer.innerHTML = mdToHtml(curAnswer.textContent);
-        } else if (!curAnswer) {
+        // 所有正文块渲染为 markdown（含被工具块打断后新建的后续正文块）
+        var ansBodies = cur.querySelectorAll('.turn-answer');
+        ansBodies.forEach(function (a) { if (a.textContent.trim()) a.innerHTML = mdToHtml(a.textContent); });
+        // 纯思考/工具轮无正文：补占位
+        if (!cur.querySelector('.turn-answer')) {
           var p = document.createElement('div'); p.className = 'turn-answer no-answer';
           p.innerHTML = '<em>（本轮未输出独立结论，见上方思考过程）</em>';
           cur.appendChild(p);
@@ -509,9 +519,13 @@ function appendThinking(name, text, atype) {
   chat.scrollTop = chat.scrollHeight;
 }
 function endThinking() {
-  // 整轮结束：思考块内容渲染为 markdown，随后自动收起
-  if (curThinkingBody) curThinkingBody.innerHTML = mdToHtml(curThinkingBody.textContent);
-  var det = curThinking && curThinking.closest('details'); if (det) det.open = false;
+  // 整轮结束：所有思考块内容渲染为 markdown（含被工具块打断后新建的后续思考块），随后自动收起
+  if (cur) {
+    cur.querySelectorAll('.turn-block.thinking > .turn-block-body').forEach(function (b) {
+      b.innerHTML = mdToHtml(b.textContent);
+    });
+    cur.querySelectorAll('.turn-block.thinking').forEach(function (d) { d.open = false; });
+  }
   curThinking = null; curThinkingBody = null; curThinkingCnt = 0;
 }
 function appendToken(name, text, atype) {
@@ -519,6 +533,22 @@ function appendToken(name, text, atype) {
   if (!cur) openTurn(name, atype);
   if (!curAnswer) { curAnswer = document.createElement('div'); curAnswer.className = 'turn-answer'; cur.appendChild(curAnswer); }
   curAnswer.textContent += text; chat.scrollTop = chat.scrollHeight;
+}
+// 工具调用块：按时间线实时追加到当前气泡（排在思考/正文之后）；清空思考/正文游标，
+// 使工具之后的思考/正文新建独立块，保持「思考→正文→工具→思考→正文」的时间线顺序。
+function appendToolCall(name, input, atype) {
+  hideLoading();
+  if (!cur) openTurn(curTurnAgent || 'Agent', atype);
+  cur.appendChild(makeToolCallBlock({ name: name || '', input: input || {} }));
+  curThinking = null; curThinkingBody = null; curThinkingCnt = 0; curAnswer = null;
+  chat.scrollTop = chat.scrollHeight;
+}
+function appendToolResult(isError, content, atype) {
+  hideLoading();
+  if (!cur) openTurn(curTurnAgent || 'Agent', atype);
+  cur.appendChild(makeToolResultBlock({ is_error: !!isError, content: content }, null));
+  curThinking = null; curThinkingBody = null; curThinkingCnt = 0; curAnswer = null;
+  chat.scrollTop = chat.scrollHeight;
 }
 function addRow(cls, who, text, ts) {
   var row = document.createElement('div'); row.className = 'row' + (cls === 'human' ? ' human' : '');
@@ -1126,7 +1156,9 @@ function toolStatusCnFor(speaker, round) {
   if (!curToolLog || !curToolLog.length) return null;
   for (var i = 0; i < curToolLog.length; i++) {
     var t = curToolLog[i];
-    if (t.agent === speaker && t.round_i === round) {
+    // 优先用 msg_round（消息历史下标）精确匹配；旧日志无 msg_round 时回退 round_i === round-1
+    // （round_i 是辩论循环下标，比 h.round 历史下标小 1），避免标签永不显示
+    if (t.agent === speaker && (t.msg_round === round || (t.msg_round === undefined && t.round_i === round - 1))) {
       return TOOL_ACTION_CN[t.action] || t.action;
     }
   }
@@ -1137,12 +1169,34 @@ function renderHistoryEntry(h) {
   if (h.speaker === 'human') { addRow('human', h.role || '人工介入', h.content || '', h.ts); return; }
   var type = cfg_agents_by_name(h.speaker) || 'claude-code';
   var body = openTurn(h.speaker, type, h.ts);
-  // 时间线：思考 → 调用工具 → 工具结果 → 正文
+  // 时间线渲染：优先按后端产出的有序 blocks（思考/正文/工具调用/工具结果 按发生顺序），
+  // 旧消息无 blocks 时回退到固定顺序（思考 → 工具调用 → 工具结果 → 正文）。
+  var blocks = h.blocks;
+  if (blocks && blocks.length) {
+    var endStatus = toolStatusCnFor(h.speaker, h.round);
+    var firstResult = true;
+    blocks.forEach(function (b) {
+      if (b.type === 'thinking') {
+        body.appendChild(makeThinkingBlock(h.speaker, b.text || '', type, false));
+      } else if (b.type === 'text') {
+        var ans = document.createElement('div'); ans.className = 'turn-answer';
+        ans.innerHTML = mdToHtml(cleanSep(b.text || ''));
+        body.appendChild(ans);
+      } else if (b.type === 'tool_use') {
+        body.appendChild(makeToolCallBlock(b));
+      } else if (b.type === 'tool_result') {
+        // 终止工具：首个结果块带中文状态标注（被拒/提议终止/对方确认·终止）
+        body.appendChild(makeToolResultBlock(b, firstResult ? endStatus : null));
+        firstResult = false;
+      }
+    });
+    return;
+  }
   if (h.thinking) body.appendChild(makeThinkingBlock(h.speaker, h.thinking, type, false));
   var hasEndTool = (h.tool_calls || []).some(function (tc) { return (tc.name || '').endsWith('end_discussion'); });
-  var endStatus = hasEndTool ? toolStatusCnFor(h.speaker, h.round) : null;
+  var endStatusOld = hasEndTool ? toolStatusCnFor(h.speaker, h.round) : null;
   (h.tool_calls || []).forEach(function (tc) { body.appendChild(makeToolCallBlock(tc)); });
-  (h.tool_results || []).forEach(function (tr) { body.appendChild(makeToolResultBlock(tr, endStatus)); });
+  (h.tool_results || []).forEach(function (tr) { body.appendChild(makeToolResultBlock(tr, endStatusOld)); });
   var content = cleanSep(h.content || '');
   var noAnswer = (!content || (h.thinking && content === h.thinking.trim()));
   var ans = document.createElement('div'); ans.className = 'turn-answer' + (noAnswer ? ' no-answer' : '');

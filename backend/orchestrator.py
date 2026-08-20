@@ -316,6 +316,13 @@ class Session:
         thinking_parts = []
         errors: list[str] = []
         tool_uses: list[dict] = []
+        blocks: list[dict] = []  # 时间线有序块：thinking/text/tool_use/tool_result（连续同类型合并）
+
+        def _push_block(btype: str, **kw):
+            if blocks and blocks[-1]["type"] == btype and btype in ("thinking", "text"):
+                blocks[-1]["text"] += kw.get("text", "")
+            else:
+                blocks.append({"type": btype, **kw})
         tool_use_ts: str | None = None      # 首个 end_discussion tool_use 到达时刻（≈调用时刻）
         tool_use_errors: list[str] = []     # 工具执行失败文本（「有调用意图」≠「调用成功」）
         async for kind, text in runtime.run(
@@ -325,10 +332,12 @@ class Session:
         ):
             if kind == "text":
                 collected.append(text)
+                _push_block("text", text=text)
                 await self._emit(type="token", agent=agent.name, text=text)
             elif kind == "thinking":
                 # 思考块实时单独渲染，并随本轮答案一起落盘（刷新后仍可见）
                 thinking_parts.append(text)
+                _push_block("thinking", text=text)
                 await self._emit(type="thinking", agent=agent.name, text=text)
             elif kind == "error":
                 errors.append(text)
@@ -339,10 +348,23 @@ class Session:
                     tool_use_errors.append(text)
             elif kind == "tool_use":
                 tool_uses.append(text)
+                _push_block("tool_use", name=text.get("name", ""), input=text.get("input", {}) or {})
+                # 实时把工具调用块推给前端（按时间线排在思考/正文之后），无需等整轮跑完刷新
+                await self._emit(type="tool_use", agent=agent.name,
+                                 name=text.get("name", ""), input=text.get("input", {}) or {})
                 # 记录首个 end_discussion 调用的到达时刻（≈模型发出调用时刻）：
                 # 日志 ts 应为「调用时间」，而非「整轮跑完的写入时间」（后者可能晚数分钟）
                 if tool_use_ts is None and isinstance(text, dict) and _is_end_discussion(text.get("name")):
                     tool_use_ts = _now_str()
+            elif kind == "tool_result":
+                # 工具回执（成功/失败都走这里，executor 已展平为字符串）：按时间线拼块，
+                # 失败计入 tool_use_errors 以标 exec_ok；实时推给前端显示在对应工具调用之后。
+                is_err = bool(text.get("is_error"))
+                content = text.get("content", "") or ""
+                _push_block("tool_result", is_error=is_err, content=content)
+                if is_err:
+                    tool_use_errors.append(content)
+                await self._emit(type="tool_result", agent=agent.name, is_error=is_err, content=content)
             # done: 忽略
         full = "".join(collected).strip()
         # 剥离 gemma 等推理模型在 reasoning/answer 之间输出的 '---' 分隔符噪声
@@ -376,6 +398,9 @@ class Session:
         log_ts = tool_use_ts or _now_str()
         exec_ok = not tool_use_errors
         exec_err = "; ".join(dict.fromkeys(tool_use_errors))[:300]
+        # msg_round = 本轮落盘消息将取的历史下标（len(history) 在 append 前即为该值）；
+        # 前端状态标注用它匹配工具日志，避免 round_i（辩论循环下标）与 h.round（历史下标）差 1。
+        msg_round = len(self.history)
         for tu in tool_uses:
             if not isinstance(tu, dict) or not _is_end_discussion(tu.get("name")):
                 continue
@@ -385,6 +410,7 @@ class Session:
                     "action": "rejected", "agent": agent.name, "round_i": round_i,
                     "reason": reason, "msg": f"未达最小轮数（floor={floor}），终止被拒",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
+                    "msg_round": msg_round,
                 })
                 # 把「被拒」回传给模型：下一轮该 agent 的 prompt 注入明确原因，
                 # 避免其把通用工具回执当「已终止」而进入待命状态
@@ -397,12 +423,14 @@ class Session:
                     "action": "proposed", "agent": agent.name, "round_i": round_i,
                     "reason": reason, "msg": "已记录终止提议，等待对方确认",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
+                    "msg_round": msg_round,
                 })
             elif self.terminate_proposed_by == agent.name:
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "repeat", "agent": agent.name, "round_i": round_i,
                     "reason": reason, "msg": "本方重复提议，仍在等待对方确认",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
+                    "msg_round": msg_round,
                 })
             else:
                 self.terminate_confirm = True
@@ -411,6 +439,7 @@ class Session:
                     "action": "confirmed", "agent": agent.name, "round_i": round_i,
                     "reason": self.terminate_reason, "msg": "对方确认，讨论终止",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
+                    "msg_round": msg_round,
                 })
         if errors and not tool_intent:
             # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止
@@ -422,11 +451,8 @@ class Session:
         # 按 Option A：失败作为结构化 tool_results 子块随本轮落盘（同一气泡内渲染），
         # 不再拼进正文（正文保持干净结论）；会话仍继续（返回空 errors，_debate 据此不中止）。
         tool_calls = [tu for tu in tool_uses if isinstance(tu, dict)]
-        tool_results = []
-        if tool_intent and errors:
-            for e in errors:
-                if e not in full:
-                    tool_results.append({"is_error": True, "content": e})
+        # 工具结果（成功 + 失败）按时间线已从流式 blocks 收集；同时保留 legacy 字段兼容旧渲染
+        tool_results = [b for b in blocks if b["type"] == "tool_result"]
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。
         # 空轮判定：无正文、无思考、且无任何工具调用/工具结果 → 本地模型偶发空响应，
@@ -441,6 +467,7 @@ class Session:
             "thinking": thinking_text,
             "tool_calls": tool_calls,
             "tool_results": tool_results,
+            "blocks": blocks,
         }
         # 纯工具轮（仅工具调用/失败、无正文无思考）：意图与状态已入工具日志，但工具调用
         # 与失败结果须保留为可折叠子块可见，故仍落盘（不造假「未输出结论」占位）。
