@@ -635,6 +635,33 @@ def _normalize_turn(content: str, thinking: str, tool_calls=None, tool_results=N
     }
 
 
+def _normalize_claude_blocks(seq: list) -> list:
+    """把按原生 type 收集的有序块列表归一化为时间线 blocks。
+
+    输入块结构直接对齐 claude 原生 content（type ∈ thinking/text/tool_use/tool_result）：
+    - thinking: {type:"thinking", thinking}
+    - text:     {type:"text", text}
+    - tool_use: {type:"tool_use", name, input}
+    - tool_result: {type:"tool_result", is_error, content}
+    这里**不重新发明结构**，只做一项必要清洗：合并相邻同类型（thinking/text）块，
+    避免 claude 把一次推理拆成多个块时 UI 出现一堆零散折叠。tool_result 的 content
+    已在解析期展平为字符串（见 _extract_tool_results），此处不再处理。
+    """
+    out: list[dict] = []
+    for b in seq:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if out and out[-1].get("type") == bt and bt in ("thinking", "text"):
+            if bt == "thinking":
+                out[-1]["thinking"] = (out[-1].get("thinking") or "") + (b.get("thinking") or "")
+            else:
+                out[-1]["text"] = (out[-1].get("text") or "") + (b.get("text") or "")
+        else:
+            out.append(dict(b))
+    return out
+
+
 def _parse_claude_transcript(path: str) -> list:
     """解析 claude JSONL：返回有序 [{content, thinking, tool_calls, tool_results}]，每个 = 一个 agent 气泡。
 
@@ -696,6 +723,8 @@ def _parse_claude_transcript(path: str) -> list:
         # 气泡非空条件：正文 / 思考 / 工具调用 / 工具结果 任一存在（纯工具失败轮也有 tc+tr，须保留）
         if content or thinking or tc or tr:
             t = _normalize_turn(content, thinking, tc, tr)
+            # 时间线 blocks 直接复用 claude 原生 content 的顺序与 type（不另造顺序逻辑）
+            t["blocks"] = _normalize_claude_blocks(pending.get("seq") or [])
             if pending.get("ts"):
                 t["ts"] = pending["ts"]
             turns.append(t)
@@ -717,22 +746,25 @@ def _parse_claude_transcript(path: str) -> list:
                 trs = _extract_tool_results(msg)
                 if trs:
                     if pending is None:
-                        pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}
+                        pending = {"think": [], "ans": [], "tc": [], "tr": [], "seq": [], "ts": ev_ts}
                     pending["tr"].extend(trs)
+                    for tr in trs:
+                        # 工具回执按原生 content 顺序进入时间线（type 对齐 claude）
+                        pending["seq"].append({"type": "tool_result", "is_error": tr["is_error"], "content": tr["content"]})
                     # 工具回执为「用户方回传」，不新开气泡；但若同消息还带真实文本
                     # （下一轮 prompt），则收口当前气泡、开新单元
                     if _has_real_text(msg):
                         flush()
-                        pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}
+                        pending = {"think": [], "ans": [], "tc": [], "tr": [], "seq": [], "ts": ev_ts}
                     continue
                 # 纯真实文本 user 事件：收口当前气泡，开新单元
                 flush()
-                pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}
+                pending = {"think": [], "ans": [], "tc": [], "tr": [], "seq": [], "ts": ev_ts}
                 continue
             if t != "assistant":
                 continue
             if pending is None:
-                pending = {"think": [], "ans": [], "tc": [], "tr": [], "ts": ev_ts}  # 容错：无 user 前置
+                pending = {"think": [], "ans": [], "tc": [], "tr": [], "seq": [], "ts": ev_ts}  # 容错：无 user 前置
             msg = o.get("message", {})
             blocks = msg.get("content")
             if not isinstance(blocks, list):
@@ -744,18 +776,30 @@ def _parse_claude_transcript(path: str) -> list:
                     continue
                 bt = b.get("type")
                 if bt == "thinking":
-                    pending["think"].append(b.get("thinking") or b.get("text", ""))
+                    txt = b.get("thinking") or b.get("text", "")
+                    pending["think"].append(txt)
+                    # 按原生 type 进入时间线（thinking 块字段即原生 thinking）
+                    pending["seq"].append({"type": "thinking", "thinking": txt})
                 elif bt == "text":
                     t2 = b.get("text", "")
                     if THINK_SENT in t2 or ANSW_SENT in t2:
                         for kind, txt in _classify_text(None, t2):
-                            (pending["think"] if kind == "thinking" else pending["ans"]).append(txt)
+                            if kind == "thinking":
+                                pending["think"].append(txt)
+                                pending["seq"].append({"type": "thinking", "thinking": txt})
+                            else:
+                                pending["ans"].append(txt)
+                                pending["seq"].append({"type": "text", "text": txt})
                     else:
                         pending["ans"].append(t2)
+                        pending["seq"].append({"type": "text", "text": t2})
                 elif bt == "tool_use":
                     # 结构化工具调用（如 end_discussion）：收集进 tool_calls，UI 同气泡内渲染
                     # （之前漏解析，导致 Claude 发出的调用输出/reason 参数在界面消失）
-                    pending["tc"].append({"name": b.get("name", ""), "input": b.get("input", {}) or {}})
+                    tc = {"name": b.get("name", ""), "input": b.get("input", {}) or {}}
+                    pending["tc"].append(tc)
+                    # 按原生 type 进入时间线（name/input 即原生字段）
+                    pending["seq"].append({"type": "tool_use", "name": tc["name"], "input": tc["input"]})
     flush()  # 文件尾收口最后一条气泡
     return turns
 

@@ -506,6 +506,37 @@ class TestCliTranscriptParse(unittest.TestCase):
         self.assertEqual(len(turns[0]["tool_results"]), 1)
         self.assertFalse(turns[0]["tool_results"][0]["is_error"])
 
+    def test_parse_claude_transcript_blocks_preserve_native_order(self):
+        # 历史 reconcile 直接用 claude 原生 content 顺序产 blocks（type 对齐原生），
+        # 不得把思考/正文/工具拆成四类再重排。验证「思考→正文→工具调用→工具结果→续写正文」交错保留。
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "thinking", "thinking": "先想一下"},
+                            {"type": "text", "text": "调用前正文"},
+                            {"type": "tool_use", "name": "end_discussion", "input": {"reason": "R"}}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_x", "is_error": False,
+                 "content": [{"type": "text", "text": "已收到中止提议"}]}]}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "thinking", "thinking": "调用后继续想"},
+                            {"type": "text", "text": "调用后正文"}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 1, "工具循环合并为一个气泡")
+        blocks = turns[0]["blocks"]
+        self.assertTrue(blocks, "历史消息必须产出 blocks（对齐原生 content 顺序）")
+        seq = [(b["type"], b.get("thinking") or b.get("text") or b.get("name") or b.get("content"))
+               for b in blocks]
+        self.assertEqual(seq, [
+            ("thinking", "先想一下"),
+            ("text", "调用前正文"),
+            ("tool_use", "end_discussion"),
+            ("tool_result", "已收到中止提议"),
+            ("thinking", "调用后继续想"),
+            ("text", "调用后正文"),
+        ], "blocks 必须按 claude 原生 content 时间线顺序，不重排")
+
     def test_parse_codex_transcript_best_effort(self):
         # codex 格式多变：尽力解析出 assistant 文本，解析不出返回空（对账时跳过）
         p = self._write([

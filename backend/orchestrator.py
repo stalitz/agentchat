@@ -319,8 +319,13 @@ class Session:
         blocks: list[dict] = []  # 时间线有序块：thinking/text/tool_use/tool_result（连续同类型合并）
 
         def _push_block(btype: str, **kw):
+            # 合并逻辑与 executor._normalize_claude_blocks 一致：相邻同类型（thinking/text）合并。
+            # 字段名对齐 claude 原生（thinking 块用 thinking，text 块用 text），不另造字段。
             if blocks and blocks[-1]["type"] == btype and btype in ("thinking", "text"):
-                blocks[-1]["text"] += kw.get("text", "")
+                if btype == "thinking":
+                    blocks[-1]["thinking"] = (blocks[-1].get("thinking") or "") + kw.get("thinking", "")
+                else:
+                    blocks[-1]["text"] = (blocks[-1].get("text") or "") + kw.get("text", "")
             else:
                 blocks.append({"type": btype, **kw})
         tool_use_ts: str | None = None      # 首个 end_discussion tool_use 到达时刻（≈调用时刻）
@@ -337,7 +342,7 @@ class Session:
             elif kind == "thinking":
                 # 思考块实时单独渲染，并随本轮答案一起落盘（刷新后仍可见）
                 thinking_parts.append(text)
-                _push_block("thinking", text=text)
+                _push_block("thinking", thinking=text)
                 await self._emit(type="thinking", agent=agent.name, text=text)
             elif kind == "error":
                 errors.append(text)

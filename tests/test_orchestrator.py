@@ -433,7 +433,7 @@ class TestOrchestrator(unittest.TestCase):
         self.run_session(s, task="测试时间线")
         msgs = store.read_session(self.proj, self.sid)["messages"]
         a_msg = next(m for m in msgs if m.get("speaker") == "A")
-        seq = [(b["type"], b.get("text") or b.get("name") or b.get("content") or "") for b in a_msg.get("blocks", [])]
+        seq = [(b["type"], b.get("thinking") or b.get("text") or b.get("name") or b.get("content") or "") for b in a_msg.get("blocks", [])]
         self.assertEqual(seq, [
             ("thinking", "先想一下"),
             ("text", "调用前正文"),
