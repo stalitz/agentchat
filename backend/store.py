@@ -371,6 +371,12 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("tool_results") or []) != new_tr:
                     m["tool_results"] = new_tr
                     changed += 1
+                # 时间线 blocks 直接复用解析出的原生 content 顺序；旧消息无 blocks 时
+                # 通过刷新 reconcile 重建（re-read 原始 transcript），避免走前端固定顺序回退。
+                new_blocks = turn.get("blocks") or []
+                if (m.get("blocks") or []) != new_blocks:
+                    m["blocks"] = new_blocks
+                    changed += 1
         else:
             # 数量不一致：严禁顺序覆盖（会把 CLI 回合复制进本地无关空位造成重复——
             # s_2289e1cf 实测 cli 3 vs 本地 7，顺序覆盖后 T1/T2/T3 各出现 2 次）。
@@ -411,6 +417,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                     changed += 1
                 if (m.get("tool_results") or []) != new_tr:
                     m["tool_results"] = new_tr
+                    changed += 1
+                # 时间线 blocks 复用解析出的原生 content 顺序（内容匹配分支同理重建旧消息）
+                new_blocks = turn.get("blocks") or []
+                if (m.get("blocks") or []) != new_blocks:
+                    m["blocks"] = new_blocks
                     changed += 1
                 matched.add(hit)
             # CLI 回合少于本地：删除「未被匹配的 think-only 残留」（content 空、thinking 非空）——
