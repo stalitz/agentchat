@@ -550,6 +550,18 @@ function mdToHtml(src) {
       .replace(/\*([^*]+)\*/g, '<em>$1</em>')
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   }
+  // json 代码块 pretty-print 兜底（2026-08-20）：模型输出的 end_discussion 调用文本
+  // 可能被压缩成一行（弱模型不遵守 prompt 的多行缩进要求），合法 JSON 时重新排版缩进；
+  // 非合法 JSON 原样显示。仅影响展示，不影响编排层对 content 的解析。
+  function renderCodeBlock(lang, text) {
+    var code = escHtml(text);
+    if (lang === 'json') {
+      try {
+        code = escHtml(JSON.stringify(JSON.parse(text), null, 2));
+      } catch (e) { /* 非合法 JSON：原样 */ }
+    }
+    return '<pre><code' + (lang ? ' class="lang-' + escHtml(lang) + '"' : '') + '>' + code + '</code></pre>';
+  }
   function flushPara(buf) {
     if (!buf.length) return;
     out.push('<p>' + inline(buf.join(' ')) + '</p>');
@@ -564,7 +576,7 @@ function mdToHtml(src) {
         codeLang = ln.replace(/^```\s*/, '').trim();
         codeBuf = [];
       } else {
-        out.push('<pre><code' + (codeLang ? ' class="lang-' + escHtml(codeLang) + '"' : '') + '>' + escHtml(codeBuf.join('\n')) + '</code></pre>');
+        out.push(renderCodeBlock(codeLang, codeBuf.join('\n')));
         inCode = false; codeLang = ''; codeBuf = [];
       }
       continue;
@@ -581,7 +593,7 @@ function mdToHtml(src) {
     para.push(ln.trim());
   }
   if (inCode) {
-    out.push('<pre><code' + (codeLang ? ' class="lang-' + escHtml(codeLang) + '"' : '') + '>' + escHtml(codeBuf.join('\n')) + '</code></pre>');
+    out.push(renderCodeBlock(codeLang, codeBuf.join('\n')));
   }
   flushPara(para);
   return renderLatex(out.join(''));
