@@ -51,18 +51,24 @@ class TestReadFrame(unittest.TestCase):
         self.assertNotIn("Content-Length", data, "不应再输出 Content-Length 帧头")
         self.assertTrue(data.endswith("\n"))
 
-    def test_handle_call_rejection_reason_unambiguous(self):
-        # 被拒回执必须点名「轮次不足」是首要原因、并明确「与对方确认无关」——
-        # gemma 曾把未生效归因于「对方未确认」，实际是未达最小轮数被拒（1+1=2 会话实测）
+    def test_handle_call_receipt_neutral_not_presuming_verdict(self):
+        # 回执必须**中性**、不预设判定结果：MCP 是无状态确认通道，不知道编排层会判
+        # rejected/proposed/confirmed；旧文案断言「终止尚未生效/轮数不足」会在 confirmed
+        # （成功终止）场景误导模型——gemma 把自己成功的确认读成「被拒」（「资本主义会
+        # 灭亡吗」实测：confirmed 已收敛，gemma 却回「因轮次限制拒绝了我们的终止请求」）。
         resp = mcp._handle_call({
             "name": "end_discussion",
             "arguments": {"reason": "双方已达成一致"},
         })
         text = resp["content"][0]["text"]
-        self.assertIn("终止尚未生效", text)
-        self.assertIn("轮数不足", text, "必须点名被拒真实原因（未达最小轮数）")
-        self.assertIn("与对方是否确认无关", text, "必须排除「对方未确认」的误归因")
-        self.assertIn("简体中文继续参与讨论", text)
+        self.assertIn("工具回执", text)
+        self.assertIn("调用已收到", text)
+        self.assertIn("终止是否生效由系统判定", text, "判定权归编排层，回执不得越权断言")
+        self.assertIn("简体中文继续参与讨论", text, "强指令仍须保留（防英文待命）")
+        # 不得预设具体判定结果（无论 rejected / confirmed 都用同一份回执）
+        self.assertNotIn("终止尚未生效", text, "confirmed 场景会误导（成功确认被读成被拒）")
+        self.assertNotIn("轮数不足", text, "不得断言具体被拒原因（由编排层下一轮注入点名）")
+        self.assertNotIn("对方是否确认无关", text)
         self.assertFalse(resp.get("isError"), "回执本身不算错误")
         self.assertNotIn("The conversation has concluded", text, "不得出现英文待命语")
 
