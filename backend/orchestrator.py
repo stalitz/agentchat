@@ -125,6 +125,9 @@ class Session:
         self.terminate_proposed_by = None
         self.terminate_reason = ""
         self.terminate_confirm = False
+        # 最近一次「终止被拒」的回执待注入：被拒只记日志不够，必须把原因回传给模型，
+        # 否则弱模型（gemma）把通用「请继续参与讨论」回执误解为「已终止·待命」。
+        self._reject_inject = None
 
     async def _emit(self, **kw):
         # 所有事件带 sid（会话 id）：多会话并发时前端据此区分事件归属，
@@ -190,6 +193,17 @@ class Session:
         # 任务 / 人工介入（本轮新议题通常经此传入）
         if inject:
             parts.append(f"人工介入 / 任务：\n{inject}")
+        # 终止被拒回执：上一轮本方发起 end_discussion 因未达最小轮数被拒，明确告知模型继续，
+        # 不要进入待命/等待状态（弱模型易把通用工具回执误解为「已终止」）
+        if self._reject_inject and self._reject_inject[0] == agent.name:
+            rj_round = self._reject_inject[1]
+            parts.append(
+                f"【终止被拒·请继续】你上一轮发起的 end_discussion 因未达最小讨论轮数"
+                f"（当时第 {rj_round // len(self.agents) + 1} 轮）被拒绝，本次终止未生效。"
+                "请继续正常参与讨论、推进观点或反驳，不要进入待命/等待状态；"
+                "待双方充分交换意见后再考虑终止。"
+            )
+            self._reject_inject = None
         parts.append(
             "请基于以上继续推进。\n"
             "【共识终止：先给出总结发言，再发起 end_discussion 调用】\n"
@@ -213,6 +227,8 @@ class Session:
             "  3) 本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。\n"
             "调用后还需对方 agent 也发起 end_discussion 确认才会真正终止——若本轮只是你提议，对方可能继续讨论，"
             "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
+            "收到工具回执后无论结果如何（已收到/被拒/待确认）都**不要进入待命或等待状态**，"
+            "要继续参与讨论，直到对方确认终止或你仍有话要说。"
         )
         # 达到最少轮数（双方各发言 2 次）后的每轮硬提醒：推着模型主动决策收尾，而非等它想起。
         # 本地弱工具调用模型（gemma/r1）在长辩论中几乎不主动调用工具（实测跑满轮次），
@@ -370,6 +386,9 @@ class Session:
                     "reason": reason, "msg": f"未达最小轮数（floor={floor}），终止被拒",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                 })
+                # 把「被拒」回传给模型：下一轮该 agent 的 prompt 注入明确原因，
+                # 避免其把通用工具回执当「已终止」而进入待命状态
+                self._reject_inject = (agent.name, round_i)
                 continue
             if self.terminate_proposed_by is None:
                 self.terminate_proposed_by = agent.name

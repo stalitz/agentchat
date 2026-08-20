@@ -11,20 +11,28 @@ class TestAnthropicToOpenAI(unittest.TestCase):
             "model": "gemma", "max_tokens": 100,
             "system": "你是架构师", "messages": [],
         })
-        self.assertEqual(oa["messages"][0], {"role": "system", "content": "你是架构师"})
+        # 网关在 system 层注入简体中文强制指令（压住 gemma 英文待命反射），原 system 保留
+        self.assertEqual(oa["messages"][0]["role"], "system")
+        self.assertIn("你是架构师", oa["messages"][0]["content"])
+        self.assertIn("【语言强制指令】", oa["messages"][0]["content"])
 
     def test_system_array_blocks(self):
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "system": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}],
             "messages": [],
         })
-        self.assertEqual(oa["messages"][0]["content"], "AB")
+        self.assertEqual(oa["messages"][0]["role"], "system")
+        self.assertIn("AB", oa["messages"][0]["content"])
+        self.assertIn("【语言强制指令】", oa["messages"][0]["content"])
 
     def test_user_text_message(self):
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [{"role": "user", "content": "hi"}],
         })
-        self.assertEqual(oa["messages"][0], {"role": "user", "content": "hi"})
+        # 无 system 时网关注入中文强制指令作为首条 system 消息，原 user 后移
+        self.assertEqual(oa["messages"][0]["role"], "system")
+        self.assertIn("【语言强制指令】", oa["messages"][0]["content"])
+        self.assertEqual(oa["messages"][1], {"role": "user", "content": "hi"})
 
     def test_tool_use_and_tool_result(self):
         oa = gateway.anthropic_to_openai({
@@ -40,15 +48,18 @@ class TestAnthropicToOpenAI(unittest.TestCase):
                 ]},
             ],
         })
+        # 第 0 条是注入的中文强制 system；用户/assistant/tool 整体后移一位
+        self.assertEqual(oa["messages"][0]["role"], "system")
+        self.assertIn("【语言强制指令】", oa["messages"][0]["content"])
         # 文本消息
-        self.assertEqual(oa["messages"][0], {"role": "user", "content": "查一下"})
+        self.assertEqual(oa["messages"][1], {"role": "user", "content": "查一下"})
         # assistant：文本 + tool_calls
-        asst = oa["messages"][1]
+        asst = oa["messages"][2]
         self.assertEqual(asst["content"], "好的")
         self.assertEqual(asst["tool_calls"][0]["function"]["name"], "read")
         self.assertEqual(json.loads(asst["tool_calls"][0]["function"]["arguments"]), {"path": "/x"})
         # tool_result -> OpenAI tool role 消息
-        self.assertEqual(oa["messages"][2], {"role": "tool", "tool_call_id": "t1", "content": "file content"})
+        self.assertEqual(oa["messages"][3], {"role": "tool", "tool_call_id": "t1", "content": "file content"})
 
     def test_tools_not_translated(self):
         # 2026-08-19：只转发「含 end_discussion 的 MCP 工具」给模型，不转发 claude 内置工具；

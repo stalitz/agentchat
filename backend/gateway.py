@@ -113,6 +113,26 @@ def anthropic_to_openai(body: dict) -> dict:
         else:
             oa_messages.append({"role": role, "content": "".join(texts)})
 
+    # 语言强制：本地模型（gemma 等）英文原生，调用 end_discussion 后极易回退到英文「待命」
+    # 反射，忽略我们中文「请继续」指令。在 system 层注入简体中文强制指令——整场最权威、
+    # 持续生效，能压住 claude-code 自带英文 system prompt 带来的语码回退（meta/待命类回复
+    # 默认跟着 system 语言走）。本网关只服务本地模型，不影响真实 claude。
+    LANG_MANDATE = (
+        "【语言强制指令】你是一个用简体中文参与辩论的本地模型。"
+        "无论任何情况、任何回复（包括总结发言、对工具回执的回应、待命/说明性文字），"
+        "都必须且只能用简体中文输出，绝对禁止输出英文或其他语言。"
+        "收到 end_discussion 工具回执后，若回执要求继续，你必须用中文继续参与讨论、"
+        "推进观点或反驳，不要进入待命/结束状态，也不要输出任何英文。"
+    )
+    _injected = False
+    for _m in oa_messages:
+        if _m.get("role") == "system":
+            _m["content"] = LANG_MANDATE + "\n\n" + (_m.get("content") or "")
+            _injected = True
+            break
+    if not _injected:
+        oa_messages.insert(0, {"role": "system", "content": LANG_MANDATE})
+
     oa: dict[str, Any] = {
         "model": body.get("model"),
         "messages": oa_messages,

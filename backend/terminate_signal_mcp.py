@@ -44,11 +44,15 @@ def _handle_call(params: dict) -> dict:
             "isError": True,
         }
     reason = str(args.get("reason", "") or "")
-    # 无状态确认：真实判定（轮次 gate / 两阶段确认）由编排层执行并落工具日志
+    # 无状态确认：真实判定（轮次 gate / 两阶段确认）由编排层执行并落工具日志。
+    # 回执刻意用强指令口吻：本地弱模型（gemma）易把「调用 end_discussion」误解为「对话结束」，
+    # 需用明确中文命令它「继续、勿待命、勿输出英文」，否则会回退英文 standby 反射。
     return {
         "content": [{"type": "text", "text": (
-            f"已收到你的中止提议（理由：{reason}）。终止是否生效由编排层判定"
-            "（需满足最小轮数且对方也调用 end_discussion 确认）；请继续正常参与讨论。"
+            f"【重要·讨论尚未结束】你的 end_discussion 调用已收到（理由：{reason}）。"
+            "但终止尚未生效——必须同时满足「已达最小讨论轮数」且「对方也调用 end_discussion 确认」"
+            "才会真正终止，目前条件未满足。请用简体中文继续参与讨论、推进你的观点或反驳对方，"
+            "不要进入待命/结束状态，也不要输出英文。"
         )}],
         "isError": False,
     }

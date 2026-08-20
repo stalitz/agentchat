@@ -504,6 +504,14 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
                 continue
             if item.get("type") == "tool_result" and item.get("is_error"):
                 err = item.get("content", "") or ""
+                # 失败回执 content 同样可能是 [{type:text,text}] 列表，展平为字符串
+                if isinstance(err, list):
+                    err = "".join(
+                        b.get("text", "") for b in err
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                elif not isinstance(err, str):
+                    err = str(err)
                 if isinstance(err, str):
                     err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
                 if err:
@@ -650,6 +658,15 @@ def _parse_claude_transcript(path: str) -> list:
                 continue
             if item.get("type") == "tool_result":
                 err = item.get("content", "") or ""
+                # claude 把 tool_result 的 content 包成 [{type:text, text:...}] 列表，
+                # 必须展平为字符串，否则原样落盘后前端 textContent 渲染成 [object Object]
+                if isinstance(err, list):
+                    err = "".join(
+                        b.get("text", "") for b in err
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                elif not isinstance(err, str):
+                    err = str(err)
                 if isinstance(err, str):
                     err = err.replace("<tool_use_error>", "").replace("</tool_use_error>", "").strip()
                 out.append({"is_error": bool(item.get("is_error")), "content": err})

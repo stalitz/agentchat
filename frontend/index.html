@@ -320,6 +320,7 @@ var agentNameColor = {};
 var cur = null;
 var curSid = null;          // 当前选中的会话 id
 var curPid = null;          // 当前选中的项目 id
+var curToolLog = [];        // 当前会话的 end_discussion 工具日志（用于气泡内状态标注）
 var curTid = null;          // 当前会话所用 Team id（composer 下拉 / 单 agent 判定）
 var curProjSessions = [];   // 当前项目的会话列表
 var curMsgCount = 0;        // 当前会话已有消息条数（决定主按钮文案）
@@ -1023,32 +1024,39 @@ function openSession(sid) {
   var sel = document.getElementById('selTeam'); if (sel && curTid) sel.value = curTid;
   updateRoundControl();
   updateCtxHead(s);
-  fetch('/api/session/' + curPid + '/' + sid, { cache: 'no-store' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      chat.innerHTML = ''; cur = null; curThinking = null;
-      var msgs = d.messages || [];
-      // 系统消息（终止原因 / 会话结束）不计入「已有 N 条」计数
-      curMsgCount = msgs.filter(function (m) { return m.speaker !== 'system'; }).length;
-      if (!msgs.length) {
-        addRow('sys', '系统', d.exists === false ? '（会话不存在）'
-          : (isChatMode() ? '（新会话：在下方输入消息，Enter 发送）' : '（该会话暂无记录，输入任务点「开始讨论」）'));
-        refreshSendBtn();
-        return;
-      }
-      addRow('sys', '系统', '—— 已恢复会话记录（' + msgs.length + ' 条） ——');
-      msgs.forEach(renderHistoryEntry);
-      if (d.agent_sessions && Object.keys(d.agent_sessions).length) {
-        var asp = Object.keys(d.agent_sessions).map(function (k) {
-          var v = d.agent_sessions[k] || '';
-          return k + ' → ' + (v ? v.slice(0, 8) + '…' : '(未开启)');
-        });
-        addRow('sys', 'agent 持久会话', asp.join('；'));
-      }
-      chat.scrollTop = chat.scrollHeight;
+  // 并行取「会话消息」与「工具调用日志」：工具日志用于把 end_discussion 的工具结果
+  // 翻译成可读状态（被拒/提议/确认），避免气泡里只显示原始回执文本
+  Promise.all([
+    fetch('/api/session/' + curPid + '/' + sid, { cache: 'no-store' }).then(function (r) { return r.json(); }),
+    fetch('/api/session/' + curPid + '/' + sid + '/tools', { cache: 'no-store' })
+      .then(function (r) { return r.json(); }).catch(function () { return { tools: [] }; }),
+  ]).then(function (res) {
+    var d = res[0];
+    var td = res[1];
+    curToolLog = (td && td.tools) || [];
+    chat.innerHTML = ''; cur = null; curThinking = null;
+    var msgs = d.messages || [];
+    // 系统消息（终止原因 / 会话结束）不计入「已有 N 条」计数
+    curMsgCount = msgs.filter(function (m) { return m.speaker !== 'system'; }).length;
+    if (!msgs.length) {
+      addRow('sys', '系统', d.exists === false ? '（会话不存在）'
+        : (isChatMode() ? '（新会话：在下方输入消息，Enter 发送）' : '（该会话暂无记录，输入任务点「开始讨论」）'));
       refreshSendBtn();
-    })
-    .catch(function () {});
+      return;
+    }
+    addRow('sys', '系统', '—— 已恢复会话记录（' + msgs.length + ' 条） ——');
+    msgs.forEach(renderHistoryEntry);
+    if (d.agent_sessions && Object.keys(d.agent_sessions).length) {
+      var asp = Object.keys(d.agent_sessions).map(function (k) {
+        var v = d.agent_sessions[k] || '';
+        return k + ' → ' + (v ? v.slice(0, 8) + '…' : '(未开启)');
+      });
+      addRow('sys', 'agent 持久会话', asp.join('；'));
+    }
+    chat.scrollTop = chat.scrollHeight;
+    refreshSendBtn();
+  })
+  .catch(function () {});
 }
 
 function updateCtxHead(s) {
@@ -1089,14 +1097,40 @@ function makeToolCallBlock(tc) {
   det.appendChild(sum); det.appendChild(body);
   return det;
 }
-function makeToolResultBlock(tr) {
+function makeToolResultBlock(tr, statusLabel) {
   var det = document.createElement('details'); det.className = 'turn-block tool-result' + (tr.is_error ? ' err' : ''); det.open = true;
   var sum = document.createElement('summary');
   sum.innerHTML = '↩️ 工具结果' + (tr.is_error ? ' <span class="err-tag">失败</span>' : '');
   var body = document.createElement('div'); body.className = 'turn-block-body';
-  body.textContent = tr.content || (tr.is_error ? '(空)' : '(成功)');
+  // 状态标注（终止工具按工具日志 action 翻译成中文）：让「[object Object]」变成可读结论
+  if (statusLabel) {
+    var badge = document.createElement('div');
+    badge.style.cssText = 'font-weight:600;margin-bottom:6px;';
+    badge.textContent = '状态：' + statusLabel;
+    body.appendChild(badge);
+  }
+  var content = tr.content;
+  if (content === null || content === undefined) {
+    body.textContent += tr.is_error ? '(空)' : '(成功)';
+  } else if (typeof content === 'string') {
+    body.textContent += content;
+  } else {
+    // content 可能是对象/列表（未展平时）：JSON.stringify 兜底，绝不显示 [object Object]
+    body.textContent += JSON.stringify(content, null, 2);
+  }
   det.appendChild(sum); det.appendChild(body);
   return det;
+}
+// 终止工具结果按工具日志 action 翻译成中文状态（供气泡内工具结果块展示）
+function toolStatusCnFor(speaker, round) {
+  if (!curToolLog || !curToolLog.length) return null;
+  for (var i = 0; i < curToolLog.length; i++) {
+    var t = curToolLog[i];
+    if (t.agent === speaker && t.round_i === round) {
+      return TOOL_ACTION_CN[t.action] || t.action;
+    }
+  }
+  return null;
 }
 function renderHistoryEntry(h) {
   if (h.speaker === 'system') { addRow('sys', h.role || '系统', h.content || '', h.ts); return; }
@@ -1105,8 +1139,10 @@ function renderHistoryEntry(h) {
   var body = openTurn(h.speaker, type, h.ts);
   // 时间线：思考 → 调用工具 → 工具结果 → 正文
   if (h.thinking) body.appendChild(makeThinkingBlock(h.speaker, h.thinking, type, false));
+  var hasEndTool = (h.tool_calls || []).some(function (tc) { return (tc.name || '').endsWith('end_discussion'); });
+  var endStatus = hasEndTool ? toolStatusCnFor(h.speaker, h.round) : null;
   (h.tool_calls || []).forEach(function (tc) { body.appendChild(makeToolCallBlock(tc)); });
-  (h.tool_results || []).forEach(function (tr) { body.appendChild(makeToolResultBlock(tr)); });
+  (h.tool_results || []).forEach(function (tr) { body.appendChild(makeToolResultBlock(tr, endStatus)); });
   var content = cleanSep(h.content || '');
   var noAnswer = (!content || (h.thinking && content === h.thinking.trim()));
   var ans = document.createElement('div'); ans.className = 'turn-answer' + (noAnswer ? ' no-answer' : '');

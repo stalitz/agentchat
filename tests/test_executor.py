@@ -442,6 +442,25 @@ class TestCliTranscriptParse(unittest.TestCase):
         self.assertIn("No such tool available", turns[0]["tool_results"][0]["content"])
         self.assertNotIn("No such tool available", turns[0]["content"], "报错不应进正文")
 
+    def test_parse_claude_transcript_tool_result_list_content_flattened(self):
+        # claude 把成功 tool_result 的 content 包成 [{type:text, text}] 列表，
+        # 必须展平为字符串，否则原样落盘后前端 textContent 渲染成 [object Object]。
+        p = self._write([
+            json.dumps({"type": "user", "message": {"role": "user", "content": "问题"}}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant",
+                "content": [{"type": "tool_use", "name": "end_discussion", "input": {"reason": "测试"}}]}}),
+            json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_x", "is_error": False,
+                 "content": [{"type": "text", "text": "已收到你的中止提议（理由：测试）。终止是否生效由编排层判定；请继续正常参与讨论。"}]}]}}),
+        ])
+        turns = executor._parse_claude_transcript(p)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(len(turns[0]["tool_results"]), 1)
+        tr = turns[0]["tool_results"][0]
+        self.assertFalse(tr["is_error"])
+        self.assertIsInstance(tr["content"], str, "列表 content 必须展平为字符串，否则前端显示 [object Object]")
+        self.assertIn("已收到你的中止提议", tr["content"])
+
     def test_parse_claude_transcript_merges_tool_loop_one_bubble(self):
         # Option A：一个 agent 回合内「思考 → 工具调用 → 工具失败 → 续写结论」合并为一个气泡，
         # tool_result(user) 之后 assistant 的续写仍属同一回合，不新开气泡。
