@@ -206,6 +206,23 @@
   .set-cancel:hover { background:#f1f3f7; }
   .set-save { padding:8px 20px; border-radius:9px; font-size:13px; font-weight:600; }
   @media (max-width:560px) { .set-grid { grid-template-columns:1fr; } }
+
+  /* ---- 统一表单弹窗现代样式（项目 / Team / Agent / 新建会话 / 目录选择 / 日志）---- */
+  .form-card { width:min(520px, 92vw); padding:0; border-radius:16px; box-shadow:0 14px 44px rgba(20,30,60,.20); overflow:hidden; max-height:88vh; overflow:auto; }
+  .form-card > h3 { margin:0 0 10px; padding:18px 22px 14px; border-bottom:1px solid var(--line); font-size:17px; font-weight:700; color:var(--txt); }
+  .form-card > label { display:block; margin:12px 22px 0; font-size:13px; font-weight:600; color:var(--txt); }
+  .form-card input, .form-card select, .form-card textarea {
+    width:100%; box-sizing:border-box; font-size:14px; padding:9px 11px; margin-top:6px;
+    border:1px solid var(--line); border-radius:9px; background:#fff; color:var(--txt);
+    transition:border-color .12s, box-shadow .12s; }
+  .form-card input:focus, .form-card select:focus, .form-card textarea:focus {
+    outline:none; border-color:var(--claude); box-shadow:0 0 0 3px rgba(47,109,246,.15); }
+  .form-card > .hint { margin:6px 22px 0; }
+  .form-card > .model-box { margin:12px 22px 0; }
+  .form-card > div { margin:12px 22px 0; }
+  .form-card > div:last-child { display:flex; justify-content:flex-end; gap:8px; margin:18px 22px 20px; }
+  .form-card button { font-size:13px; padding:7px 16px; border-radius:9px; }
+  .form-card button.primary { font-weight:600; }
 </style>
 </head>
 <body>
@@ -1237,6 +1254,7 @@ function openNewSession() {
   if (!teams.length) { alert('该项目暂无 Team，请先在左侧 + Team 并挂到项目'); return; }
   var tOpts = teams.map(function (t) { return '<option value="' + t.id + '">' + esc(t.name) + '</option>'; }).join('');
   var c = document.getElementById('newCard');
+  c.className = 'card form-card';
   c.innerHTML = '<h3>新建会话</h3>' +
     '<label>项目（当前）<br><input value="' + esc(p.name) + '" disabled style="width:100%"></label>' +
     '<label style="margin-top:6px;display:block;">Team<br><select id="nTeam" style="width:100%">' + tOpts + '</select></label>' +
@@ -1271,6 +1289,7 @@ function delSession(sid) {
 function openPromptLog() {
   if (!curSid) { alert('请先选择一个会话'); return; }
   var c = document.getElementById('promptCard');
+  c.className = 'card form-card';
   c.innerHTML = '<h3>提示词日志</h3><div class="ctx-meta">加载中…</div>';
   document.getElementById('promptModal').classList.add('show');
   fetch('/api/session/' + curPid + '/' + curSid + '/prompts', { cache: 'no-store' })
@@ -1301,6 +1320,7 @@ var TOOL_ACTION_CN = { rejected: '被拒（未达最小轮数）', proposed: '�
 function openToolLog() {
   if (!curSid) { alert('请先选择一个会话'); return; }
   var c = document.getElementById('promptCard');
+  c.className = 'card form-card';
   c.innerHTML = '<h3>工具调用日志</h3><div class="ctx-meta">加载中…</div>';
   document.getElementById('promptModal').classList.add('show');
   fetch('/api/session/' + curPid + '/' + curSid + '/tools', { cache: 'no-store' })
@@ -1364,6 +1384,7 @@ function openAgentForm(a) {
   var src = modelSrcOf(a);
   var showDefault = (isCC && src === 'default');
   var c = document.getElementById('modalCard');
+  c.className = 'card form-card';
   var html = '<h3>' + (a ? '编辑 Agent' : '新建 Agent') + '</h3>' +
     f('name', '名称', a ? a.name : '') +
     f('role', 'System Prompt / 系统提示', a ? a.role : '') +
@@ -1419,6 +1440,7 @@ function openTeamForm(t) {
     return '<option value="' + cfg.agents[k].id + '"' + sel0 + '>' + esc(cfg.agents[k].name) + '</option>';
   }).join('');
   var c = document.getElementById('modalCard');
+  c.className = 'card form-card';
   c.innerHTML = '<h3>' + (t ? '编辑 Team' : '新建 Team') + '</h3>' +
     f('name', '名称', t ? t.name : '') +
     '<div>成员：<select id="mAgents" multiple size="5">' + ags + '</select></div>' +
@@ -1432,6 +1454,7 @@ function openProjectForm(p) {
     return '<option value="' + tm.id + '"' + sel0 + '>' + esc(tm.name) + '</option>';
   }).join('');
   var c = document.getElementById('modalCard');
+  c.className = 'card form-card';
   c.innerHTML = '<h3>' + (p ? '编辑 项目' : '新建 项目') + '</h3>' +
     f('name', '名称', p ? p.name : '') +
     '<label>项目目录（点「选择文件夹」即可）<br>' +
@@ -1477,7 +1500,7 @@ function sel(id, label, opts, sel0) {
 function closeModal() {
   document.getElementById('modal').classList.remove('show');
   var c = document.getElementById('modalCard');
-  if (c) c.style.cssText = '';   // 清掉设置面板等临时内联样式，避免影响后续弹窗
+  if (c) { c.style.cssText = ''; c.className = 'card'; }   // 清掉设置面板内联样式与表单类，避免影响后续弹窗
 }
 
 // ---- 全局设置（timeout / 默认轮次等 App 级配置）----
@@ -1516,7 +1539,8 @@ function openSettings() {
     '</div>' +
     '<div class="set-section">内置网关</div>' +
     '<div class="set-grid">' +
-      field('gOllama', 'Ollama 地址', ol, '仅被读取，不改 Ollama 自身配置（默认 11434）', 'text', true) +
+      field('gOllama', 'Ollama 地址', ol, '仅被读取，不改 Ollama 自身配置（默认 11434）') +
+      field('gCtx', '上下文长度 (num_ctx)', s.ollama_num_ctx != null ? s.ollama_num_ctx : 16384, '发给 Ollama 的 KV cache 上限（token）；仅内置网关生效，不动 Ollama 全局', 'number') +
     '</div>' +
     '<div class="set-foot">' +
       '<button class="set-cancel" onclick="closeModal()">取消</button>' +
@@ -1538,6 +1562,7 @@ function submitSettings() {
     default_model: v('gDefaultModel').trim(),
     default_model_codex: v('gDefaultModelCodex').trim(),
     ollama_base_url: v('gOllama').trim() || 'http://localhost:11434',
+    ollama_num_ctx: parseInt(v('gCtx'), 10) || 16384,
   };
   return fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
@@ -1579,6 +1604,7 @@ function closeFs() { document.getElementById('fsModal').classList.remove('show')
 function q(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 function openFsPicker(initial) { fsRender(initial && initial.trim() ? initial.trim() : ''); document.getElementById('fsModal').classList.add('show'); }
 function fsRender(path) {
+  document.getElementById('fsCard').className = 'card form-card';
   var url = '/api/fs' + (path ? ('?path=' + encodeURIComponent(path)) : '');
   fetch(url, { cache: 'no-store' })
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })

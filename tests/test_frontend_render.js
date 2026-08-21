@@ -212,6 +212,7 @@ setTimeout(async () => {
   check(!!doc.getElementById('gMaxRounds'), '全局设置弹窗应提供「辩论模式默认轮次上限」输入(gMaxRounds)');
   check(doc.getElementById('gMaxRounds') && doc.getElementById('gMaxRounds').value === '20',
     'gMaxRounds 应预填全局默认轮次(20)，实际 ' + (doc.getElementById('gMaxRounds') && doc.getElementById('gMaxRounds').value));
+  check(!!doc.getElementById('gCtx'), '全局设置应提供 Ollama 上下文长度输入(gCtx)，可从界面控制 num_ctx');
   const mrComposer = doc.getElementById('maxRounds');
   check(mrComposer && mrComposer.value === '20' && !mrComposer.disabled,
     '辩论模式下 composer 的「最大轮次」默认值应等于全局默认(20)，实际 ' + (mrComposer && mrComposer.value));
