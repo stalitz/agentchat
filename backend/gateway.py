@@ -541,6 +541,11 @@ async def handle_messages(req: Request, settings: dict):
         "options": {"num_ctx": num_ctx},
         "stream": want_stream,
     }
+    # 思考开关：ollama_think=False 时请求带 think:false（gemma 等推理模型支持的参数，
+    # 实测生效：不再产出 thinking 块，输出从单轮数万 token 降到个位数）。默认 True 不传，
+    # 保持对不支持 think 参数的模型（deepseek 等）无影响。
+    if not bool(settings.get("ollama_think", True)):
+        ollama_body["think"] = False
     if oa.get("tools"):
         # 真工具调用路径：把 anthropic_to_openai 过滤后的 end_discussion 工具定义透传给
         # Ollama 原生端点（其 tools 格式与 OpenAI 一致：{type:function, function:{name,

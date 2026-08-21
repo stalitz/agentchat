@@ -109,6 +109,15 @@ class AgentRuntime:
         不修改 Claude Code 任何配置文件——仅作用于本次子进程 env。
         """
         env = dict(os.environ)
+        # 单次响应 output token 上限（claude-code 默认 32000 偏小；gemma 等推理模型思考块
+        # 疯狂吃 output token，象棋实测单轮 4 块 2.2 万字符直接爆表）。从全局配置读，可随时调。
+        try:
+            from .store import get_settings
+            _mo = get_settings().get("claude_max_output_tokens")
+            if _mo:
+                env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(_mo)
+        except Exception:
+            pass
         if self.agent.base_url:
             # claude 2.x 会把 ~/.claude/settings.json 的 env 合并进运行时并**覆盖**同名进程环境变量，
             # 仅靠子进程 env 注入 ANTHROPIC_BASE_URL 会被全局配置（如指向 deepseek）盖掉、per-agent 网关失效。

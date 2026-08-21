@@ -97,6 +97,9 @@ def get_settings() -> dict:
         "default_model_codex": pinned_codex if pinned_codex else detect_codex_default_model(),
         "ollama_base_url": s.get("ollama_base_url", "http://localhost:11434"),
         "ollama_num_ctx": int(s.get("ollama_num_ctx", 16384)),
+        "ollama_think": bool(s.get("ollama_think", True)),
+        "claude_max_output_tokens": int(s.get("claude_max_output_tokens", 64000)),
+        "prompt_templates": s.get("prompt_templates") or {},
     }
 
 

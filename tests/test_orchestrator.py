@@ -824,5 +824,22 @@ class TestOrchestrator(unittest.TestCase):
         a_second = next(p for p in prompts if p.get("agent") == "A" and p.get("round") == 2)
         self.assertNotIn("任务背景", a_second["prompt"], "A 已就本议题发言过，不应再带任务背景")
 
+    def test_prompt_template_override_from_settings(self):
+        # 通用辩论提示词可经配置覆盖（settings.prompt_templates.debate.<slot>）：
+        # 覆盖后新文本生效、内置默认措辞消失；<name> 占位符正确替换
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid)
+        s._pt["consensus"] = "【自定义共识规则】<agent> 必须确认后才可结束。"
+        p = s._build_prompt(a1, "任务", round_i=0)
+        self.assertIn("【自定义共识规则】A 必须确认后才可结束。", p)
+        self.assertNotIn("先输出你的总结性发言", p, "内置默认被覆盖后不应出现")
+        # proposal_peer 占位符替换（含投票进度）
+        s._pt["proposal_peer"] = "<proposer> 提议了，理由：<reason>，票数 <votes>/<n_agents> 需 <threshold>，还需 <needed>"
+        s.terminate_proposed_by = "B"
+        s.terminate_reason = "结论X"
+        p2 = s._build_prompt(a1, "任务", round_i=4)  # floor=3，round_i>=3 走 proposal 分支
+        self.assertIn("B 提议了，理由：结论X，票数 1/2 需 2，还需 1", p2, "占位符应替换为实际值")
+
 if __name__ == "__main__":
     unittest.main()

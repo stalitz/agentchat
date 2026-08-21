@@ -35,6 +35,9 @@ class AppSettings(BaseModel):
     default_model_codex: str = ""       # codex 默认模型名（留空=自动探测 Codex 当前默认；用于展示，pin 后可覆盖）
     ollama_base_url: str = "http://localhost:11434"  # 内置网关转发目标（走 Ollama 原生 /api/chat，可传 options.num_ctx 控制上下文，不改 Ollama 全局配置）
     ollama_num_ctx: int = 16384                      # 发给 Ollama 的上下文长度（KV cache 上限）；仅本网关生效，不影响 Ollama GUI/全局设置
+    ollama_think: bool = True                        # 发给 Ollama 的请求是否保留模型思考（thinking）块；False 时网关带 think:false（gemma 等推理模型思考会疯狂吃 output token，象棋实测单轮 4 块 2.2 万字符爆 32k 上限）
+    claude_max_output_tokens: int = 64000            # claude-code 子进程 CLAUDE_CODE_MAX_OUTPUT_TOKENS（单次响应 output token 上限，默认 32000 偏小，防 thinking 长时爆表）
+    prompt_templates: dict = {}                      # 通用提示词模板（settings.prompt_templates.<scene>.<slot>）；空则用代码内置默认（辩论共识/门槛/被拒回执等 7 槽位）
 
 
 class ProjectConfig(BaseModel):

@@ -87,6 +87,19 @@ class TestClaudeGatewayEnv(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_BASE_URL", env)
         self.assertNotIn("ANTHROPIC_CUSTOM_MODEL_OPTION", env)
 
+    def test_env_sets_claude_max_output_tokens(self):
+        # 单次响应 output token 上限应从全局配置注入（默认 64000，防 gemma 思考块爆 32k 上限）
+        a = models.AgentConfig(name="G", type="claude-code", model="gemma4:26b",
+                                base_url="http://localhost:4000")
+        rt = executor.AgentRuntime(a)
+        env = rt._claude_env()
+        self.assertIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS", env, "应注入 CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+        self.assertEqual(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "64000", "默认输出上限应为 64000")
+        # 未配网关的 agent 同样注入（该上限对所有 claude 子进程生效）
+        b = models.AgentConfig(name="C", type="claude-code", model="claude-opus-4")
+        env2 = executor.AgentRuntime(b)._claude_env()
+        self.assertIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS", env2)
+
     def test_claude_config_dir_isolation(self):
         # 带 base_url 的 claude agent：必须生成隔离配置目录，使 per-agent 网关真正生效
         # （claude 2.x 会把 ~/.claude/settings.json 的 env 覆盖同名进程 env，仅靠子进程 env 注入会被全局配置盖掉）

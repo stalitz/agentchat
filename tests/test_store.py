@@ -10,6 +10,20 @@ class TestStore(unittest.TestCase):
         # 每个用例用独立干净存储
         fresh_config()
 
+    def test_get_settings_defaults_include_new_fields(self):
+        # 新配置项缺省兜底：输出上限/思考开关/提示词模板（空配置不报错、有默认值）
+        s = store.get_settings()
+        self.assertEqual(s["ollama_think"], True, "思考开关默认开（保持现状）")
+        self.assertEqual(s["claude_max_output_tokens"], 64000, "输出上限默认 64000")
+        self.assertEqual(s["prompt_templates"], {}, "提示词模板默认空（回退内置默认）")
+        # 写入后可读回
+        store.update_settings({"ollama_think": False, "claude_max_output_tokens": 99999,
+                               "prompt_templates": {"debate": {"consensus": "自定义"}}})
+        s2 = store.get_settings()
+        self.assertIs(s2["ollama_think"], False)
+        self.assertEqual(s2["claude_max_output_tokens"], 99999)
+        self.assertEqual(s2["prompt_templates"]["debate"]["consensus"], "自定义")
+
     def test_agent_crud(self):
         a = models.AgentConfig(name="架构师", type="claude-code", role="r")
         saved = store.upsert_agent(a)

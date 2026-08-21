@@ -27,6 +27,82 @@ TONE_STYLES: dict[str, str] = {
     "幽默": "轻松诙谐，善用类比与玩笑化解对立，但不失深度",
 }
 
+# 通用辩论提示词默认模板（2026-08-21 起可经全局配置 settings.prompt_templates.debate.<slot> 覆盖，
+# 便于随时调整「如何达成一致」等话术而不改代码；空配置用本默认值，行为与旧硬编码完全一致）。
+# 占位符用 <name> 形式（str.replace 渲染，避免与模板内 json 代码块的大括号冲突）。
+PROMPT_TEMPLATES_DEBATE: dict[str, str] = {
+    "consensus": (
+        "请基于以上继续推进。\n"
+        "【共识终止：先给出总结发言，再发起 end_discussion 调用】\n"
+        "如果你想结束本场讨论，请**按两步表达**：\n"
+        "**第一步（必须）：先输出你的总结性发言**——用一两段话概括双方的核心观点、"
+        "你认同或保留的分歧，以及你认为讨论已可收尾的理由。这段文字会作为你的正式发言"
+        "展示出来，**不能省略、不能只输出终止调用**。\n"
+        "**第二步：再发起 end_discussion 调用**（reason 参数用一两句话凝练双方达成的一致结论）：\n"
+        "- **首选（必须优先）：调用 end_discussion 工具**——该工具在你的 tools 工具列表中"
+        "（名称可能是 `end_discussion` 或带前缀如 `mcp__terminate-signal__end_discussion`）。"
+        "**只要工具列表中能看到它，就必须直接调用工具**，绝不用代码块代替；\n"
+        "- **仅当你的工具列表里确实没有该工具**时，才输出以下格式的代码块（与调用等价，"
+        "**必须用多行缩进排版，禁止压缩成一行**）：\n"
+        '```json\n{\n  "tool": "end_discussion",\n  "reason": "双方达成的一致结论（一两句话）"\n}\n```\n'
+        "**注意**：总结性发言是必要的正文，但**终止意图本身**不能只用普通文字表达——"
+        "例如「我同意结束」「可以收尾了」「我认为已达成一致」等文字不会被当作终止信号，"
+        "对方收不到你的结束意图，讨论会继续。\n"
+        "调用前提（必须**全部**满足才可调用）：\n"
+        "  1) 你已认真阅读并理解上一位 agent 的观点，而非自说自话、各说各话；\n"
+        "  2) 你真正接受（认同或采纳）上一位 agent 的结论，而不是为了早点结束而草草收尾；\n"
+        "  3) 本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。\n"
+        "调用后还需多数 agent（达到 ⌊N/2⌋+1 票）也发起 end_discussion 确认才会真正终止——若本轮只是你提议，其他 agent 可能继续讨论，"
+        "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
+        "收到工具回执后无论结果如何（已收到/被拒/待确认）都**不要进入待命或等待状态**，"
+        "要继续参与讨论，直到对方确认终止或你仍有话要说。"
+    ),
+    "floor_notice": (
+        "【轮次门槛提醒】当前是第 <my_turn> 轮发言，对方已发言 <peer_turns> 次。"
+        "本场最小轮数：**每位 agent 各完成第 2 次发言**——即你本次发言后，"
+        "还需对方也完成第 2 次发言才算达标。"
+        "在未达门槛前调用 end_discussion 会被系统**拒绝**——被拒原因是**轮次不足**，"
+        "与对方是否确认**无关**。请继续正常讨论、推进观点或反驳对方，不要急于终止。"
+    ),
+    "rejected_inject": (
+        "【终止被拒·请继续】你上一轮发起的 end_discussion 因未达最小讨论轮数"
+        "（当时第 <round> 轮）被拒绝，本次终止未生效。"
+        "请继续正常参与讨论、推进观点或反驳，不要进入待命/等待状态；"
+        "待双方充分交换意见后再考虑终止。"
+    ),
+    "peer_rejected": (
+        "【对方终止被拒·继续讨论】<peer> 上一轮也尝试发起 end_discussion 终止，"
+        "但被系统拒绝（原因：未达最小轮数，当时第 <round> 轮），"
+        "**并非已提议终止、也不是在等你确认**。请继续正常参与讨论、推进观点或反驳，"
+        "不要因为对方尝试过就跟着调用 end_discussion。"
+    ),
+    "proposal_peer": (
+        "【对方已提议终止】<proposer> 已发起 end_discussion 提议终止"
+        "（理由：<reason>）。"
+        "目前已有 <votes>/<n_agents> 位 agent 同意终止，需达多数 <threshold> 票才收敛"
+        "（还需 <needed> 票）。"
+        "若你认同该结论，请**先输出你的确认总结**（一两句话说明你认同的核心结论），"
+        "**再调用 end_discussion 工具确认**（reason 填你的确认意见；"
+        "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本），"
+        "达到多数同意（不止你一人）后讨论即终止；若仍有异议，继续正常讨论即可。"
+    ),
+    "proposal_self": (
+        "【你已提议终止】你已发起 end_discussion 提议终止"
+        "（目前 <votes>/<n_agents> 票，需 <threshold> 票收敛）。"
+        "请继续正常参与讨论；若其他 agent 也发起 end_discussion 达到多数同意，讨论即终止。"
+    ),
+    "proposal_none": (
+        "【轮次提醒】本场已讨论到第 <turn> / <max_rounds> 轮"
+        "（达到最少轮数，可以收尾）。"
+        "若你认为各方已达一致，请**先输出你的收官总结**（概括各方观点与一致结论），"
+        "**再调用 end_discussion 工具终止**（reason 填共识结论；"
+        "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本"
+        "（**多行缩进，禁止单行**）："
+        '```json\n{\n  "tool": "end_discussion",\n  "reason": "..."\n}\n```）；'
+        "总结性发言是必要的正文，但**终止意图**不能只靠文字表达，讨论会继续。若仍有分歧，继续讨论。"
+    ),
+}
+
 
 def _is_end_discussion(name) -> bool:
     """判定是否为 end_discussion 调用——兼容干净名（end_discussion）与
@@ -108,6 +184,13 @@ class Session:
         self.history = sess.get("messages", []) if sess else []
         # 讨论调性：发起时传入优先；未传则沿用会话已存（历史会话续接保持同调）
         self.tone = tone or ((sess or {}).get("tone") or "")
+        # 通用辩论提示词模板快照：会话启动时读一次，改配置对新会话生效（运行中会话不受影响）。
+        # 结构 settings.prompt_templates.debate.<slot>，缺省槽位回退代码内置默认（PROMPT_TEMPLATES_DEBATE）。
+        try:
+            _pt_cfg = (store.get_settings().get("prompt_templates") or {}).get("debate") or {}
+        except Exception:
+            _pt_cfg = {}
+        self._pt = {**PROMPT_TEMPLATES_DEBATE, **(_pt_cfg if isinstance(_pt_cfg, dict) else {})}
         # 每个 agent 的「持续 CLI 会话」id，用于 1:1 续接；从磁盘读回（历史会话恢复用）
         self.agent_sessions = (sess or {}).get("agent_sessions", {})
         self.runtimes = {a.name: AgentRuntime(a, self.agent_sessions.get(a.name)) for a in agents}
@@ -162,6 +245,13 @@ class Session:
         await self.inject_queue.put(text)
 
     # ---------------- prompt ----------------
+    def _render_slot(self, slot: str, **kw) -> str:
+        """渲染提示词模板槽位：配置模板优先，缺省回退内置默认；<name> 占位符 replace 替换。"""
+        t = self._pt.get(slot) or PROMPT_TEMPLATES_DEBATE.get(slot, "")
+        for k, v in kw.items():
+            t = t.replace("<" + k + ">", "" if v is None else str(v))
+        return t
+
     def _build_prompt(self, agent: AgentConfig, inject: str | None, round_i: int = 0) -> str:
         # 状态式 agent：每个 agent 在自己的 CLI 会话里持有完整历史（含历次议题与结论）。
         # 编排器每轮只发「增量 delta」——对手最近一句 + 本轮任务 / 介入，token 极省，
@@ -231,24 +321,17 @@ class Session:
         # 不要进入待命/等待状态（弱模型易把通用工具回执误解为「已终止」）
         if self._reject_inject and self._reject_inject[0] == agent.name:
             rj_round = self._reject_inject[1]
-            parts.append(
-                f"【终止被拒·请继续】你上一轮发起的 end_discussion 因未达最小讨论轮数"
-                f"（当时第 {rj_round // len(self.agents) + 1} 轮）被拒绝，本次终止未生效。"
-                "请继续正常参与讨论、推进观点或反驳，不要进入待命/等待状态；"
-                "待双方充分交换意见后再考虑终止。"
-            )
+            parts.append(self._render_slot("rejected_inject", agent=agent.name, round=rj_round // len(self.agents) + 1))
             self._reject_inject = None
         # 对方被拒提示：上一轮对方尝试 end_discussion 被系统拒绝（未达最小轮数）——
         # 弱模型（gemma）会把对方被拒的调用误读为「对方已提议终止、等我确认」，
         # 进而盲目跟调 end_discussion（「谁聪明」实测连调 2 次去"确认"）。须明确告知。
         if self._peer_rejected and self._peer_rejected[0] != agent.name:
             peer, pr = self._peer_rejected
-            parts.append(
-                f"【对方终止被拒·继续讨论】{peer} 上一轮也尝试发起 end_discussion 终止，"
-                f"但被系统拒绝（原因：未达最小轮数，当时第 {pr // len(self.agents) + 1} 轮），"
-                "**并非已提议终止、也不是在等你确认**。请继续正常参与讨论、推进观点或反驳，"
-                "不要因为对方尝试过就跟着调用 end_discussion。"
-            )
+            parts.append(self._render_slot(
+                "peer_rejected",
+                agent=agent.name, peer=peer, round=pr // len(self.agents) + 1,
+            ))
             self._peer_rejected = None
         # 门槛前每轮预吿：让 agent 明确知道当前轮次与最小轮数要求，避免它在未达门槛时
         # 误调用 end_discussion 后被拒、还把原因归咎于「对方未确认」（gemma 实测归因错误：
@@ -258,39 +341,10 @@ class Session:
             _n = len(self.agents)
             _my_turn = round_i // _n + 1
             _peer_turns = (round_i - 1) // _n + 1 if round_i > 0 else 0
-            parts.append(
-                f"【轮次门槛提醒】当前是第 {_my_turn} 轮发言，对方已发言 {_peer_turns} 次。"
-                f"本场最小轮数：**每位 agent 各完成第 2 次发言**——即你本次发言后，"
-                "还需对方也完成第 2 次发言才算达标。"
-                f"在未达门槛前调用 end_discussion 会被系统**拒绝**——被拒原因是**轮次不足**，"
-                "与对方是否确认**无关**。请继续正常讨论、推进观点或反驳对方，不要急于终止。"
-            )
-        parts.append(
-            "请基于以上继续推进。\n"
-            "【共识终止：先给出总结发言，再发起 end_discussion 调用】\n"
-            "如果你想结束本场讨论，请**按两步表达**：\n"
-            "**第一步（必须）：先输出你的总结性发言**——用一两段话概括双方的核心观点、"
-            "你认同或保留的分歧，以及你认为讨论已可收尾的理由。这段文字会作为你的正式发言"
-            "展示出来，**不能省略、不能只输出终止调用**。\n"
-            "**第二步：再发起 end_discussion 调用**（reason 参数用一两句话凝练双方达成的一致结论）：\n"
-            "- **首选（必须优先）：调用 end_discussion 工具**——该工具在你的 tools 工具列表中"
-            "（名称可能是 `end_discussion` 或带前缀如 `mcp__terminate-signal__end_discussion`）。"
-            "**只要工具列表中能看到它，就必须直接调用工具**，绝不用代码块代替；\n"
-            "- **仅当你的工具列表里确实没有该工具**时，才输出以下格式的代码块（与调用等价，"
-            "**必须用多行缩进排版，禁止压缩成一行**）：\n"
-            '```json\n{\n  "tool": "end_discussion",\n  "reason": "双方达成的一致结论（一两句话）"\n}\n```\n'
-            "**注意**：总结性发言是必要的正文，但**终止意图本身**不能只用普通文字表达——"
-            "例如「我同意结束」「可以收尾了」「我认为已达成一致」等文字不会被当作终止信号，"
-            "对方收不到你的结束意图，讨论会继续。\n"
-            "调用前提（必须**全部**满足才可调用）：\n"
-            "  1) 你已认真阅读并理解上一位 agent 的观点，而非自说自话、各说各话；\n"
-            "  2) 你真正接受（认同或采纳）上一位 agent 的结论，而不是为了早点结束而草草收尾；\n"
-            "  3) 本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。\n"
-            "调用后还需多数 agent（达到 ⌊N/2⌋+1 票）也发起 end_discussion 确认才会真正终止——若本轮只是你提议，其他 agent 可能继续讨论，"
-            "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
-            "收到工具回执后无论结果如何（已收到/被拒/待确认）都**不要进入待命或等待状态**，"
-            "要继续参与讨论，直到对方确认终止或你仍有话要说。"
-        )
+            parts.append(self._render_slot(
+                "floor_notice", agent=agent.name, my_turn=_my_turn, peer_turns=_peer_turns,
+            ))
+        parts.append(self._render_slot("consensus", agent=agent.name))
         # 达到最少轮数（双方各发言 2 次）后的每轮硬提醒：推着模型主动决策收尾，而非等它想起。
         # 本地弱工具调用模型（gemma/r1）在长辩论中几乎不主动调用工具（实测跑满轮次），
         # 故 floor 后每轮明确告知轮次与可选动作，并把「对方已提议」显式喂给本方推动确认。
@@ -301,33 +355,26 @@ class Session:
             # 投票计数（防御性：测试可能直接置 proposed_by 而未走状态机入 approvers）
             votes = len(self.terminate_approvers) or (1 if self.terminate_proposed_by else 0)
             if self.terminate_proposed_by and self.terminate_proposed_by != agent.name:
-                parts.append(
-                    f"【对方已提议终止】{self.terminate_proposed_by} 已发起 end_discussion 提议终止"
-                    f"（理由：{self.terminate_reason or '未说明'}）。"
-                    f"目前已有 {votes}/{n_agents} 位 agent 同意终止，需达多数 {threshold} 票才收敛"
-                    f"（还需 {max(threshold - votes, 0)} 票）。"
-                    "若你认同该结论，请**先输出你的确认总结**（一两句话说明你认同的核心结论），"
-                    "**再调用 end_discussion 工具确认**（reason 填你的确认意见；"
-                    "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本），"
-                    "达到多数同意（不止你一人）后讨论即终止；若仍有异议，继续正常讨论即可。"
-                )
+                parts.append(self._render_slot(
+                    "proposal_peer",
+                    agent=agent.name,
+                    proposer=self.terminate_proposed_by,
+                    reason=self.terminate_reason or "未说明",
+                    votes=votes, n_agents=n_agents, threshold=threshold,
+                    needed=max(threshold - votes, 0),
+                ))
             elif self.terminate_proposed_by == agent.name:
-                parts.append(
-                    f"【你已提议终止】你已发起 end_discussion 提议终止"
-                    f"（目前 {votes}/{n_agents} 票，需 {threshold} 票收敛）。"
-                    "请继续正常参与讨论；若其他 agent 也发起 end_discussion 达到多数同意，讨论即终止。"
-                )
+                parts.append(self._render_slot(
+                    "proposal_self",
+                    agent=agent.name,
+                    votes=votes, n_agents=n_agents, threshold=threshold,
+                ))
             else:
-                parts.append(
-                    f"【轮次提醒】本场已讨论到第 {round_i // len(self.agents) + 1} / {self.max_rounds} 轮"
-                    "（达到最少轮数，可以收尾）。"
-                    "若你认为各方已达一致，请**先输出你的收官总结**（概括各方观点与一致结论），"
-                    "**再调用 end_discussion 工具终止**（reason 填共识结论；"
-                    "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本"
-                    "（**多行缩进，禁止单行**）："
-                    '```json\n{\n  "tool": "end_discussion",\n  "reason": "..."\n}\n```）；'
-                    "总结性发言是必要的正文，但**终止意图**不能只靠文字表达，讨论会继续。若仍有分歧，继续讨论。"
-                )
+                parts.append(self._render_slot(
+                    "proposal_none",
+                    agent=agent.name,
+                    turn=round_i // len(self.agents) + 1, max_rounds=self.max_rounds,
+                ))
         return "\n\n".join(parts)
 
     # ---------------- 单轮执行（两种模式共用） ----------------

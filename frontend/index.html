@@ -1567,6 +1567,9 @@ function openSettings() {
   var dm = s.default_model || '';
   var dmc = s.default_model_codex || '';
   var ol = s.ollama_base_url || 'http://localhost:11434';
+  var mo = s.claude_max_output_tokens != null ? s.claude_max_output_tokens : 64000;
+  var th = s.ollama_think !== false;
+  var pt = (s.prompt_templates && s.prompt_templates.debate && s.prompt_templates.debate.consensus) || '';
   function field(id, label, def, help, type, wide) {
     type = type || 'text';
     def = def == null ? '' : String(def);
@@ -1597,6 +1600,20 @@ function openSettings() {
       field('gOllama', 'Ollama 地址', ol, '仅被读取，不改 Ollama 自身配置（默认 11434）') +
       field('gCtx', '上下文长度 (num_ctx)', s.ollama_num_ctx != null ? s.ollama_num_ctx : 16384, '发给 Ollama 的 KV cache 上限（token）；仅内置网关生效，不动 Ollama 全局', 'number') +
     '</div>' +
+    '<div class="set-section">高级</div>' +
+    '<div class="set-grid">' +
+      field('gMaxOut', 'Claude 输出上限 (token)', mo, 'claude 单次响应 output 上限；思考长/输出大时可调大防报错', 'number') +
+      '<div class="set-field">' +
+        '<label class="set-label" for="gThink">Ollama 思考 (thinking)</label>' +
+        '<label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); cursor:pointer;">' +
+        '<input id="gThink" type="checkbox"' + (th ? ' checked' : '') + '> 保留模型思考块（关掉可大幅降低输出量，gemma 推理模型适用）' +
+        '</label>' +
+      '</div>' +
+    '</div>' +
+    '<div class="set-field wide">' +
+      '<label class="set-label" for="gConsensus">共识终止提示词（辩论）</label>' +
+      '<textarea id="gConsensus" class="set-input" rows="4" style="resize:vertical; font-family:monospace; font-size:12px;" placeholder="留空＝内置默认（先总结再调用 end_discussion 的两步法）">' + esc(pt) + '</textarea>' +
+    '</div>' +
     '<div class="set-foot">' +
       '<button class="set-cancel" onclick="closeModal()">取消</button>' +
       '<button class="primary set-save" onclick="submitSettings()">保存</button>' +
@@ -1618,6 +1635,16 @@ function submitSettings() {
     default_model_codex: v('gDefaultModelCodex').trim(),
     ollama_base_url: v('gOllama').trim() || 'http://localhost:11434',
     ollama_num_ctx: parseInt(v('gCtx'), 10) || 16384,
+    ollama_think: document.getElementById('gThink').checked,
+    claude_max_output_tokens: parseInt(v('gMaxOut'), 10) || 64000,
+    prompt_templates: (function () {
+      var old = (cfg.settings && cfg.settings.prompt_templates) || {};
+      var ptNew = JSON.parse(JSON.stringify(old));
+      if (!ptNew.debate) ptNew.debate = {};
+      var cons = v('gConsensus').trim();
+      if (cons) ptNew.debate.consensus = cons; else delete ptNew.debate.consensus;
+      return ptNew;
+    })(),
   };
   return fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })

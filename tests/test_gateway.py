@@ -610,6 +610,32 @@ class TestOllamaNativeGateway(unittest.TestCase):
         self.assertIn('"output_tokens": 3', out)
         self.assertLess(out.index("thinking_delta"), out.index("tool_use"), "思考块应在工具块之前")
 
+    def test_stream_route_respects_ollama_think_switch(self):
+        # ollama_think=False → 请求带 think:false（gemma 关思考，防 thinking 爆 output token）；
+        # 默认 True 不带该字段（对不支持 think 参数的模型无影响）
+        def send(settings):
+            orig = gateway.httpx.AsyncClient
+            gateway.httpx.AsyncClient = _FakeCaptureBody
+            try:
+                async def run():
+                    resp = await gateway.handle_messages(
+                        _FakeRequest({"model": "gemma", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                        settings,
+                    )
+                    return "".join([c async for c in resp.body_iterator])
+                asyncio.run(run())
+            finally:
+                gateway.httpx.AsyncClient = orig
+            return _FakeCaptureBody.captured
+
+        body_on = send({"ollama_base_url": "http://x", "ollama_think": True})
+        self.assertNotIn("think", body_on, "ollama_think=True 时不应传 think 字段")
+        body_off = send({"ollama_base_url": "http://x", "ollama_think": False})
+        self.assertIs(body_off.get("think"), False, "ollama_think=False 时应传 think:false")
+        # 未配置默认 True
+        body_default = send({"ollama_base_url": "http://x"})
+        self.assertNotIn("think", body_default)
+
     def test_stream_route_forwards_tools_to_ollama(self):
         # 真工具调用路径：请求带 end_discussion 工具时，必须透传给 Ollama 原生 /api/chat，
         # 否则 gemma 收不到工具定义、永不产出 tool_calls（8e0eef0 改原生端点时漏传，回归）。
