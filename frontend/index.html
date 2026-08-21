@@ -223,6 +223,24 @@
   .form-card > div:last-child { display:flex; justify-content:flex-end; gap:8px; margin:18px 22px 20px; }
   .form-card button { font-size:13px; padding:7px 16px; border-radius:9px; }
   .form-card button.primary { font-weight:600; }
+
+  /* ---- 现代多选（Team 成员 / 项目 Teams）：替代原生 <select multiple> ---- */
+  .ms-field { border:1px solid var(--line); border-radius:11px; background:#fff; overflow:hidden; }
+  .ms-head { display:flex; justify-content:space-between; align-items:center; padding:9px 12px;
+             font-size:12.5px; font-weight:600; color:var(--txt); border-bottom:1px solid var(--line); background:#f7f8fb; }
+  .ms-count { color:var(--claude); font-weight:600; }
+  .form-card .ms-search { width:100%; box-sizing:border-box; border:none; border-bottom:1px solid var(--line);
+             border-radius:0; padding:9px 12px; margin-top:0; font-size:13.5px; color:var(--txt); background:#fff; transition:border-color .12s; }
+  .form-card .ms-search:focus { outline:none; box-shadow:none; border-bottom-color:var(--claude); }
+  .ms-list { max-height:188px; overflow:auto; padding:4px; }
+  .ms-opt { display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:8px;
+            font-size:13.5px; color:var(--txt); cursor:pointer; user-select:none; }
+  .ms-opt:hover { background:#f1f3f7; }
+  .ms-opt.on { background:rgba(47,109,246,.10); }
+  .ms-opt input[type=checkbox] { width:auto; margin:0; padding:0; border:1.5px solid #b9c2d0; border-radius:5px; accent-color:var(--claude); flex:0 0 auto; }
+  .ms-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ms-check { color:var(--claude); font-weight:700; opacity:0; flex:0 0 auto; }
+  .ms-opt.on .ms-check { opacity:1; }
 </style>
 </head>
 <body>
@@ -1435,24 +1453,20 @@ function openAgentForm(a) {
 }
 function openTeamForm(t) {
   editingId = t ? t.id : null; editingKind = 'team';
-  var ags = Object.keys(cfg.agents).map(function (k) {
-    var sel0 = (t && t.agent_ids.indexOf(k) >= 0) ? ' selected' : '';
-    return '<option value="' + cfg.agents[k].id + '"' + sel0 + '>' + esc(cfg.agents[k].name) + '</option>';
-  }).join('');
+  var agItems = Object.keys(cfg.agents).map(function (k) {
+    return { id: cfg.agents[k].id, name: cfg.agents[k].name };
+  });
   var c = document.getElementById('modalCard');
   c.className = 'card form-card';
   c.innerHTML = '<h3>' + (t ? '编辑 Team' : '新建 Team') + '</h3>' +
     f('name', '名称', t ? t.name : '') +
-    '<div>成员：<select id="mAgents" multiple size="5">' + ags + '</select></div>' +
+    '<div>成员：' + multiSelectHtml('mAgents', 'Agent', agItems, t ? t.agent_ids : []) + '</div>' +
     formButtons('submitTeam', t);
   document.getElementById('modal').classList.add('show');
 }
 function openProjectForm(p) {
   editingId = p ? p.id : null; editingKind = 'project';
-  var tms = cfg.teams.map(function (tm) {
-    var sel0 = (p && p.team_ids.indexOf(tm.id) >= 0) ? ' selected' : '';
-    return '<option value="' + tm.id + '"' + sel0 + '>' + esc(tm.name) + '</option>';
-  }).join('');
+  var tmItems = cfg.teams.map(function (tm) { return { id: tm.id, name: tm.name }; });
   var c = document.getElementById('modalCard');
   c.className = 'card form-card';
   c.innerHTML = '<h3>' + (p ? '编辑 项目' : '新建 项目') + '</h3>' +
@@ -1462,7 +1476,7 @@ function openProjectForm(p) {
     '<input id="path" value="' + (p ? esc(p.path) : '') + '" style="flex:1; min-width:0;" placeholder="未选择" readonly>' +
     '<button type="button" class="ghost" onclick="openFsPicker(' + (p ? "'" + (p.path || '') + "'" : "null") + ')">选择文件夹</button>' +
     '</div></label>' +
-    '<div>Teams：<select id="mTeams" multiple size="5" style="width:100%">' + tms + '</select></div>' +
+    '<div>Teams：' + multiSelectHtml('mTeams', 'Team', tmItems, p ? p.team_ids : []) + '</div>' +
     formButtons('submitProject', p);
   document.getElementById('modal').classList.add('show');
 }
@@ -1476,6 +1490,47 @@ function formButtons(submitFn, ent) {
   if (ent) html += '<button onclick="deleteEntity()" style="border-color:#e88;color:#c33">删除</button>';
   html += '<button onclick="closeModal()">取消</button></div>';
   return html;
+}
+// ---- 现代多选（可搜索勾选列表，替代原生 <select multiple>）----
+function multiSelectHtml(id, label, items, selected) {
+  var sel = selected || [];
+  var cnt0 = sel.length ? (sel.length + ' 已选') : '';
+  var opts = (items || []).map(function (it) {
+    var on = sel.indexOf(it.id) >= 0 ? ' checked' : '';
+    return '<label class="ms-opt' + (on ? ' on' : '') + '">' +
+      '<input type="checkbox" data-id="' + it.id + '"' + on + ' onchange="msToggle(this)">' +
+      '<span class="ms-name">' + esc(it.name) + '</span>' +
+      '<span class="ms-check">✓</span></label>';
+  }).join('');
+  return '<div class="ms-field">' +
+    '<div class="ms-head"><span>' + label + '</span><span class="ms-count" id="' + id + '_cnt">' + cnt0 + '</span></div>' +
+    '<input class="ms-search" id="' + id + '_q" placeholder="搜索…" oninput="msFilter(\'' + id + '\', this.value)">' +
+    '<div class="ms-list" id="' + id + '">' + opts + '</div></div>';
+}
+function msToggle(cb) {
+  var lbl = cb.closest('.ms-opt');
+  if (lbl) lbl.classList.toggle('on', cb.checked);
+  msCount(cb.closest('.ms-list'));
+}
+function msCount(list) {
+  if (!list) return;
+  var n = list.querySelectorAll('input:checked').length;
+  var c = document.getElementById(list.id + '_cnt');
+  if (c) c.textContent = n ? (n + ' 已选') : '';
+}
+function msFilter(id, q) {
+  var list = document.getElementById(id);
+  if (!list) return;
+  q = (q || '').toLowerCase();
+  Array.prototype.slice.call(list.querySelectorAll('.ms-opt')).forEach(function (o) {
+    var nm = o.querySelector('.ms-name').textContent.toLowerCase();
+    o.style.display = nm.indexOf(q) >= 0 ? '' : 'none';
+  });
+}
+function getMultiSelected(id) {
+  var list = document.getElementById(id);
+  if (!list) return [];
+  return Array.prototype.slice.call(list.querySelectorAll('input:checked')).map(function (c) { return c.getAttribute('data-id'); });
 }
 function deleteEntity() {
   if (!editingId || !editingKind) return;
@@ -1652,8 +1707,7 @@ function submitAgent() {
     .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
 }
 function submitTeam() {
-  var sel = document.getElementById('mAgents');
-  var ids = Array.prototype.slice.call(sel.selectedOptions).map(function (o) { return o.value; });
+  var ids = getMultiSelected('mAgents');
   var body = { name: v('name'), agent_ids: ids };
   if (editingId) body.id = editingId;
   return fetch('/api/teams', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
@@ -1662,8 +1716,7 @@ function submitTeam() {
     .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
 }
 function submitProject() {
-  var sel = document.getElementById('mTeams');
-  var ids = sel ? Array.prototype.slice.call(sel.selectedOptions).map(function (o) { return o.value; }) : [];
+  var ids = getMultiSelected('mTeams');
   var body = { name: v('name'), path: v('path'), team_ids: ids };
   if (editingId) body.id = editingId;
   return fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })

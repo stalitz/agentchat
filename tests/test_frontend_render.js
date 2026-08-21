@@ -165,7 +165,26 @@ setTimeout(async () => {
   check(doc.getElementById('modal').classList.contains('show'), '点项目编辑图标应弹出编辑弹窗');
   check(card.innerHTML.indexOf('编辑 项目') >= 0, '编辑弹窗标题应为「编辑 项目」');
   check(doc.getElementById('name') && doc.getElementById('name').value === 'demo', '编辑表单应预填项目名 demo');
+  // ---- 现代多选（项目 Teams）：替代原生 <select multiple> ----
+  const mTeams = doc.getElementById('mTeams');
+  check(mTeams && mTeams.classList.contains('ms-list'), '项目表单 Teams 应为现代多选(.ms-list 容器)，实际 ' + (mTeams && mTeams.className));
+  check(mTeams && mTeams.querySelectorAll('input[type=checkbox]').length === 2, '项目表单 Teams 应渲染 2 个 team 选项(checkbox)，实际 ' + (mTeams && mTeams.querySelectorAll('input[type=checkbox]').length));
+  check(mTeams && mTeams.querySelectorAll('input[checked]').length === 2, '项目表单 Teams 应预选 2 个 team(tm_dual/tm_fake)');
+  check(!doc.getElementById('modalCard').querySelector('select[multiple]'), '项目表单不应再含原生 <select multiple>');
   dom.window.closeModal();
+
+  // ---- Team 成员现代多选 ----
+  const teamEdit = doc.querySelector('.node.team .edit-btn');
+  check(!!teamEdit, 'Team 节点应提供行内编辑图标');
+  if (teamEdit) {
+    teamEdit.click();
+    const mAgents = doc.getElementById('mAgents');
+    check(mAgents && mAgents.classList.contains('ms-list'), 'Team 表单成员应为现代多选(.ms-list)');
+    check(mAgents && mAgents.querySelectorAll('input[type=checkbox]').length === 5, 'Team 表单成员应渲染 5 个 agent 选项，实际 ' + (mAgents && mAgents.querySelectorAll('input[type=checkbox]').length));
+    check(mAgents && mAgents.querySelectorAll('input[checked]').length === 2, 'Team 表单成员应预选该 team 的 2 个 agent');
+    check(!doc.getElementById('modalCard').querySelector('select[multiple]'), 'Team 表单不应再含原生 <select multiple>');
+    dom.window.closeModal();
+  }
 
   // ---- 点项目名 -> 选中项目并加载其会话（中栏）----
   const projNm = doc.querySelector('.node.proj .nm');
