@@ -462,7 +462,7 @@ class TestOrchestrator(unittest.TestCase):
         logs = store.read_tool_log(self.proj, self.sid)
         self.assertTrue(logs, "应产生工具日志")
         entry = logs[-1]
-        self.assertIn(entry.get("action"), ("proposed", "rejected", "repeat", "confirmed"))
+        self.assertIn(entry.get("action"), ("proposed", "rejected", "repeat", "agreed", "confirmed"))
         self.assertFalse(entry.get("exec_ok"), "工具执行失败时 exec_ok 应为 False")
         self.assertIn("No such tool", entry.get("exec_error", ""), "exec_error 应含失败原因")
         self.assertRegex(entry.get("ts", ""), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
@@ -722,6 +722,78 @@ class TestOrchestrator(unittest.TestCase):
         a2_p = next(p for p in a_prompts if p.get("round") == 2)
         self.assertIn("终止被拒·请继续", a2_p["prompt"])
         self.assertNotIn("对方终止被拒", a2_p["prompt"], "本人不应收到『对方被拒』提示")
+
+    # ---- FR5.3b 多 agent 扩展（多数同意 + 全量发言回传）----
+    def test_three_agent_majority_converges_with_two_votes(self):
+        # FR5.3b 子项1：3 agent 阈值 = ⌊3/2⌋+1 = 2（多数），只需 2 票即收敛，
+        # 第 3 个 agent 不必投票。C 在 floor 后提议、B 随后投票 → 2 票达多数，A 全程不参与仍收敛。
+        a1 = models.AgentConfig(name="A", type="fake")            # A 从不发起
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=8)  # B 从 round_i>=7 起发
+        a3 = models.AgentConfig(name="C", type="fake", fake_terminate_round=6)  # C 从 round_i>=5 起发
+        s, rec = make_session([a1, a2, a3], self.proj, self.sid, max_rounds=10)
+        self.run_session(s, task="三方讨论")
+        starts = [e["agent"] for e in rec.events if e.get("type") == "turn_start"]
+        # 轮转 A,B,C；C@5 提议、B@7 投票达成多数 → 共 8 次发言后收敛
+        self.assertEqual(starts, ["A", "B", "C", "A", "B", "C", "A", "B"],
+                         "C 提议 + B 投票达多数后应收敛，A 不必投票")
+        self.assertTrue(s.terminate_confirm, "达多数同意应 terminate_confirm=True")
+        sys = " ".join(e.get("msg", "") for e in rec.events if e.get("type") == "system")
+        self.assertIn("收敛", sys, "多数同意后应收敛")
+        # 工具日志应含 proposed + confirmed，且只有 2 个 distinct agent 投票
+        logs = store.read_tool_log(self.proj, self.sid)
+        actions = [e.get("action") for e in logs]
+        self.assertIn("proposed", actions)
+        self.assertIn("confirmed", actions)
+        voters = [e["agent"] for e in logs if e.get("action") in ("proposed", "agreed", "confirmed")]
+        self.assertEqual(len(set(voters)), 2, "只有 2 个 distinct agent 投票即达多数")
+        self.assertNotIn("A", set(voters), "第 3 个 agent(A)不应被强制投票")
+
+    def test_three_agent_single_proposer_does_not_converge(self):
+        # FR5.3b 子项1：仅 1 个 agent 反复提议（其余从不投票）→ 不达多数（需 2 票），不收敛，跑满上限
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake", fake_terminate_round=8)  # 仅 B 从 round_i>=7 起发
+        a3 = models.AgentConfig(name="C", type="fake")
+        s, rec = make_session([a1, a2, a3], self.proj, self.sid, max_rounds=4)  # 3*4=12 次发言
+        self.run_session(s, task="单方提议")
+        starts = [e["agent"] for e in rec.events if e.get("type") == "turn_start"]
+        self.assertEqual(starts, ["A", "B", "C", "A", "B", "C", "A", "B", "C", "A", "B", "C"],
+                         "单方提议无多数确认应跑满上限")
+        sys = " ".join(e.get("msg", "") for e in rec.events if e.get("type") == "system")
+        self.assertNotIn("收敛", sys, "未达多数不应收敛")
+        self.assertIn("会话结束", sys)
+        # 只有 B 一票，永远到不了 2 票
+        logs = store.read_tool_log(self.proj, self.sid)
+        voters = {e["agent"] for e in logs if e.get("action") in ("proposed", "agreed", "confirmed")}
+        self.assertEqual(voters, {"B"}, "只有 B 投票，A/C 不应被计票")
+
+    def test_full_delta_returns_all_other_speeches(self):
+        # FR5.3b 子项2：每轮 prompt 回传「本方上次发言之后的全部他人发言」，而非只取紧邻上一个。
+        # 3 agent 轮转 A,B,C,A：A 第二次发言时应同时看到 B 与 C 的首句（信息对称）。
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        a3 = models.AgentConfig(name="C", type="fake")
+        s, _ = make_session([a1, a2, a3], self.proj, self.sid)
+        # 模拟已发生的轮转：human 任务 + A 首句 + B 首句 + C 首句（A 的下一次发言将在其后）
+        s.history = [
+            {"speaker": "human", "role": "任务", "content": "任务"},
+            {"speaker": "A", "role": "x", "content": "A首句"},
+            {"speaker": "B", "role": "x", "content": "B首句"},
+            {"speaker": "C", "role": "x", "content": "C首句"},
+        ]
+        p = s._build_prompt(a1, "继续", round_i=3)
+        self.assertIn("B首句", p, "应回传 B 的发言")
+        self.assertIn("C首句", p, "应回传 C 的发言（而非只回传紧邻上一个）")
+        self.assertNotIn("A首句", p, "不应把本方旧发言当 delta 回传给自己")
+        # 2 agent 时行为与旧逻辑等价：只回传对方那一句
+        s2, _ = make_session([a1, a2], self.proj, self.sid)
+        s2.history = [
+            {"speaker": "human", "role": "任务", "content": "任务"},
+            {"speaker": "A", "role": "x", "content": "A旧句"},
+            {"speaker": "B", "role": "x", "content": "B旧句"},
+        ]
+        p2 = s2._build_prompt(a1, "继续", round_i=1)
+        self.assertIn("B旧句", p2, "双 agent 仍应回传对方发言")
+        self.assertNotIn("A旧句", p2, "双 agent 不应回传本方旧发言")
 
 if __name__ == "__main__":
     unittest.main()

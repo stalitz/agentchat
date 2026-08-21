@@ -121,8 +121,13 @@ class Session:
         self.resume_event.set()
         self.inject_queue: asyncio.Queue = asyncio.Queue()
         self.running = False
-        # end_discussion 两阶段终止状态：提议方 / 理由 / 是否已获对方确认（确认后整场收敛）
+        # end_discussion 终止状态机（FR5.3b 多数同意）：
+        # - terminate_proposed_by：首个提议方（用于 prompt 提示「谁先提的」）
+        # - terminate_approvers：已显式同意终止的 agent 集合（每 agent 一次 end_discussion 计一票，
+        #   同方重复调用仍只算一票）；集合大小 ≥ ⌊N/2⌋+1（多数）即收敛
+        # - terminate_confirm：已达多数同意、整场收敛的标志（_debate 据此结束）
         self.terminate_proposed_by = None
+        self.terminate_approvers = set()
         self.terminate_reason = ""
         self.terminate_confirm = False
         # 最近一次「终止被拒」的回执待注入：被拒只记日志不够，必须把原因回传给模型，
@@ -181,19 +186,24 @@ class Session:
             parts.append("请以对话方式直接回复。这是人机对话，不要调用 end_discussion 工具或输出其调用文本（辩论模式专用）。")
             return "\n\n".join(parts)
 
-        # 多 agent 辩论：只把「对手上一句」作为 delta 回传；首轮（round_i==0）没有对手句，
-        # 也不回传上一场残骸（续开新议题时 history 里混着旧议题的 agent 发言）。
-        # agent 的持续会话已记住历次议题与结论，无需手动回传——它自行结合上下文判断。
-        last = None
+        # 多 agent 辩论（FR5.3b 子项2）：回传「本方上次发言之后的全部他人发言」（按发生顺序），
+        # 保证每个 agent 都看得到全体其他参与者的观点，而非只看到紧邻上一个（信息对称）。
+        # 2 agent 时本方法结果与旧「只取紧邻上家」等价（对方上一句 = 全部增量），无需特判。
+        # agent 的持续会话已记住自身历史与历次议题，故只回传「他人增量」，不回传本方旧发言。
         if round_i > 0:
-            for m in reversed(self.history):
-                if m.get("speaker") not in ("system", agent.name, "human"):
-                    last = m
-                    break
-        if last:
-            parts.append(
-                f"{last['speaker']}（{last.get('role', '')}）刚才说：\n{last['content']}"
-            )
+            my_idx = -1
+            for i, m in enumerate(self.history):
+                if m.get("speaker") == agent.name:
+                    my_idx = i
+            others = [
+                m for m in self.history[my_idx + 1:]
+                if m.get("speaker") not in (agent.name, "system", "human")
+            ]
+            if others:
+                delta = "\n\n".join(
+                    f"{m['speaker']}（{m.get('role', '')}）说：\n{m['content']}" for m in others
+                )
+                parts.append("其他 agent 的发言（自你上次发言之后）：\n" + delta)
         # 任务 / 人工介入（本轮新议题通常经此传入）
         if inject:
             parts.append(f"人工介入 / 任务：\n{inject}")
@@ -256,7 +266,7 @@ class Session:
             "  1) 你已认真阅读并理解上一位 agent 的观点，而非自说自话、各说各话；\n"
             "  2) 你真正接受（认同或采纳）上一位 agent 的结论，而不是为了早点结束而草草收尾；\n"
             "  3) 本场至少要进行两轮完整往返才会考虑结束，不要在一两轮内就急于终止。\n"
-            "调用后还需对方 agent 也发起 end_discussion 确认才会真正终止——若本轮只是你提议，对方可能继续讨论，"
+            "调用后还需多数 agent（达到 ⌊N/2⌋+1 票）也发起 end_discussion 确认才会真正终止——若本轮只是你提议，其他 agent 可能继续讨论，"
             "请继续正常参与；只要你仍有不同意见、想补充或反驳，就不要调用它，继续正常讨论。"
             "收到工具回执后无论结果如何（已收到/被拒/待确认）都**不要进入待命或等待状态**，"
             "要继续参与讨论，直到对方确认终止或你仍有话要说。"
@@ -266,25 +276,32 @@ class Session:
         # 故 floor 后每轮明确告知轮次与可选动作，并把「对方已提议」显式喂给本方推动确认。
         floor = 2 * len(self.agents) - 1
         if round_i >= floor:
+            n_agents = len(self.agents)
+            threshold = n_agents // 2 + 1
+            # 投票计数（防御性：测试可能直接置 proposed_by 而未走状态机入 approvers）
+            votes = len(self.terminate_approvers) or (1 if self.terminate_proposed_by else 0)
             if self.terminate_proposed_by and self.terminate_proposed_by != agent.name:
                 parts.append(
                     f"【对方已提议终止】{self.terminate_proposed_by} 已发起 end_discussion 提议终止"
                     f"（理由：{self.terminate_reason or '未说明'}）。"
+                    f"目前已有 {votes}/{n_agents} 位 agent 同意终止，需达多数 {threshold} 票才收敛"
+                    f"（还需 {max(threshold - votes, 0)} 票）。"
                     "若你认同该结论，请**先输出你的确认总结**（一两句话说明你认同的核心结论），"
                     "**再调用 end_discussion 工具确认**（reason 填你的确认意见；"
                     "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本），"
-                    "双方确认后讨论即终止；若仍有异议，继续正常讨论即可。"
+                    "达到多数同意（不止你一人）后讨论即终止；若仍有异议，继续正常讨论即可。"
                 )
             elif self.terminate_proposed_by == agent.name:
                 parts.append(
-                    "【你已提议终止】你已发起 end_discussion 提议终止，正在等待对方确认。"
-                    "请继续正常参与讨论；若对方也发起 end_discussion 确认，讨论即终止。"
+                    f"【你已提议终止】你已发起 end_discussion 提议终止"
+                    f"（目前 {votes}/{n_agents} 票，需 {threshold} 票收敛）。"
+                    "请继续正常参与讨论；若其他 agent 也发起 end_discussion 达到多数同意，讨论即终止。"
                 )
             else:
                 parts.append(
                     f"【轮次提醒】本场已讨论到第 {round_i // len(self.agents) + 1} / {self.max_rounds} 轮"
                     "（达到最少轮数，可以收尾）。"
-                    "若你认为双方已达一致，请**先输出你的收官总结**（概括双方观点与一致结论），"
+                    "若你认为各方已达一致，请**先输出你的收官总结**（概括各方观点与一致结论），"
                     "**再调用 end_discussion 工具终止**（reason 填共识结论；"
                     "工具在 tools 列表中就必须调用工具，仅无工具时才输出 ```json 调用文本"
                     "（**多行缩进，禁止单行**）："
@@ -457,28 +474,43 @@ class Session:
                 continue
             if self.terminate_proposed_by is None:
                 self.terminate_proposed_by = agent.name
+                self.terminate_approvers.add(agent.name)
                 self.terminate_reason = reason
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "proposed", "agent": agent.name, "round_i": round_i,
-                    "reason": reason, "msg": "已记录终止提议，等待对方确认",
+                    "reason": reason, "msg": "已记录终止提议，等待多数同意",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                     "msg_round": msg_round,
                 })
-            elif self.terminate_proposed_by == agent.name:
+            elif agent.name in self.terminate_approvers:
+                # 本人重复调用 end_discussion：仍只计一票，记录 repeat 不增票
                 store.append_tool_log(self.project_path, self.session_id, {
                     "action": "repeat", "agent": agent.name, "round_i": round_i,
-                    "reason": reason, "msg": "本方重复提议，仍在等待对方确认",
+                    "reason": reason, "msg": "本方重复提议，仍在等待多数同意",
                     "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
                     "msg_round": msg_round,
                 })
             else:
-                self.terminate_confirm = True
-                self.terminate_reason = reason or self.terminate_reason
-                store.append_tool_log(self.project_path, self.session_id, {
-                    "action": "confirmed", "agent": agent.name, "round_i": round_i,
-                    "reason": self.terminate_reason, "msg": "对方确认，讨论终止",
-                    "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
-                    "msg_round": msg_round,
+                # 不同 agent 追加一票（FR5.3b 多数同意）
+                self.terminate_approvers.add(agent.name)
+                threshold = len(self.agents) // 2 + 1
+                if len(self.terminate_approvers) >= threshold:
+                    self.terminate_confirm = True
+                    self.terminate_reason = reason or self.terminate_reason
+                    store.append_tool_log(self.project_path, self.session_id, {
+                        "action": "confirmed", "agent": agent.name, "round_i": round_i,
+                        "reason": self.terminate_reason,
+                        "msg": f"已达多数同意（{len(self.terminate_approvers)}/{len(self.agents)}），讨论终止",
+                        "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
+                        "msg_round": msg_round,
+                    })
+                else:
+                    store.append_tool_log(self.project_path, self.session_id, {
+                        "action": "agreed", "agent": agent.name, "round_i": round_i,
+                        "reason": reason,
+                        "msg": f"已计一票（{len(self.terminate_approvers)}/{len(self.agents)}），尚未达多数（需 {threshold}）",
+                        "ts": log_ts, "exec_ok": exec_ok, "exec_error": exec_err,
+                        "msg_round": msg_round,
                 })
         if errors and not tool_intent:
             # 失败：不落 agent 发言，落 system 错误消息，调用方据此中止

@@ -1334,7 +1334,7 @@ function openPromptLog() {
 }
 function closePromptLog() { document.getElementById('promptModal').classList.remove('show'); }
 // 工具调用日志：end_discussion 每次调用（被拒/提议/重复/确认）的落盘记录
-var TOOL_ACTION_CN = { rejected: '被拒（未达最小轮数）', proposed: '提议终止', repeat: '重复提议', confirmed: '对方确认·终止' };
+var TOOL_ACTION_CN = { rejected: '被拒（未达最小轮数）', proposed: '提议终止', repeat: '重复提议', agreed: '已同意（未达多数）', confirmed: '多数同意·终止' };
 function openToolLog() {
   if (!curSid) { alert('请先选择一个会话'); return; }
   var c = document.getElementById('promptCard');
