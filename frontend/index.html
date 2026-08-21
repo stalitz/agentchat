@@ -1569,7 +1569,11 @@ function openSettings() {
   var ol = s.ollama_base_url || 'http://localhost:11434';
   var mo = s.claude_max_output_tokens != null ? s.claude_max_output_tokens : 64000;
   var th = s.ollama_think !== false;
-  var pt = (s.prompt_templates && s.prompt_templates.debate && s.prompt_templates.debate.consensus) || '';
+  var ptCfg = (s.prompt_templates && s.prompt_templates.debate) || {};
+  var ptDef = (s.prompt_template_defaults && s.prompt_template_defaults.debate) || {};
+  // 显示「当前生效」文本：配置有就用配置，否则显示内置默认（可改、可恢复默认）
+  var consVal = ptCfg.consensus != null ? ptCfg.consensus : (ptDef.consensus || '');
+  var extraVal = ptCfg.extra_rules != null ? ptCfg.extra_rules : (ptDef.extra_rules || '');
   function field(id, label, def, help, type, wide) {
     type = type || 'text';
     def = def == null ? '' : String(def);
@@ -1611,9 +1615,21 @@ function openSettings() {
         '</label>' +
       '</div>' +
     '</div>' +
-    '<div class="set-field wide">' +
-      '<label class="set-label" for="gConsensus">共识终止提示词（辩论）</label>' +
-      '<textarea id="gConsensus" class="set-input" rows="4" style="resize:vertical; font-family:monospace; font-size:12px;" placeholder="留空＝内置默认（先总结再调用 end_discussion 的两步法）">' + esc(pt) + '</textarea>' +
+    '<div class="set-field wide" style="padding:0 22px;">' +
+      '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
+        '<label class="set-label" for="gConsensus">共识终止提示词（辩论）</label>' +
+        '<button type="button" class="ghost" style="font-size:12px; padding:2px 10px;" onclick="setTemplateDefault(\'gConsensus\')">恢复默认</button>' +
+      '</div>' +
+      '<textarea id="gConsensus" class="set-input" rows="4" style="resize:vertical; font-family:monospace; font-size:12px; width:100%; box-sizing:border-box;">' + esc(consVal) + '</textarea>' +
+      '<div class="set-help">当前生效文本（未改过即内置默认）；保存时与默认一致则视为未配置，点「恢复默认」即还原</div>' +
+    '</div>' +
+    '<div class="set-field wide" style="padding:0 22px;">' +
+      '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
+        '<label class="set-label" for="gExtraRules">附加规则提示词（每轮常驻）</label>' +
+        '<button type="button" class="ghost" style="font-size:12px; padding:2px 10px;" onclick="setTemplateDefault(\'gExtraRules\')">恢复默认</button>' +
+      '</div>' +
+      '<textarea id="gExtraRules" class="set-input" rows="3" style="resize:vertical; font-family:monospace; font-size:12px; width:100%; box-sizing:border-box;" placeholder="场景专属规则（如盲棋/游戏），留空则无">' + esc(extraVal) + '</textarea>' +
+      '<div class="set-help">每轮注入所有 agent 的附加规则；留空＝无</div>' +
     '</div>' +
     '</div>' +
     '<div class="set-foot">' +
@@ -1633,6 +1649,13 @@ function openSettings() {
   c.style.maxHeight = 'min(86vh, 620px)';
   document.getElementById('modal').classList.add('show');
 }
+// 恢复提示词模板默认：把 textarea 重置为内置默认文本（保存时与默认一致会自动视为未配置）
+function setTemplateDefault(id) {
+  var defs = (cfg.settings && cfg.settings.prompt_template_defaults && cfg.settings.prompt_template_defaults.debate) || {};
+  var key = id === 'gConsensus' ? 'consensus' : 'extra_rules';
+  var el = document.getElementById(id);
+  if (el) el.value = (defs[key] != null ? defs[key] : '');
+}
 function submitSettings() {
   var body = {
     default_timeout: parseInt(v('gTimeout'), 10) || 300,
@@ -1647,8 +1670,12 @@ function submitSettings() {
       var old = (cfg.settings && cfg.settings.prompt_templates) || {};
       var ptNew = JSON.parse(JSON.stringify(old));
       if (!ptNew.debate) ptNew.debate = {};
+      var defs = (cfg.settings && cfg.settings.prompt_template_defaults && cfg.settings.prompt_template_defaults.debate) || {};
+      // 与默认一致（或为空）＝视为未配置（删除），避免垃圾配置
       var cons = v('gConsensus').trim();
-      if (cons) ptNew.debate.consensus = cons; else delete ptNew.debate.consensus;
+      if (cons && cons !== (defs.consensus || '')) ptNew.debate.consensus = cons; else delete ptNew.debate.consensus;
+      var extra = v('gExtraRules').trim();
+      if (extra && extra !== (defs.extra_rules || '')) ptNew.debate.extra_rules = extra; else delete ptNew.debate.extra_rules;
       return ptNew;
     })(),
   };

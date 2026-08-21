@@ -16,6 +16,11 @@ class TestStore(unittest.TestCase):
         self.assertEqual(s["ollama_think"], True, "思考开关默认开（保持现状）")
         self.assertEqual(s["claude_max_output_tokens"], 64000, "输出上限默认 64000")
         self.assertEqual(s["prompt_templates"], {}, "提示词模板默认空（回退内置默认）")
+        # 默认模板应返回给前端（显示默认/恢复默认用），与内置默认同源
+        self.assertIn("debate", s["prompt_template_defaults"], "应返回提示词默认模板供前端展示")
+        self.assertIn("consensus", s["prompt_template_defaults"]["debate"])
+        self.assertTrue(s["prompt_template_defaults"]["debate"]["consensus"].startswith("请基于以上继续推进"),
+                        "默认共识模板应为内置文本")
         # 写入后可读回
         store.update_settings({"ollama_think": False, "claude_max_output_tokens": 99999,
                                "prompt_templates": {"debate": {"consensus": "自定义"}}})

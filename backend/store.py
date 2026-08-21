@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .models import ProjectConfig, TeamConfig, AgentConfig
+from .prompt_defaults import PROMPT_TEMPLATES_DEBATE
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -100,6 +101,8 @@ def get_settings() -> dict:
         "ollama_think": bool(s.get("ollama_think", True)),
         "claude_max_output_tokens": int(s.get("claude_max_output_tokens", 64000)),
         "prompt_templates": s.get("prompt_templates") or {},
+        # 提示词默认模板（供前端「显示默认 / 恢复默认」）：与后端实际生效的缺省值同源
+        "prompt_template_defaults": {"debate": dict(PROMPT_TEMPLATES_DEBATE)},
     }
 
 

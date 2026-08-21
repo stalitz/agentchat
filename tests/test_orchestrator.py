@@ -840,6 +840,14 @@ class TestOrchestrator(unittest.TestCase):
         s.terminate_reason = "结论X"
         p2 = s._build_prompt(a1, "任务", round_i=4)  # floor=3，round_i>=3 走 proposal 分支
         self.assertIn("B 提议了，理由：结论X，票数 1/2 需 2，还需 1", p2, "占位符应替换为实际值")
+        # 附加规则槽位：配置后每轮常驻注入
+        s._pt["extra_rules"] = "【附加规则】本场是盲棋，禁止总结。"
+        p3 = s._build_prompt(a1, "任务", round_i=1)
+        self.assertIn("【附加规则】本场是盲棋，禁止总结。", p3)
+        # 未配置（默认空）时无附加规则块
+        s2, _ = make_session([a1, a2], self.proj, self.sid)
+        p4 = s2._build_prompt(a1, "任务", round_i=1)
+        self.assertNotIn("附加规则", p4)
 
 if __name__ == "__main__":
     unittest.main()

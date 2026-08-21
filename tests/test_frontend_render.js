@@ -32,7 +32,11 @@ const fakeConfig = {
   ],
   // 全局设置：default_max_rounds 用 20 以便与硬编码 12 区分，验证 composer 默认值确实来自全局设置
   // default_model / default_model_codex 用真实格式串，验证「默认」agent 显示的是模型名而非「默认」占位
-  settings: { default_timeout: 300, default_max_rounds: 20, default_model: 'claude-sonnet-4-20250514', default_model_codex: 'deepseek-v4-flash' },
+  settings: {
+    default_timeout: 300, default_max_rounds: 20, default_model: 'claude-sonnet-4-20250514', default_model_codex: 'deepseek-v4-flash',
+    // 提示词默认模板（后端返回，前端据此显示默认/恢复默认）
+    prompt_template_defaults: { debate: { consensus: '【默认共识】先总结再确认', extra_rules: '' } },
+  },
 };
 
 const demoSession = {
@@ -235,6 +239,11 @@ setTimeout(async () => {
   check(!!doc.getElementById('gMaxOut'), '全局设置应提供 Claude 输出上限输入(gMaxOut)');
   check(!!doc.getElementById('gThink'), '全局设置应提供 Ollama 思考开关(gThink)');
   check(!!doc.getElementById('gConsensus'), '全局设置应提供共识终止提示词编辑(gConsensus)');
+  check(doc.getElementById('gConsensus') && doc.getElementById('gConsensus').value === '【默认共识】先总结再确认',
+    'gConsensus 应显示当前生效文本（未配置时=内置默认），实际 ' + (doc.getElementById('gConsensus') && doc.getElementById('gConsensus').value));
+  check(!!doc.getElementById('gExtraRules'), '全局设置应提供附加规则提示词编辑(gExtraRules)');
+  check(!!doc.querySelector('button[onclick="setTemplateDefault(\'gConsensus\')"]'),
+    'gConsensus 应有「恢复默认」按钮');
   check(!!doc.querySelector('#modalCard .set-body'), '设置面板应有可滚动内容区(set-body)，长内容不被裁切');
   check((doc.getElementById('modalCard') && doc.getElementById('modalCard').style.maxHeight) || '',
     '设置卡片应限高(maxHeight)，保证滚动生效');
