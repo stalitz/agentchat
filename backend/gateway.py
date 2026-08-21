@@ -5,7 +5,7 @@ tool_result），而本地 Ollama 说 OpenAI Chat Completions 格式。两者协
 把这一层翻译做进 app 本身，claude-code 类型的 agent 就能把 `base_url` 指向本网关
 （如 http://127.0.0.1:8777），从而直连 Ollama 上已 pull 好的模型（gemma / deepseek 等），
 **无需用户另起 litellm、也完全不改动 Ollama 自身配置**——本网关只是去读 Ollama 既有的
-OpenAI 兼容端点（默认 http://localhost:11434/v1/chat/completions）。
+原生 /api/chat 端点（默认 http://localhost:11434/api/chat，可传 options.num_ctx 控制上下文长度）。
 
 路由：POST /v1/messages（与 Anthropic SDK 追加的路径一致：ANTHROPIC_BASE_URL + /v1/messages）。
 """
@@ -19,8 +19,9 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# Ollama 的 OpenAI 兼容端点（只读，不改 Ollama 配置）；可被全局设置 ollama_base_url 或
-# 环境变量 OLLAMA_BASE_URL 覆盖。
+# Ollama 原生 /api/chat 端点（只读 Ollama，不改 Ollama 配置）；可被全局设置 ollama_base_url 或
+# 环境变量 OLLAMA_BASE_URL 覆盖。走原生端点而非 OpenAI 兼容端点，因为只有原生端点接受
+# options.num_ctx，才能由本网关控制上下文长度（KV cache 上限），不影响 Ollama GUI/全局设置。
 # 思考/答案块的边界哨兵：仅用于**读取旧 transcript 时的兜底清洗**（executor._clean_sentinels），
 # 新版网关已改为原生 Anthropic `thinking` 块（带 signature）+ `text` 块，claude-code 会原样落盘、
 # 原生 claude / 外部工具可直接识别思考与答案，不再依赖哨兵。
@@ -199,6 +200,65 @@ def _map_stop(reason: str | None) -> str:
         "length": "max_tokens",
         "content_filter": "end_turn",
     }.get(reason or "", "end_turn")
+
+
+def _map_stop_ollama(done_reason: str | None) -> str:
+    """Ollama 原生 /api/chat 的 done_reason → Anthropic stop_reason。"""
+    return {
+        "stop": "end_turn",
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+    }.get(done_reason or "", "end_turn")
+
+
+def _ollama_tool_calls_to_openai(tcs: Any) -> list[dict] | None:
+    """Ollama 原生 /api/chat 流式 tool_calls（无 index/id）转 OpenAI 增量格式，供 translator 复用。
+
+    Ollama 原生 tool_calls 形如 [{function:{name, arguments:"{...增量json}"}]，arguments 是
+    字符串增量；OpenAI 格式 translator 期望 {index, id, function:{name, arguments}}，二者兼容，
+    这里补上 index/id 即可。
+    """
+    if not tcs:
+        return None
+    out = []
+    for i, tc in enumerate(tcs):
+        f = tc.get("function") or {}
+        out.append({
+            "index": i,
+            "id": "tool_" + str(i),
+            "function": {"name": f.get("name", ""), "arguments": f.get("arguments", "") or ""},
+        })
+    return out
+
+
+def _openai_messages_to_ollama(messages: Any) -> list[dict]:
+    """把 OpenAI 格式的 messages（tool_calls.arguments 为 JSON 字符串，content 可能为 null）
+
+    转 Ollama 原生 /api/chat 格式（tool_calls.arguments 为对象、content 为空串而非 null）。
+    Ollama 原生端点拒绝字符串型 arguments（实测 HTTP 400），且对 null content 不友好。
+     debate 场景下 agent 历史含上一轮的 end_discussion tool_use（OpenAI 字符串格式），
+    必须转换否则 Ollama 直接 400 拒绝整轮请求。
+    """
+    out = []
+    for m in messages or []:
+        nm = dict(m)
+        if nm.get("content") is None:
+            nm["content"] = ""
+        tcs = m.get("tool_calls")
+        if tcs:
+            converted = []
+            for tc in tcs:
+                f = tc.get("function") or {}
+                arg = f.get("arguments")
+                if isinstance(arg, str):
+                    try:
+                        arg = json.loads(arg) if arg.strip() else {}
+                    except Exception:
+                        arg = {}
+                converted.append({"function": {"name": f.get("name", ""), "arguments": arg}})
+            nm["tool_calls"] = converted
+        out.append(nm)
+    return out
 
 
 def _estimate_input_tokens(body: dict) -> int:
@@ -408,11 +468,49 @@ def _non_stream_response(body: dict, oa_resp: dict) -> dict:
     }
 
 
+def _non_stream_response_ollama(body: dict, resp: dict) -> dict:
+    """把 Ollama 原生 /api/chat 非流式响应翻译为 Anthropic 非流式 Messages 响应。"""
+    msg = resp.get("message") or {}
+    content: list[dict] = []
+    reasoning = msg.get("thinking") or ""
+    text = msg.get("content") or ""
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning, "signature": _make_signature(body.get("model", ""), reasoning)})
+        if text:
+            content.append({"type": "text", "text": text})
+    elif text:
+        content.append({"type": "text", "text": text})
+    for tc in msg.get("tool_calls") or []:
+        f = tc.get("function") or {}
+        try:
+            inp = json.loads(f.get("arguments") or "{}")
+        except Exception:
+            inp = {}
+        content.append({"type": "tool_use", "id": tc.get("id") or ("tool_" + os.urandom(4).hex()),
+                        "name": _restore_mcp_name(f.get("name", "")), "input": inp})
+    pe = resp.get("prompt_eval_count")
+    ec = resp.get("eval_count")
+    usage = resp.get("usage") or {}
+    return {
+        "id": "msg_" + os.urandom(8).hex(),
+        "type": "message",
+        "role": "assistant",
+        "model": body.get("model"),
+        "stop_reason": _map_stop_ollama(resp.get("done_reason")),
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens") or pe or 0,
+            "output_tokens": usage.get("completion_tokens") or ec or 0,
+        },
+        "content": content,
+    }
+
+
 async def handle_messages(req: Request, settings: dict):
     """FastAPI 路由处理函数：POST /v1/messages。"""
     body = await req.json()
     oa = anthropic_to_openai(body)
-    url = _ollama_base_url(settings) + "/v1/chat/completions"
+    url = _ollama_base_url(settings) + "/api/chat"
 
     auth = req.headers.get("x-api-key") or req.headers.get("authorization", "")
     headers = {"Content-Type": "application/json"}
@@ -421,20 +519,31 @@ async def handle_messages(req: Request, settings: dict):
 
     want_stream = bool(body.get("stream", True))
 
+    # 走 Ollama 原生 /api/chat 端点（非 OpenAI 兼容端点）：只有原生端点接受 options.num_ctx，
+    # 才能由本网关控制上下文长度（KV cache 上限），**不影响 Ollama GUI/全局配置**。实测 OpenAI
+    # 兼容端点忽略 num_ctx/options.num_ctx，会把上下文拉满模型原生 128k（deepseek-r1:14b 单份
+    # 吃掉 ~34GB）。默认 16384 对辩论场景足够，且把单份显存压到 ~12GB。
+    num_ctx = int(settings.get("ollama_num_ctx") or 16384)
+    ollama_body = {
+        "model": oa.get("model"),
+        "messages": _openai_messages_to_ollama(oa.get("messages")),
+        "options": {"num_ctx": num_ctx},
+        "stream": want_stream,
+    }
+    if oa.get("temperature") is not None:
+        ollama_body["options"]["temperature"] = oa["temperature"]
+    if oa.get("max_tokens") is not None:
+        ollama_body["options"]["num_predict"] = oa["max_tokens"]
+
     if not want_stream:
         async with httpx.AsyncClient(timeout=600) as client:
-            r = await client.post(url, json=oa, headers=headers)
+            r = await client.post(url, json=ollama_body, headers=headers)
             r.raise_for_status()
-            return JSONResponse(_non_stream_response(body, r.json()))
-
-    oa["stream"] = True
-    # 请求 Ollama 在流末 chunk 返回真实 usage（OpenAI 标准字段，Ollama 已支持），
-    # 使 transcript 里 input/output tokens 非 0（问题：UI 工具显示「输入 0 输出 0」）。
-    oa["stream_options"] = {"include_usage": True}
+            return JSONResponse(_non_stream_response_ollama(body, r.json()))
 
     async def gen():
         async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream("POST", url, json=oa, headers=headers) as r:
+            async with client.stream("POST", url, json=ollama_body, headers=headers) as r:
                 if r.status_code >= 400:
                     err = await r.aread()
                     try:
@@ -463,16 +572,27 @@ async def handle_messages(req: Request, settings: dict):
                         chunk = json.loads(data)
                     except Exception:
                         continue
-                    choice = (chunk.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    if chunk.get("usage"):
-                        translator.usage = chunk["usage"]
-                    if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content") or delta.get("tool_calls"):
+                    # Ollama 原生 /api/chat：增量在 chunk["message"]（content/thinking）；
+                    # done 事件在顶层带 done/done_reason/prompt_eval_count/eval_count（无 usage 键）。
+                    if chunk.get("done"):
+                        pe = chunk.get("prompt_eval_count")
+                        ec = chunk.get("eval_count")
+                        if pe is not None or ec is not None:
+                            translator.usage = {"prompt_tokens": pe or 0, "completion_tokens": ec or 0}
+                        dr = chunk.get("done_reason")
+                        if dr and not translator.stop_reason:
+                            translator.stop_reason = _map_stop_ollama(dr)
+                        continue
+                    msg = chunk.get("message") or {}
+                    delta = {
+                        "content": msg.get("content") or "",
+                        "reasoning": msg.get("thinking") or "",
+                        "tool_calls": _ollama_tool_calls_to_openai(msg.get("tool_calls")),
+                    }
+                    if delta["content"] or delta["reasoning"] or delta["tool_calls"]:
                         got_any = True
                     for ev in translator.feed(delta):
                         yield _sse_event(ev)
-                    if choice.get("finish_reason") and not translator.stop_reason:
-                        translator.stop_reason = _map_stop(choice["finish_reason"])
                 if not got_any and not (translator.usage or {}).get("completion_tokens"):
                     # HTTP 200 但空流/畸形流：claude-code 会把这种情况渲染成普通文本
                     # 「API Error: API returned an empty or malformed response ...」混进正文，

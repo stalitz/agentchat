@@ -96,6 +96,7 @@ def get_settings() -> dict:
         "default_model": pinned if pinned else detect_claude_default_model(),
         "default_model_codex": pinned_codex if pinned_codex else detect_codex_default_model(),
         "ollama_base_url": s.get("ollama_base_url", "http://localhost:11434"),
+        "ollama_num_ctx": int(s.get("ollama_num_ctx", 16384)),
     }
 
 

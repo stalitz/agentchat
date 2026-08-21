@@ -298,6 +298,7 @@ class _FakeOllamaCtx:
 
 
 class _FakeOllamaClient:
+    """模拟 Ollama 原生 /api/chat 流式响应（增量在 message.content，done 事件带计数）。"""
     def __init__(self, *a, **k):
         pass
     async def __aenter__(self):
@@ -306,8 +307,42 @@ class _FakeOllamaClient:
         return False
     def stream(self, method, url, json=None, headers=None):
         return _FakeOllamaCtx([
-            'data: {"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}',
-            'data: [DONE]',
+            'data: {"message":{"role":"assistant","content":"你好"}}',
+            'data: {"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":2}',
+        ])
+
+
+class _FakeOllamaClientThinkingTool:
+    """模拟 Ollama 原生 /api/chat：thinking → text → tool_calls → done(tool_calls)。"""
+    def __init__(self, *a, **k):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    def stream(self, method, url, json=None, headers=None):
+        return _FakeOllamaCtx([
+            'data: {"message":{"role":"assistant","thinking":"让我想想"}}',
+            'data: {"message":{"role":"assistant","content":"结论"}}',
+            'data: {"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"end_discussion","arguments":"{\\"reason\\":\\"x\\"}"}}]}}',
+            'data: {"done":true,"done_reason":"tool_calls","prompt_eval_count":10,"eval_count":3}',
+        ])
+
+
+class _FakeCaptureBody:
+    """捕获发给 Ollama 的请求体，验证 options.num_ctx 注入。"""
+    captured: dict = {}
+    def __init__(self, *a, **k):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    def stream(self, method, url, json=None, headers=None):
+        _FakeCaptureBody.captured = json or {}
+        return _FakeOllamaCtx([
+            'data: {"message":{"role":"assistant","content":"ok"}}',
+            'data: {"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}',
         ])
 
 
@@ -349,7 +384,11 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         try:
             async def run():
                 resp = await gateway.handle_messages(
-                    _FakeRequest({"model": "gemma", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
+                    ], "stream": True}),
                     {"ollama_base_url": "http://x"},
                 )
                 self.assertEqual(resp.media_type, "text/event-stream")
@@ -376,7 +415,11 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         try:
             async def run():
                 resp = await gateway.handle_messages(
-                    _FakeRequest({"model": "gemma", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
+                    ], "stream": True}),
                     {"ollama_base_url": "http://x"},
                 )
                 out = "".join([c async for c in resp.body_iterator])
@@ -396,7 +439,11 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         try:
             async def run():
                 resp = await gateway.handle_messages(
-                    _FakeRequest({"model": "gemma", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
+                    ], "stream": True}),
                     {"ollama_base_url": "http://x"},
                 )
                 out = "".join([c async for c in resp.body_iterator])
@@ -410,6 +457,139 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         # message_start 已先行发出（防 claude 首事件超时），随后才 error
         self.assertLess(out.index("message_start"), out.index("event: error"),
                         "message_start 应先发，claude 才不至于误判空响应")
+
+
+class TestOllamaNativeGateway(unittest.TestCase):
+    """原生 /api/chat 端点（options.num_ctx 控制上下文）相关测试。"""
+
+    def test_ollama_tool_calls_to_openai(self):
+        # Ollama 原生 tool_calls（无 index/id）→ OpenAI 增量格式，供 translator 复用
+        out = gateway._ollama_tool_calls_to_openai([
+            {"function": {"name": "end_discussion", "arguments": '{"reason":"x"}'}},
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["index"], 0)
+        self.assertEqual(out[0]["id"], "tool_0")
+        self.assertEqual(out[0]["function"]["name"], "end_discussion")
+        self.assertEqual(out[0]["function"]["arguments"], '{"reason":"x"}')
+        self.assertIsNone(gateway._ollama_tool_calls_to_openai(None))
+
+    def test_openai_messages_to_ollama(self):
+        # 历史含 OpenAI 格式 tool_calls（arguments 字符串、content null）→ Ollama 原生格式
+        #（arguments 对象、content 空串），否则 Ollama /api/chat 直接 400 拒绝
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "t1", "type": "function",
+                             "function": {"name": "end_discussion", "arguments": '{"reason":"x"}'}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "已收到"},
+        ]
+        out = gateway._openai_messages_to_ollama(msgs)
+        self.assertEqual(out[0], msgs[0])
+        self.assertEqual(out[1]["content"], "", "null content 应转为空串")
+        tc = out[1]["tool_calls"][0]
+        self.assertEqual(tc["function"]["name"], "end_discussion")
+        self.assertEqual(tc["function"]["arguments"], {"reason": "x"}, "arguments 字符串应解析为对象")
+        self.assertNotIn("id", tc, "Ollama 原生不需要 id/type")
+        self.assertEqual(out[2]["role"], "tool")
+        self.assertEqual(out[2]["content"], "已收到")
+
+    def test_map_stop_ollama(self):
+        self.assertEqual(gateway._map_stop_ollama("stop"), "end_turn")
+        self.assertEqual(gateway._map_stop_ollama("tool_calls"), "tool_use")
+        self.assertEqual(gateway._map_stop_ollama("length"), "max_tokens")
+        self.assertEqual(gateway._map_stop_ollama("unknown"), "end_turn")
+
+    def test_non_stream_response_ollama(self):
+        # Ollama 原生非流式响应（message.thinking/content/tool_calls + prompt_eval_count/eval_count）
+        # → Anthropic Messages 响应
+        resp = {
+            "message": {"role": "assistant", "thinking": "推理", "content": "答案",
+                        "tool_calls": [{"function": {"name": "read", "arguments": '{"path":"/x"}'}}]},
+            "done_reason": "tool_calls", "prompt_eval_count": 7, "eval_count": 4,
+        }
+        a = gateway._non_stream_response_ollama({"model": "gemma"}, resp)
+        self.assertEqual(a["type"], "message")
+        # thinking 块在 answer 块之前
+        self.assertEqual(a["content"][0], {"type": "thinking", "thinking": "推理", "signature": a["content"][0]["signature"]})
+        self.assertEqual(a["content"][1], {"type": "text", "text": "答案"})
+        self.assertEqual(a["content"][2]["type"], "tool_use")
+        self.assertEqual(a["content"][2]["name"], "read")
+        self.assertEqual(a["content"][2]["input"], {"path": "/x"})
+        self.assertEqual(a["stop_reason"], "tool_use")
+        # 原生计数映射到 Anthropic usage
+        self.assertEqual(a["usage"]["input_tokens"], 7)
+        self.assertEqual(a["usage"]["output_tokens"], 4)
+
+    def test_stream_route_injects_num_ctx(self):
+        # 请求必须发往 /api/chat 且带 options.num_ctx（默认 16384）
+        orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeCaptureBody
+        try:
+            async def run():
+                resp = await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
+                    ], "stream": True}),
+                    {"ollama_base_url": "http://x"},
+                )
+                return "".join([c async for c in resp.body_iterator])
+            asyncio.run(run())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        body = _FakeCaptureBody.captured
+        self.assertTrue(body.get("model") == "gemma")
+        self.assertEqual(body["options"]["num_ctx"], 16384, "默认 num_ctx 应为 16384")
+        # 历史 tool_calls 必须转为 Ollama 原生（arguments 对象），否则 Ollama 400 拒绝整轮
+        hist = [m for m in body["messages"] if m.get("tool_calls")]
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["tool_calls"][0]["function"]["arguments"], {"reason": "x"})
+        # 覆盖 settings 生效
+        gateway.httpx.AsyncClient = _FakeCaptureBody
+        try:
+            async def run2():
+                resp = await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
+                    ], "stream": True}),
+                    {"ollama_base_url": "http://x", "ollama_num_ctx": 8192},
+                )
+                return "".join([c async for c in resp.body_iterator])
+            asyncio.run(run2())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        self.assertEqual(_FakeCaptureBody.captured["options"]["num_ctx"], 8192, "settings.ollama_num_ctx 应覆盖默认")
+
+    def test_stream_route_parses_ollama_native_thinking_and_tool(self):
+        # 原生 /api/chat 流式（thinking→text→tool_calls→done）应被正确翻译为 Anthropic SSE
+        orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeOllamaClientThinkingTool
+        try:
+            async def run():
+                resp = await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "hi"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
+                    ], "stream": True}),
+                    {"ollama_base_url": "http://x"},
+                )
+                return "".join([c async for c in resp.body_iterator])
+            out = asyncio.run(run())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        self.assertIn("message_start", out)
+        self.assertIn("thinking_delta", out, "原生 thinking 块应产出 thinking_delta")
+        self.assertIn("text_delta", out)
+        self.assertIn("tool_use", out, "tool_calls 应翻译为 tool_use 块")
+        self.assertIn("message_stop", out)
+        self.assertIn('"input_tokens": 10', out, "done 事件 prompt_eval_count 应回填 usage")
+        self.assertIn('"output_tokens": 3', out)
+        self.assertLess(out.index("thinking_delta"), out.index("tool_use"), "思考块应在工具块之前")
 
 
 if __name__ == "__main__":

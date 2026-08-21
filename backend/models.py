@@ -33,7 +33,8 @@ class AppSettings(BaseModel):
     default_max_rounds: int = 12        # 辩论模式默认轮次上限，全局生效（composer 轮次输入默认值来源）
     default_model: str = ""             # claude-code 默认模型名（留空=自动探测 Claude Code 当前默认；用于展示，pin 后可覆盖）
     default_model_codex: str = ""       # codex 默认模型名（留空=自动探测 Codex 当前默认；用于展示，pin 后可覆盖）
-    ollama_base_url: str = "http://localhost:11434"  # 内置网关转发目标（只读 Ollama 的 OpenAI 兼容端点，不改 Ollama 配置）
+    ollama_base_url: str = "http://localhost:11434"  # 内置网关转发目标（走 Ollama 原生 /api/chat，可传 options.num_ctx 控制上下文，不改 Ollama 全局配置）
+    ollama_num_ctx: int = 16384                      # 发给 Ollama 的上下文长度（KV cache 上限）；仅本网关生效，不影响 Ollama GUI/全局设置
 
 
 class ProjectConfig(BaseModel):
