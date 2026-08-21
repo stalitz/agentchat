@@ -205,11 +205,15 @@ class Session:
         # 保证每个 agent 都看得到全体其他参与者的观点，而非只看到紧邻上一个（信息对称）。
         # 2 agent 时本方法结果与旧「只取紧邻上家」等价（对方上一句 = 全部增量），无需特判。
         # agent 的持续会话已记住自身历史与历次议题，故只回传「他人增量」，不回传本方旧发言。
-        if round_i > 0:
-            my_idx = -1
-            for i, m in enumerate(self.history):
-                if m.get("speaker") == agent.name:
-                    my_idx = i
+        # 全新会话首轮（history 只有 human 任务、本方从未发言）others 为空 → 自然不回传；
+        # 续接场景（同会话内再次 start）round_i 重新从 0 开始，但本方已发过言（my_idx>=0），
+        # 必须回传「本方上次发言之后的他人增量」——否则续接首轮收不到对方在上一场末尾的
+        # 发言（象棋g+ 实测：g1 续接时缺 g2 的红3 马3进4，误当新一轮重新开局）。
+        my_idx = -1
+        for i, m in enumerate(self.history):
+            if m.get("speaker") == agent.name:
+                my_idx = i
+        if round_i > 0 or my_idx >= 0:
             others = [
                 m for m in self.history[my_idx + 1:]
                 if m.get("speaker") not in (agent.name, "system", "human")

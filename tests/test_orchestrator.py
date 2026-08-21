@@ -849,5 +849,33 @@ class TestOrchestrator(unittest.TestCase):
         p4 = s2._build_prompt(a1, "任务", round_i=1)
         self.assertNotIn("附加规则", p4)
 
+    def test_continue_session_first_turn_includes_peer_delta(self):
+        # 续接场景（同会话再次 start）：round_i 重新从 0 开始，但本方已发过言——
+        # 首轮必须回传「本方上次发言之后的他人增量」，否则续接首轮收不到对方末尾发言，
+        # 误当新一轮重新开始（象棋g+ 实测：g1 缺 g2 的红3 马3进4 重新开局）
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        a3 = models.AgentConfig(name="C", type="fake")
+        s, _ = make_session([a1, a2, a3], self.proj, self.sid)
+        s.history = [
+            {"speaker": "human", "role": "任务", "content": "任务"},
+            {"speaker": "A", "role": "x", "content": "A1"},
+            {"speaker": "B", "role": "x", "content": "B1"},
+            {"speaker": "C", "role": "x", "content": "C1"},
+            {"speaker": "A", "role": "x", "content": "A2"},
+            {"speaker": "B", "role": "x", "content": "B2"},
+            {"speaker": "C", "role": "x", "content": "C2"},
+        ]
+        # A 最后一次发言 = index3(A2)；其后 B2/C2 必须回传给续接首轮的 A
+        p = s._build_prompt(a1, "继续之前的棋局", round_i=0)
+        self.assertIn("B2", p, "续接首轮应回传 A 上次发言后的 B 增量")
+        self.assertIn("C2", p, "续接首轮应回传 A 上次发言后的 C 增量")
+        self.assertNotIn("A2", p, "本方旧发言不应回传")
+        # 全新会话首轮（本方从未发言）仍不回传 delta
+        s2, _ = make_session([a1, a2], self.proj, self.sid)
+        s2.history = [{"speaker": "human", "role": "任务", "content": "任务"}]
+        p2 = s2._build_prompt(a1, "任务", round_i=0)
+        self.assertNotIn("其他 agent 的发言", p2, "全新会话首轮无他人发言，不应回传 delta")
+
 if __name__ == "__main__":
     unittest.main()

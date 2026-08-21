@@ -488,9 +488,12 @@ function handleEvent(ev) {
       if (!curPid) break;
       refreshSessionList(curPid);
       if (!ev.sid || ev.mode === 'chat') break;  // chat 模式只刷新列表；无 sid 的旧事件兼容
-      // 辩论模式：当前会话自己跑完，重载为持久化后的权威内容
+      // 辩论模式：当前会话自己跑完，重载为持久化后的权威内容（250ms 避开流式收尾）。
+      // 若用户已立即点「继续」重新开跑（running=true）则跳过重载——否则 openSession 清空
+      // 聊天区会把续接首个 agent 刚流式渲染的内容抹掉（象棋g+ 实测：g1 输出消失、刷新才见）。
       setTimeout(function () {
-        loadProjectSessions(curPid).then(function () { if (curSid) openSession(curSid); });
+        if (runningBySid[curSid]) return;
+        openSession(curSid);
       }, 250);
       break;
     case 'human': addRow('human', ev.role || '人工介入', ev.text); break;
