@@ -187,6 +187,25 @@
   .fs-item.up { color:var(--codex); font-style:italic; }
   .fs-enter { color:var(--muted); font-size:12px; }
   .fs-empty { padding:10px; color:var(--muted); font-size:13px; }
+
+  /* ---- 现代设置面板（全局设置）---- */
+  .set-head { padding:20px 22px 14px; border-bottom:1px solid var(--line); background:linear-gradient(180deg,#fafbff,#fff); }
+  .set-title { font-size:18px; font-weight:700; color:var(--txt); }
+  .set-sub { font-size:12px; color:var(--muted); margin-top:4px; }
+  .set-section { padding:16px 22px 2px; font-size:11px; font-weight:700; letter-spacing:.06em; color:var(--muted); text-transform:uppercase; }
+  .set-grid { display:grid; grid-template-columns:1fr 1fr; gap:13px 16px; padding:9px 22px 4px; }
+  .set-field { display:flex; flex-direction:column; min-width:0; }
+  .set-field.wide { grid-column:1 / -1; }
+  .set-label { font-size:13px; font-weight:600; color:var(--txt); margin-bottom:6px; }
+  .set-input { width:100%; box-sizing:border-box; font-size:14px; padding:9px 11px; border:1px solid var(--line);
+               border-radius:9px; background:#fff; color:var(--txt); transition:border-color .12s, box-shadow .12s; }
+  .set-input:focus { outline:none; border-color:var(--claude); box-shadow:0 0 0 3px rgba(47,109,246,.15); }
+  .set-help { font-size:11.5px; color:var(--muted); margin-top:5px; line-height:1.45; }
+  .set-foot { display:flex; justify-content:flex-end; gap:10px; padding:18px 22px 20px; }
+  .set-cancel { background:#fff; border:1px solid var(--line); color:var(--txt); padding:8px 18px; border-radius:9px; font-size:13px; }
+  .set-cancel:hover { background:#f1f3f7; }
+  .set-save { padding:8px 20px; border-radius:9px; font-size:13px; font-weight:600; }
+  @media (max-width:560px) { .set-grid { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -1455,32 +1474,61 @@ function sel(id, label, opts, sel0) {
   }).join('');
   return '<label>' + label + '<br><select id="' + id + '" style="width:100%; box-sizing:border-box;">' + html + '</select></label>';
 }
-function closeModal() { document.getElementById('modal').classList.remove('show'); }
+function closeModal() {
+  document.getElementById('modal').classList.remove('show');
+  var c = document.getElementById('modalCard');
+  if (c) c.style.cssText = '';   // 清掉设置面板等临时内联样式，避免影响后续弹窗
+}
 
 // ---- 全局设置（timeout / 默认轮次等 App 级配置）----
 function openSettings() {
   var c = document.getElementById('modalCard');
-  var dt = (cfg.settings && cfg.settings.default_timeout) ? cfg.settings.default_timeout : 300;
-  var dmr = (cfg.settings && cfg.settings.default_max_rounds) ? cfg.settings.default_max_rounds : 12;
-  var dm = (cfg.settings && cfg.settings.default_model) ? cfg.settings.default_model : '';
-  var dmc = (cfg.settings && cfg.settings.default_model_codex) ? cfg.settings.default_model_codex : '';
-  c.innerHTML = '<h3>全局设置</h3>' +
-    f('gTimeout', '单轮静默超时(秒)', dt) +
-    '<div class="hint">某个 agent 连续这么久不输出新内容，就判定卡死并终止该轮。流式输出过程中不会触发。</div>' +
-    f('gMaxRounds', '辩论模式默认轮次上限', dmr) +
-    '<div class="hint">发起讨论时「最大轮次」输入框的默认值；仅对尚未手动改过的会话生效。改完点保存即全局生效，无需重启。</div>' +
-    f('gDefaultModel', 'Claude Code 默认模型(可选)', dm) +
-    '<div class="hint">claude-code 类型 agent 未单独填「模型」时，左栏/配置中显示的默认模型名。' +
-    '留空则自动探测 Claude Code 当前默认（读 ANTHROPIC_DEFAULT_MODEL 或 ~/.claude/settings.json）。填了则以此为准并展示。</div>' +
-    f('gDefaultModelCodex', 'Codex 默认模型(可选)', dmc) +
-    '<div class="hint">codex 类型 agent 未单独填「模型」时显示的默认模型名。' +
-    '留空则自动探测 Codex 当前默认（读 CODEX_MODEL/OPENAI_MODEL 或 ~/.codex/config.toml）。填了则以此为准并展示。</div>' +
-    f('gOllama', 'Ollama 地址(内置网关用)', (cfg.settings && cfg.settings.ollama_base_url) ? cfg.settings.ollama_base_url : 'http://localhost:11434') +
-    '<div class="hint">内置 Anthropic→Ollama 翻译网关转发到的 Ollama OpenAI 兼容端点。' +
-    '仅被读取、<b>不改 Ollama 自身配置</b>；默认 http://localhost:11434（Ollama 默认端口）。若你的 Ollama 在别的地址/端口，改这里即可。</div>' +
-    '<div style="display:flex; gap:8px; margin-top:4px;">' +
-    '<button class="primary" onclick="submitSettings()">保存</button>' +
-    '<button onclick="closeModal()">取消</button></div>';
+  var s = cfg.settings || {};
+  var dt = s.default_timeout != null ? s.default_timeout : 300;
+  var dmr = s.default_max_rounds != null ? s.default_max_rounds : 12;
+  var dm = s.default_model || '';
+  var dmc = s.default_model_codex || '';
+  var ol = s.ollama_base_url || 'http://localhost:11434';
+  function field(id, label, def, help, type, wide) {
+    type = type || 'text';
+    def = def == null ? '' : String(def);
+    var safe = def.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return '<div class="set-field' + (wide ? ' wide' : '') + '">' +
+      '<label class="set-label" for="' + id + '">' + label + '</label>' +
+      '<input id="' + id + '" class="set-input" type="' + type + '" value="' + safe + '">' +
+      (help ? '<div class="set-help">' + help + '</div>' : '') +
+      '</div>';
+  }
+  c.innerHTML =
+    '<div class="set-head">' +
+      '<div class="set-title">全局设置</div>' +
+      '<div class="set-sub">对所有讨论统一生效 · 保存即生效，无需重启</div>' +
+    '</div>' +
+    '<div class="set-section">讨论参数</div>' +
+    '<div class="set-grid">' +
+      field('gTimeout', '单轮静默超时（秒）', dt, '某 agent 久不输出即判卡死并终止该轮', 'number') +
+      field('gMaxRounds', '辩论默认轮次上限', dmr, '新发起讨论的预填值，手动改过则不覆盖', 'number') +
+    '</div>' +
+    '<div class="set-section">默认模型</div>' +
+    '<div class="set-grid">' +
+      field('gDefaultModel', 'Claude Code', dm, '留空＝自动探测 Claude Code 当前默认') +
+      field('gDefaultModelCodex', 'Codex', dmc, '留空＝自动探测 Codex 当前默认') +
+    '</div>' +
+    '<div class="set-section">内置网关</div>' +
+    '<div class="set-grid">' +
+      field('gOllama', 'Ollama 地址', ol, '仅被读取，不改 Ollama 自身配置（默认 11434）', 'text', true) +
+    '</div>' +
+    '<div class="set-foot">' +
+      '<button class="set-cancel" onclick="closeModal()">取消</button>' +
+      '<button class="primary set-save" onclick="submitSettings()">保存</button>' +
+    '</div>';
+  // 临时撑宽弹窗（设置面板专用），closeModal 时清掉
+  c.style.width = 'min(560px, 92vw)';
+  c.style.padding = '0';
+  c.style.borderRadius = '16px';
+  c.style.overflow = 'hidden';
+  c.style.boxShadow = '0 14px 44px rgba(20,30,60,.20)';
+  c.style.gap = '0';
   document.getElementById('modal').classList.add('show');
 }
 function submitSettings() {
@@ -1500,8 +1548,16 @@ function submitSettings() {
     })
     .catch(function (e) { setStatus('保存失败: ' + e.message, false); });
 }
+// 点遮罩关闭：但拖选文字（在卡片内按下、拖到卡片外松手）会误触发 click，
+// 且选中文字期间不应关闭设置框，故存在活跃选区时不关闭。
+function _backdropClose(e) {
+  if (e.target !== this) return;
+  var sel = (window.getSelection && window.getSelection()) || '';
+  if (sel && sel.toString && sel.toString().trim().length) return;
+  this.classList.remove('show');
+}
 ['modal', 'newModal', 'fsModal'].forEach(function (id) {
-  document.getElementById(id).addEventListener('click', function (e) { if (e.target === this) this.classList.remove('show'); });
+  document.getElementById(id).addEventListener('click', _backdropClose);
 });
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') { ['modal', 'newModal', 'fsModal'].forEach(function (id) { document.getElementById(id).classList.remove('show'); }); }

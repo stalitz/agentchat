@@ -215,6 +215,18 @@ setTimeout(async () => {
   const mrComposer = doc.getElementById('maxRounds');
   check(mrComposer && mrComposer.value === '20' && !mrComposer.disabled,
     '辩论模式下 composer 的「最大轮次」默认值应等于全局默认(20)，实际 ' + (mrComposer && mrComposer.value));
+  // ---- 遮罩点击关闭：拖选文字后松手不应误关设置框（历史 bug：选中文字鼠标滑出设置框即消失）----
+  const sModal = doc.getElementById('modal');
+  const sSel = doc.defaultView.getSelection();
+  const sRg = doc.createRange();
+  sRg.selectNodeContents(doc.getElementById('modalCard'));   // modalCard 含「全局设置」等文本
+  sSel.removeAllRanges(); sSel.addRange(sRg);
+  check(sSel.toString().length > 0, '准备：应为设置框内容建立文字选区');
+  sModal.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  check(sModal.classList.contains('show'), '选中文字后点击遮罩不应关闭设置框');
+  sSel.removeAllRanges();
+  sModal.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  check(!sModal.classList.contains('show'), '无选中文字时点击遮罩应正常关闭设置框');
   dom.window.closeModal();
 
   // ---- 两栏折叠（项目栏 IDEA 风格「-」-> 图标栏；会话栏可折叠）----
