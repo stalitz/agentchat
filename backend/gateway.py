@@ -223,10 +223,18 @@ def _ollama_tool_calls_to_openai(tcs: Any) -> list[dict] | None:
     out = []
     for i, tc in enumerate(tcs):
         f = tc.get("function") or {}
+        arg = f.get("arguments")
+        # Ollama 原生 /api/chat 的 tool_calls.arguments 可能是字符串增量（旧模型），
+        # 也可能是对象（gemma4 实测返回对象）。translator 需要字符串 partial_json，
+        # 故对象统一 json.dumps 成字符串，避免下游把 dict 当 partial_json 出错
+        if isinstance(arg, dict):
+            arg = json.dumps(arg, ensure_ascii=False)
+        elif arg is None:
+            arg = ""
         out.append({
             "index": i,
             "id": "tool_" + str(i),
-            "function": {"name": f.get("name", ""), "arguments": f.get("arguments", "") or ""},
+            "function": {"name": f.get("name", ""), "arguments": arg},
         })
     return out
 
@@ -410,7 +418,10 @@ class _AnthropicTranslator:
             events.append({"type": "content_block_stop", "index": 1 if self._think_started else 0})
         for idx in sorted(self.tool_blocks):
             events.append({"type": "content_block_stop", "index": self.tool_blocks[idx]["our"]})
-        stop = self.stop_reason or ("tool_use" if self.tool_blocks else "end_turn")
+        # 只要本轮产了 tool_use 块，stop_reason 必须为 tool_use——即使 Ollama 原生端点把
+        # done_reason 标成 stop（gemma4 实测：产出 tool_calls 但 done_reason="stop"）。否则
+        # claude-code 会因 end_turn 而不回传工具结果，终止逻辑失效
+        stop = "tool_use" if self.tool_blocks else (self.stop_reason or "end_turn")
         usage = self.usage or {}
         events.append({
             "type": "message_delta",
@@ -530,6 +541,12 @@ async def handle_messages(req: Request, settings: dict):
         "options": {"num_ctx": num_ctx},
         "stream": want_stream,
     }
+    if oa.get("tools"):
+        # 真工具调用路径：把 anthropic_to_openai 过滤后的 end_discussion 工具定义透传给
+        # Ollama 原生端点（其 tools 格式与 OpenAI 一致：{type:function, function:{name,
+        # description, parameters}}）。漏传则 gemma 收不到工具定义、永不产出 tool_calls
+        # （8e0eef0 改原生 /api/chat 时把请求体重写为手工 ollama_body，漏掉 tools，回归）。
+        ollama_body["tools"] = oa["tools"]
     if oa.get("temperature") is not None:
         ollama_body["options"]["temperature"] = oa["temperature"]
     if oa.get("max_tokens") is not None:
@@ -563,13 +580,18 @@ async def handle_messages(req: Request, settings: dict):
                     yield _sse_event(ev)
                 got_any = False  # 是否收到过任何内容增量（空流检测）
                 async for line in r.aiter_lines():
-                    if not line or not line.startswith("data:"):
+                    line = line.strip()
+                    if not line:
                         continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
+                    # Ollama 原生 /api/chat 流式为不带 data: 前缀的纯 JSON 行（OpenAI 兼容端点
+                    # 才带 data: 前缀）。之前强制要求 data: 前缀会把原生端点整行跳过 → 空流
+                    # （8e0eef0 的测试用带 data: 前缀的假数据，掩盖了这一真 bug）。兼容两种格式。
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                        if not line or line == "[DONE]":
+                            continue
                     try:
-                        chunk = json.loads(data)
+                        chunk = json.loads(line)
                     except Exception:
                         continue
                     # Ollama 原生 /api/chat：增量在 chunk["message"]（content/thinking）；

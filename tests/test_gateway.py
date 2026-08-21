@@ -329,6 +329,25 @@ class _FakeOllamaClientThinkingTool:
         ])
 
 
+class _FakeOllamaClientNativeNoPrefix:
+    """模拟 Ollama 原生 /api/chat 真实流式格式：不带 data: 前缀的纯 JSON 行
+    （8e0eef0 的假数据带 data: 前缀，掩盖了网关要求 data: 前缀导致空流的 bug）。
+    同时 tool_calls.arguments 用对象（gemma4 实测返回对象），覆盖参数类型兼容。"""
+    def __init__(self, *a, **k):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    def stream(self, method, url, json=None, headers=None):
+        return _FakeOllamaCtx([
+            '{"message":{"role":"assistant","thinking":"让我想想"}}',
+            '{"message":{"role":"assistant","content":"结论"}}',
+            '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"end_discussion","arguments":{"reason":"x"}}}]}}',
+            '{"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":3}',
+        ])
+
+
 class _FakeCaptureBody:
     """捕获发给 Ollama 的请求体，验证 options.num_ctx 注入。"""
     captured: dict = {}
@@ -590,6 +609,79 @@ class TestOllamaNativeGateway(unittest.TestCase):
         self.assertIn('"input_tokens": 10', out, "done 事件 prompt_eval_count 应回填 usage")
         self.assertIn('"output_tokens": 3', out)
         self.assertLess(out.index("thinking_delta"), out.index("tool_use"), "思考块应在工具块之前")
+
+    def test_stream_route_forwards_tools_to_ollama(self):
+        # 真工具调用路径：请求带 end_discussion 工具时，必须透传给 Ollama 原生 /api/chat，
+        # 否则 gemma 收不到工具定义、永不产出 tool_calls（8e0eef0 改原生端点时漏传，回归）。
+        # 这里端到端经过 anthropic_to_openai（过滤+去前缀+input_schema→parameters）再发出。
+        orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeCaptureBody
+        try:
+            async def run():
+                resp = await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma", "messages": [
+                        {"role": "user", "content": "我们达成一致了吗"},
+                    ], "stream": True,
+                    "tools": [
+                        {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
+                        {"name": "mcp__terminate-signal__end_discussion", "description": "d",
+                         "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}},
+                    ]}),
+                    {"ollama_base_url": "http://x"},
+                )
+                return "".join([c async for c in resp.body_iterator])
+            asyncio.run(run())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        body = _FakeCaptureBody.captured
+        self.assertIn("tools", body, "tools 必须透传给 Ollama，否则 gemma 无法调用 end_discussion")
+        names = [t["function"]["name"] for t in body["tools"]]
+        self.assertEqual(names, ["end_discussion"], "只转发 end_discussion 且去前缀")
+        self.assertNotIn("Bash", names, "claude 内置工具不转发")
+        self.assertNotIn("mcp__", names[0], "模型侧应为干净名")
+        self.assertEqual(body["tools"][0]["function"]["parameters"],
+                         {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
+                         "input_schema 应映射为 parameters 透传")
+
+    def test_ollama_tool_calls_arguments_object(self):
+        # gemma4 原生 /api/chat 返回 tool_calls.arguments 为对象（非字符串增量），
+        # 网关必须统一 json.dumps 成字符串 partial_json，否则下游把 dict 当 partial_json 出错
+        out = gateway._ollama_tool_calls_to_openai([
+            {"function": {"name": "end_discussion", "arguments": {"reason": "x"}}},
+        ])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "end_discussion")
+        self.assertEqual(out[0]["function"]["arguments"], '{"reason": "x"}', "对象 arguments 应转成字符串")
+        # 字符串 arguments 保持原样（旧模型增量格式）
+        out2 = gateway._ollama_tool_calls_to_openai([
+            {"function": {"name": "end_discussion", "arguments": '{"reason":"x"}'}},
+        ])
+        self.assertEqual(out2[0]["function"]["arguments"], '{"reason":"x"}')
+
+    def test_stream_route_parses_native_no_prefix(self):
+        # 真实 Ollama 原生 /api/chat 流式不带 data: 前缀，网关必须能解析（否则空流）；
+        # 同时覆盖 tool_calls.arguments 为对象的真实格式。断言翻译出 tool_use 块、无空流错误。
+        orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeOllamaClientNativeNoPrefix
+        try:
+            async def run():
+                resp = await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma4:26b", "messages": [
+                        {"role": "user", "content": "hi"},
+                    ], "stream": True,
+                    "tools": [{"name": "mcp__terminate-signal__end_discussion", "description": "d",
+                               "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}}]}),
+                    {"ollama_base_url": "http://x"},
+                )
+                return "".join([c async for c in resp.body_iterator])
+            out = asyncio.run(run())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        self.assertIn("tool_use", out, "无前缀原生流式应翻译出 tool_use 块")
+        self.assertIn("thinking_delta", out)
+        self.assertNotIn("empty or malformed stream", out, "不得再误判空流")
+        self.assertIn('"input_tokens": 10', out, "done 事件 usage 应回填")
+        self.assertIn('"stop_reason": "tool_use"', out, "有 tool_use 块时 stop_reason 必须为 tool_use（gemma4 实测 done_reason=stop）")
 
 
 if __name__ == "__main__":
