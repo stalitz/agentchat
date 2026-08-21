@@ -1585,6 +1585,7 @@ function openSettings() {
       '<div class="set-title">全局设置</div>' +
       '<div class="set-sub">对所有讨论统一生效 · 保存即生效，无需重启</div>' +
     '</div>' +
+    '<div class="set-body" style="flex:1; min-height:0; overflow-y:auto;">' +
     '<div class="set-section">讨论参数</div>' +
     '<div class="set-grid">' +
       field('gTimeout', '单轮静默超时（秒）', dt, '某 agent 久不输出即判卡死并终止该轮', 'number') +
@@ -1614,6 +1615,7 @@ function openSettings() {
       '<label class="set-label" for="gConsensus">共识终止提示词（辩论）</label>' +
       '<textarea id="gConsensus" class="set-input" rows="4" style="resize:vertical; font-family:monospace; font-size:12px;" placeholder="留空＝内置默认（先总结再调用 end_discussion 的两步法）">' + esc(pt) + '</textarea>' +
     '</div>' +
+    '</div>' +
     '<div class="set-foot">' +
       '<button class="set-cancel" onclick="closeModal()">取消</button>' +
       '<button class="primary set-save" onclick="submitSettings()">保存</button>' +
@@ -1625,6 +1627,10 @@ function openSettings() {
   c.style.overflow = 'hidden';
   c.style.boxShadow = '0 14px 44px rgba(20,30,60,.20)';
   c.style.gap = '0';
+  // 限高 + flex 纵向布局：头部/底部固定，中间内容区（set-body）独立滚动，长内容不裁切
+  c.style.display = 'flex';
+  c.style.flexDirection = 'column';
+  c.style.maxHeight = 'min(86vh, 620px)';
   document.getElementById('modal').classList.add('show');
 }
 function submitSettings() {

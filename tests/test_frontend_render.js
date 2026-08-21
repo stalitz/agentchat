@@ -235,6 +235,9 @@ setTimeout(async () => {
   check(!!doc.getElementById('gMaxOut'), '全局设置应提供 Claude 输出上限输入(gMaxOut)');
   check(!!doc.getElementById('gThink'), '全局设置应提供 Ollama 思考开关(gThink)');
   check(!!doc.getElementById('gConsensus'), '全局设置应提供共识终止提示词编辑(gConsensus)');
+  check(!!doc.querySelector('#modalCard .set-body'), '设置面板应有可滚动内容区(set-body)，长内容不被裁切');
+  check((doc.getElementById('modalCard') && doc.getElementById('modalCard').style.maxHeight) || '',
+    '设置卡片应限高(maxHeight)，保证滚动生效');
   const mrComposer = doc.getElementById('maxRounds');
   check(mrComposer && mrComposer.value === '20' && !mrComposer.disabled,
     '辩论模式下 composer 的「最大轮次」默认值应等于全局默认(20)，实际 ' + (mrComposer && mrComposer.value));
