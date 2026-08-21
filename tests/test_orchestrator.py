@@ -795,5 +795,34 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("B旧句", p2, "双 agent 仍应回传对方发言")
         self.assertNotIn("A旧句", p2, "双 agent 不应回传本方旧发言")
 
+    def test_second_agent_first_turn_gets_task_background(self):
+        # 任务只在 round0 注入第一个 agent；第二个 agent 首轮必须补「任务背景」，
+        # 否则它只看到上一 agent 发言、可能无法推断议题（象棋实测 d2 走偏、deepseek 急于中止疑同因）
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=2)
+        self.run_session(s, task="你们两个下象棋，黑先红后，文字走棋")
+        prompts = store.read_prompt_log(self.proj, self.sid)
+        b_first = next(p for p in prompts if p.get("agent") == "B" and p.get("round") == 1)
+        self.assertIn("你们两个下象棋", b_first["prompt"], "B 首轮应带任务背景")
+        # A 首轮（round0）经 inject 已含任务，不应重复出现「任务背景」块
+        a_first = next(p for p in prompts if p.get("agent") == "A" and p.get("round") == 0)
+        self.assertNotIn("任务背景", a_first["prompt"], "round0 的 inject 已是任务，不应重复注入")
+
+    def test_task_background_not_reinjected_each_turn(self):
+        # 用户明确：任务背景只在该 agent「首次发言」时带，非首轮不再重复搬运
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=2)
+        self.run_session(s, task="我们讨论人工智能")
+        prompts = store.read_prompt_log(self.proj, self.sid)
+        # B 首轮（round1）带任务背景；B 第二轮（round3）不应再带
+        b_first = next(p for p in prompts if p.get("agent") == "B" and p.get("round") == 1)
+        self.assertIn("任务背景", b_first["prompt"])
+        b_second = next(p for p in prompts if p.get("agent") == "B" and p.get("round") == 3)
+        self.assertNotIn("任务背景", b_second["prompt"], "非首轮不应重复搬运任务背景")
+        a_second = next(p for p in prompts if p.get("agent") == "A" and p.get("round") == 2)
+        self.assertNotIn("任务背景", a_second["prompt"], "A 已就本议题发言过，不应再带任务背景")
+
 if __name__ == "__main__":
     unittest.main()

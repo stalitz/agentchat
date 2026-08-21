@@ -207,6 +207,26 @@ class Session:
         # 任务 / 人工介入（本轮新议题通常经此传入）
         if inject:
             parts.append(f"人工介入 / 任务：\n{inject}")
+        # 任务背景补齐（2026-08-21）：任务只在 round0 经 inject 传给第一个 agent，
+        # 其他 agent 首轮若只看到 delta，可能无法从上一 agent 发言推断出议题——
+        # 象棋实测：d1 首轮直接走棋「炮8平5」不复述任务，d2 首轮把 CLI 系统提示的技能
+        # 列表误当议题，编出「代码仓库管理」总结并误调 end_discussion（deepseek 急于中止疑同因）。
+        # 故每个 agent「就当前议题首次发言」时补任务背景；非首轮不再带（避免每轮重复搬运）。
+        if inject is None:
+            task = (getattr(self, "_initial_task", "") or "").strip()
+            if task:
+                # 最后一条 human「任务」消息 = 当前议题（续接场景 history 混着旧议题）
+                task_idx = -1
+                for i, m in enumerate(self.history):
+                    if m.get("speaker") == "human" and m.get("role") == "任务":
+                        task_idx = i
+                my_last = -1
+                for i, m in enumerate(self.history):
+                    if m.get("speaker") == agent.name:
+                        my_last = i
+                # 该 agent 尚未就当前议题发过言 → 补任务背景
+                if my_last < task_idx:
+                    parts.append(f"任务背景（本场议题）：\n{task}")
         # 终止被拒回执：上一轮本方发起 end_discussion 因未达最小轮数被拒，明确告知模型继续，
         # 不要进入待命/等待状态（弱模型易把通用工具回执误解为「已终止」）
         if self._reject_inject and self._reject_inject[0] == agent.name:
@@ -581,6 +601,9 @@ class Session:
             type="system",
             msg=f"会话开始 · agent 数={len(self.agents)} · 上限 {self.max_rounds} 轮",
         )
+        # 记录本场议题：任务只在 round0 经 inject 传给第一个 agent，
+        # 后续 agent 首轮需要它作「任务背景」补齐（否则可能无法从上一 agent 发言推断议题，象棋实测走偏）。
+        self._initial_task = initial_task or ""
         if (initial_task or "").strip():
             await self._record_human(initial_task.strip(), "任务")
         round_i = 0
