@@ -504,6 +504,12 @@ function handleEvent(ev) {
       // 标记会话正在跑：任何入口（开始 / 继续 / 介入触发）只要后端开始流式发 turn_start 即视为
       // 在跑，保证 run_end 的 250ms 重载守卫生效，不会把续接首个 agent 刚渲染的内容抹掉。
       if (ev.sid) runningBySid[ev.sid] = true;
+      // 每轮开始必须清空上一轮的流式游标（cur/curThinking/curAnswer…）。否则若上轮因被打断
+      // 或报错而没发 turn_end，cur 仍指向旧气泡，本轮首个 thinking/token 会被 append 进旧气泡，
+      // 造成跨轮污染（实测：g2 被介入打断未发 turn_end，g1 内容合并进了 g2 气泡）。
+      hideLoading();
+      cur = null; curThinking = null; curThinkingBody = null;
+      curThinkingCnt = 0; curAnswer = null;
       // 立即显示「正在思考…」加载占位——agent 响应可能需数十秒（CLI 启动 / 本地模型
       // 冷启动 prefill），期间无 thinking/token 事件，没有占位用户会以为卡死。
       showLoading(ev.agent);
