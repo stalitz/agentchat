@@ -501,6 +501,9 @@ function handleEvent(ev) {
     case 'turn_start':
       agentNameColor[ev.agent] = ev.atype || 'claude-code';
       curTurnAgent = ev.agent;
+      // 标记会话正在跑：任何入口（开始 / 继续 / 介入触发）只要后端开始流式发 turn_start 即视为
+      // 在跑，保证 run_end 的 250ms 重载守卫生效，不会把续接首个 agent 刚渲染的内容抹掉。
+      if (ev.sid) runningBySid[ev.sid] = true;
       // 立即显示「正在思考…」加载占位——agent 响应可能需数十秒（CLI 启动 / 本地模型
       // 冷启动 prefill），期间无 thinking/token 事件，没有占位用户会以为卡死。
       showLoading(ev.agent);
@@ -983,7 +986,13 @@ function startSession() {
     document.getElementById('task').value = '';  // 内容已作为消息回显，输入框清空
   }).catch(function (e) { if (curSid) runningBySid[curSid] = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
 }
-function ctrl(a) { WS.send(JSON.stringify({ action: a, session_id: curSid })); }
+function ctrl(a) {
+  // 「继续」按钮走 resume：必须立即标记会话正在跑（与 startSession 一致），否则 run_end 的
+  // 250ms 重载守卫（if (runningBySid[curSid]) return）对续接路径永远失效——续接首个 agent
+  // 刚流式渲染的内容会被重载抹掉（g1 输出消失）。startSession 已在发送前置位，resume 此前漏了。
+  if (a === 'resume' && curSid) { runningBySid[curSid] = true; refreshSendBtn(); }
+  WS.send(JSON.stringify({ action: a, session_id: curSid }));
+}
 function doInject() {
   var x = document.getElementById('inject').value.trim();
   if (!x) { setStatus('介入内容为空', false); return; }
