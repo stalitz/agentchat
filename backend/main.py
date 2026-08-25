@@ -163,9 +163,13 @@ async def handle_start(msg: dict):
         tone = ""  # 未知调名忽略（防脏数据）
     if not sid:
         title = (msg.get("task") or "").strip()[:24] or "新会话"
-        sid = store.create_session(proj["path"], title)["id"]
+        sid = store.create_session(proj["path"], title, msg.get("team_id"))["id"]
     if tone:
         store.set_session_tone(proj["path"], sid, tone)
+    # 持久化发起/续跑实际选用的 Team：首轮若用户在 composer 切了 Team（或「新建会话」弹窗选了
+    # 非默认 Team）必须落库，否则 stored team_id 停留在创建默认 teams[0]，重开会话会被静默降级成
+    # 2 agent（实测五子棋会话：首跑 3g 但 stored=2g，续跑无裁判）。每次发起都按当前选择写回。
+    store.update_session_team(proj["path"], sid, msg.get("team_id"))
     sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout, tone=tone)
     sessions[sid] = sess  # 注册；结束后保留（running=False，可继续/复用）
     asyncio.create_task(sess.start(msg.get("task", "")))

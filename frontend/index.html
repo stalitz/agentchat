@@ -1298,6 +1298,10 @@ function openNewSession() {
     '<div style="display:flex; gap:8px; margin-top:10px;">' +
     '<button class="primary" onclick="submitNewSession()">创建</button>' +
     '<button onclick="closeNew()">取消</button></div>';
+  // 预填新建会话弹窗的 Team 为 composer 当前选择（#selTeam 的实时值），消除「composer 选了 3g、
+  // 弹窗却默认 teams[0] 而静默存成 2g」的双下拉不一致陷阱（实测五子棋会话因此存成 2g）。
+  var ns = document.getElementById('nTeam');
+  if (ns) ns.value = document.getElementById('selTeam').value;
   document.getElementById('newModal').classList.add('show');
 }
 function submitNewSession() {

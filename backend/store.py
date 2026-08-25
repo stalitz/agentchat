@@ -279,6 +279,23 @@ def create_session(project_path: str, title: str = "新会话", team_id: str | N
     return s
 
 
+def update_session_team(project_path: str, sid: str, team_id: str) -> None:
+    """持久化会话实际选用的 Team。
+
+    发起/续跑时用户可能在 composer 切换 Team（或「新建会话」弹窗选了非默认 Team），该选择
+    必须落库——否则 stored team_id 停留在创建默认 teams[0]，重开会话会被静默降级成 2 agent
+    （实测五子棋会话：首跑 3g 但 stored=2g，续跑无裁判）。每次发起都按当前选择写回。"""
+    sessions = _load_sessions(project_path)
+    for s in sessions:
+        if s["id"] == sid:
+            s["team_id"] = team_id or ""
+            s["updated_at"] = _now()
+            break
+    else:
+        return
+    _save_sessions(project_path, sessions)
+
+
 def append_message(project_path: str, sid: str, entry: dict) -> None:
     sessions = _load_sessions(project_path)
     # 每条消息落盘时自动带时间戳（ts，本地时间）——前端时间线展示；历史数据由
