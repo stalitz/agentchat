@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -234,6 +235,40 @@ def _now() -> str:
     return _t.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _claude_ts_to_local(iso: str):
+    """claude transcript 的 UTC ISO 时间戳 -> 本地 `%Y-%m-%d %H:%M:%S`，与 messages.ts 同格式。
+
+    reconcile 从 CLI transcript 取回 agent 回合时，回合自带 claude 原生 timestamp（UTC ISO）。
+    转成本地格式回填 messages.ts，使重开会话带真实时间，且与时序排序（按 ts 字符串比较）一致。
+    解析失败返回 None（调用方保持原 ts 不动）。"""
+    if not iso:
+        return None
+    try:
+        s = iso.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _reorder_by_ts(msgs: list) -> bool:
+    """按 ts 稳定排序（无 ts 排末尾，保相对序），并重排 round=下标。返回是否发生位置/round 变化。
+
+    治本修复：API-error 时 orchestrator 不落 agent 最后一轮，reconcile 把缺失轮 append 到数组末尾
+    （落在「会话结束」系统消息之后）造成错序；按 claude 时间戳把缺失轮归位到正确时序。"""
+    ordered = sorted(msgs, key=lambda m: (0 if m.get("ts") else 1, m.get("ts") or ""))
+    changed = any(ordered[i] is not msgs[i] for i in range(len(ordered)))
+    for i, m in enumerate(ordered):
+        if m.get("round") != i:
+            m["round"] = i
+            changed = True
+    msgs[:] = ordered
+    return changed
+
+
+
 def list_sessions(project_path: str) -> list:
     """返回会话元数据列表（按 updated_at 倒序），含 message_count 与 preview。"""
     out = []
@@ -401,6 +436,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("blocks") or []) != new_blocks:
                     m["blocks"] = new_blocks
                     changed += 1
+                # 回填 claude 真实时间（仅补缺失，避免每次重开改写已有本地 ts）
+                new_ts = _claude_ts_to_local(turn.get("ts"))
+                if new_ts and not m.get("ts"):
+                    m["ts"] = new_ts
+                    changed += 1
         else:
             # 数量不一致：严禁顺序覆盖（会把 CLI 回合复制进本地无关空位造成重复——
             # s_2289e1cf 实测 cli 3 vs 本地 7，顺序覆盖后 T1/T2/T3 各出现 2 次）。
@@ -424,6 +464,7 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                             "content": new_content, "thinking": new_think,
                             "tool_calls": turn.get("tool_calls", []) or [],
                             "tool_results": turn.get("tool_results", []) or [],
+                            "ts": _claude_ts_to_local(turn.get("ts")),
                         })
                         appended += 1
                     continue
@@ -447,6 +488,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("blocks") or []) != new_blocks:
                     m["blocks"] = new_blocks
                     changed += 1
+                # 回填 claude 真实时间（仅补缺失）
+                new_ts = _claude_ts_to_local(turn.get("ts"))
+                if new_ts and not m.get("ts"):
+                    m["ts"] = new_ts
+                    changed += 1
                 matched.add(hit)
             # CLI 回合少于本地：删除「未被匹配的 think-only 残留」（content 空、thinking 非空）——
             # 拆条修复后本地多出的"思考空答案"一半。有 content 的条目是真实历史，
@@ -458,6 +504,9 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                     if (m.get("thinking") or "") and not (m.get("content") or ""):
                         msgs.pop(i)
                         changed += 1
+        # 治本：按 ts 稳定排序兜底，归位 API-error 缺失轮（reconcile 曾 append 到「会话结束」之后）
+        if _reorder_by_ts(msgs):
+            changed += 1
         if changed or appended:
             s["updated_at"] = _now()
             _save_sessions(project_path, sessions)
