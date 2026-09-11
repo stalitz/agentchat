@@ -98,6 +98,13 @@ class AgentRuntime:
         self._force_new_session = False  # 自愈：True 时下一轮用全新 id 注册（绕过已占用的旧锁）
         self._fake_history: list[str] = []
         self._section = None  # 当前文本分片归属：None / "think" / "ans"（跨 claude 多事件续接用）
+        # 真流式（--include-partial-messages）：开了 partial 后，同一段内容会**既以
+        # stream_event 的 delta 增量到达、又出现在最终那条整块 assistant 消息里**。
+        # 这两个标志记录「本轮已经用 delta 吐过正文/思考」，据此在解析 assistant 整块时
+        # 跳过重复内容（否则界面会显示两遍）。仅在 message_start 时复位。
+        self._streamed_text = False
+        self._streamed_think = False
+        self._partial_messages = True  # 若该 claude 版本不认此 flag，自愈降级为 False（见 _run_claude）
 
     @property
     def is_fresh(self) -> bool:
@@ -211,6 +218,13 @@ class AgentRuntime:
         # prompt 经 stdin 以 user 帧传入（见 _user_frame），不再作位置参数。
         cmd = ["claude", "--output-format", "stream-json", "--input-format", "stream-json",
                "--verbose", "--dangerously-skip-permissions"]
+        # --include-partial-messages：**真流式**的关键开关（2026-09-11 实测）。
+        # 不加时 claude 只发整块 assistant 消息（零 delta），界面上的"逐字效果"其实是
+        # executor 侧 _replay 把整块文本演出来的；加上后才会发
+        # `stream_event` → `content_block_delta`（text_delta / thinking_delta），
+        # 正文与思考都是真增量。旧版本 claude 没有此 flag，_run_claude 会自愈降级。
+        if self._partial_messages:
+            cmd += ["--include-partial-messages"]
         if self.cli_session_id is None or self._force_new_session:
             # 本 app 会话中该 agent 首次启动（或自愈换新 id）：生成新 id 并注册为 claude 会话
             self.cli_session_id = str(uuid.uuid4())
@@ -282,6 +296,15 @@ class AgentRuntime:
             if kind == "error" and _is_bad_session_id(text):
                 # 自愈：该 session id 被占用（异常退出残留锁 / 旧进程未退出）或不存在（历史恢复读到坏 id），
                 # 换新 id 重试一次。用 --session-id 全新注册以避开旧锁；orchestrator 会在本轮结束后持久化新 id。
+                self._force_new_session = True
+                async for k, t in self._run_claude_once(prompt, cwd, timeout):
+                    yield k, t
+                return
+            if kind == "error" and self._partial_messages and _is_unknown_partial_flag(text):
+                # 自愈：该 claude 版本没有 --include-partial-messages → 关掉它重试一次，
+                # 退回「整块输出 + _replay 打字兜底」的旧行为（功能不受影响，只是非真流式）。
+                # 此刻 claude 还没真正跑起来，故顺带换新 session id，避免拿未注册的 id 去 --resume。
+                self._partial_messages = False
                 self._force_new_session = True
                 async for k, t in self._run_claude_once(prompt, cwd, timeout):
                     yield k, t
@@ -528,15 +551,32 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
             return _classify_text(runtime, text)
         return []
     t = ev.get("type")
+    # 真流式：`--include-partial-messages` 把原始 API 流事件包在
+    # `{"type":"stream_event","event":{...}}` 里（event 才是 content_block_delta 等）。
+    # 这里就地解包，使下面的 delta / 各分支逻辑对「包与不包」两种形态都成立。
+    if t == "stream_event" and isinstance(ev.get("event"), dict):
+        ev = ev["event"]
+        t = ev.get("type")
+        # message_start：一条新的 assistant 消息开始，复位去重标志
+        if t == "message_start" and runtime is not None:
+            runtime._streamed_text = False
+            runtime._streamed_think = False
     # 流式增量
     delta = ev.get("delta")
     if isinstance(delta, dict):
         # 思考增量（Anthropic thinking_delta，非网关路径）：独立产出 thinking 事件
         if isinstance(delta.get("thinking"), str) and delta["thinking"]:
+            if runtime is not None:
+                runtime._streamed_think = True
             return [("thinking", delta["thinking"])]
         d = delta.get("text") or ""
         if d:
+            if runtime is not None:
+                runtime._streamed_text = True
             return _classify_text(runtime, d)
+        # 其余 delta（input_json_delta / signature_delta）不出事件：tool_use 由下面
+        # 整块 assistant 消息统一给出，避免半截 JSON 流到编排层
+        return []
     # assistant 整块：标准 thinking block（直连其他 client）或网关双 text 块（带哨兵）
     if t == "assistant":
         msg = ev.get("message") or {}
@@ -545,11 +585,17 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
             if not isinstance(item, dict):
                 continue
             if item.get("type") == "thinking" and item.get("thinking"):
+                # 已经用 delta 真流式吐过思考 → 跳过，避免显示两遍
+                if runtime is not None and runtime._streamed_think:
+                    continue
                 out.append(("thinking", item["thinking"]))
             elif item.get("type") == "text" and item.get("text"):
+                if runtime is not None and runtime._streamed_text:
+                    continue
                 out += _classify_text(runtime, item["text"])
             elif item.get("type") == "tool_use":
-                # 结构化工具调用（如 end_discussion）：透传给编排层做终止状态机
+                # 结构化工具调用（如 end_discussion）：透传给编排层做终止状态机。
+                # 即使在 partial 模式下也**必须**从整块消息取（delta 只有半截 JSON）。
                 out.append(("tool_use", {
                     "name": item.get("name", ""),
                     "input": item.get("input", {}) or {},
@@ -657,6 +703,14 @@ def _codex_text(ev: dict) -> str:
         if isinstance(it, str) and it:
             return it
     return ""
+
+
+def _is_unknown_partial_flag(text: str) -> bool:
+    """该版本 claude 不认 `--include-partial-messages` 时的报错特征（用于自愈降级）。"""
+    t = (text or "").lower()
+    return "include-partial-messages" in t and (
+        "unknown option" in t or "unknown argument" in t or "unrecognized" in t or "invalid option" in t
+    )
 
 
 def _is_bad_session_id(text: str) -> bool:
