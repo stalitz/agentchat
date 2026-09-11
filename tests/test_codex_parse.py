@@ -47,6 +47,24 @@ EV_ITEM_COMMAND = (
     '"command":"ls","aggregated_output":"total 0"}}'
 )
 
+# ---- end_discussion MCP 工具调用（原文抓取，2026-09-11 实测 codex 0.146.1）----
+EV_MCP_STARTED = (
+    '{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"terminate-signal",'
+    '"tool":"end_discussion","arguments":{"reason":"连通性测试"},"result":null,"error":null,'
+    '"status":"in_progress"}}'
+)
+EV_MCP_COMPLETED = (
+    '{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"terminate-signal",'
+    '"tool":"end_discussion","arguments":{"reason":"连通性测试"},'
+    '"result":{"content":[{"type":"text","text":"【工具回执】你的 end_discussion 调用已收到（理由：连通性测试）。"}],'
+    '"structured_content":null},"error":null,"status":"completed"}}'
+)
+EV_MCP_CANCELLED = (
+    '{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"terminate-signal",'
+    '"tool":"end_discussion","arguments":{"reason":"连通性测试"},"result":null,'
+    '"error":{"message":"user cancelled MCP tool call"},"status":"failed"}}'
+)
+
 
 def _runtime(session_id=None, model=None):
     agent = AgentConfig(id="ag_c1", name="c1", type="codex", model=model)
@@ -142,3 +160,76 @@ def test_parse_non_json_line_falls_back_to_text():
     events = _parse_codex_line("Not inside a trusted directory and --skip-git-repo-check was not specified.", rt)
     assert events and events[0][0] == "text"
     assert "trusted directory" in events[0][1]
+
+
+# ---------------- end_discussion MCP 工具：命令注入 + 事件映射 ----------------
+
+def _config_flags(cmd):
+    """取出所有 `-c <value>` 的 value。"""
+    return [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "-c"]
+
+
+def test_codex_cmd_injects_end_discussion_mcp_server():
+    """命令必须按次注入 terminate-signal MCP 服务（claude 靠项目 .mcp.json，codex 无此机制）。"""
+    rt = _runtime()
+    cmd = rt._codex_cmd("x")
+    flags = _config_flags(cmd)
+    joined = " ".join(flags)
+    assert any("mcp_servers.terminate-signal.command=" in f for f in flags), (
+        "必须注入 mcp_servers.terminate-signal.command，否则 codex 看不到 end_discussion 工具"
+    )
+    assert any("mcp_servers.terminate-signal.args=" in f for f in flags)
+    assert "terminate_signal_mcp.py" in joined, "args 必须指向 claude 侧同一个 MCP 脚本"
+    # 用 TOML 字面字符串（单引号）避免路径转义问题
+    assert "'" in joined
+
+
+def test_codex_cmd_sets_approval_mode_approve():
+    """审批模式必须是 approve —— 默认值与 auto 都会让 codex 自动取消 MCP 调用。"""
+    rt = _runtime()
+    flags = _config_flags(rt._codex_cmd("x"))
+    want = 'mcp_servers.terminate-signal.default_tools_approval_mode="approve"'
+    assert want in flags, (
+        "缺 default_tools_approval_mode=approve 时，codex exec 非交互无审批人，"
+        "MCP 工具调用会被自动取消（实测报 'user cancelled MCP tool call'）"
+    )
+
+
+def test_codex_cmd_mcp_flags_come_before_resume():
+    """-c 覆盖必须排在 resume 子命令之前（实测该顺序下 resume 仍能生效）。"""
+    rt = _runtime(session_id="01a08fa7-7e95-72c3-aebf-897933ff1ff5")
+    cmd = rt._codex_cmd("继续")
+    assert "resume" in cmd
+    assert max(i for i, tok in enumerate(cmd) if tok == "-c") < cmd.index("resume")
+
+
+def test_parse_mcp_completed_emits_tool_use():
+    """核心：item.completed 的 mcp_tool_call 必须映射成 tool_use，编排层才能收到 codex 的终止票。"""
+    rt = _runtime()
+    events = _parse_codex_line(EV_MCP_COMPLETED, rt)
+    assert events, "mcp_tool_call（completed）必须产出 tool_use 事件（修复前被完全忽略）"
+    kind, payload = events[0]
+    assert kind == "tool_use"
+    assert payload["name"] == "end_discussion"
+    assert payload["input"]["reason"] == "连通性测试"
+
+
+def test_parse_mcp_started_does_not_duplicate_tool_use():
+    """item.started 不产事件，避免同一次调用被记两次（只认 completed）。"""
+    rt = _runtime()
+    assert _parse_codex_line(EV_MCP_STARTED, rt) == []
+
+
+def test_parse_mcp_cancelled_still_counts_as_intent():
+    """被审批取消的调用同样算「模型发起了终止」——与 claude 侧「见 tool_use 即计票」一致。"""
+    rt = _runtime()
+    events = _parse_codex_line(EV_MCP_CANCELLED, rt)
+    assert events and events[0][0] == "tool_use"
+    assert events[0][1]["name"] == "end_discussion"
+
+
+def test_mcp_item_emits_no_text():
+    """mcp_tool_call 的回执文本嵌在 result.content 里，不得被当发言文本输出到气泡。"""
+    import json
+    assert _codex_text(json.loads(EV_MCP_COMPLETED)) == ""
+    assert _codex_text(json.loads(EV_MCP_STARTED)) == ""

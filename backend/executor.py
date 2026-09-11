@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
@@ -24,6 +25,10 @@ _MCP_SERVER_CONFIG = {
         }
     }
 }
+
+# claude 用的 MCP 服务脚本（纯 stdlib，无第三方依赖）。codex 侧复用同一个脚本，
+# 见 AgentRuntime._codex_cmd 的 `-c mcp_servers.*` 注入。
+_MCP_SCRIPT = str(Path(__file__).resolve().parent / "terminate_signal_mcp.py")
 
 
 def _user_frame(prompt: str) -> bytes:
@@ -307,6 +312,19 @@ class AgentRuntime:
         # 本 app 的项目目录由用户任选、不可能都预先受信，故默认带上该 flag ——
         # 对应 claude 侧的 --dangerously-skip-permissions，codex 侧原先漏了这层豁免。
         cmd = ["codex", "exec", "--json", "--skip-git-repo-check"]
+        # end_discussion 工具（FR5.3a）：复用 claude 侧同一个 MCP stdio 服务
+        # （backend/terminate_signal_mcp.py，纯 stdlib）。claude 靠项目级 .mcp.json 注册，
+        # codex 没有该项目级机制，改用 `-c key=value` 逐次注入配置覆盖（点号路径），
+        # **不动用户 ~/.codex/config.toml**。三项缺一不可：
+        #   1) command / args：拉起同一个「无状态确认通道」（判定仍由编排层做）；
+        #   2) default_tools_approval_mode="approve"：codex 的 MCP 工具调用默认需要审批，
+        #      而 `codex exec` 非交互、无审批人 → 自动返回 "user cancelled MCP tool call"，
+        #      工具永远调不通（实测默认值与 "auto" 均被取消，只有 "approve" 能真正执行；
+        #      合法值 auto/prompt/writes/approve 由 codex 对非法值的报错枚举得出）。
+        # 取值用 TOML 字面字符串（单引号），路径含反斜杠也无需转义。
+        cmd += ["-c", f"mcp_servers.terminate-signal.command='{sys.executable}'"]
+        cmd += ["-c", f"mcp_servers.terminate-signal.args=['{_MCP_SCRIPT}']"]
+        cmd += ["-c", 'mcp_servers.terminate-signal.default_tools_approval_mode="approve"']
         if self.agent.model:
             cmd += ["-m", self.agent.model]
         if self.agent.cli_args:
@@ -560,6 +578,21 @@ def _parse_codex_line(text: str, runtime: "AgentRuntime | None"):
                or ev.get("thread_id"))
         if sid:
             runtime.cli_session_id = sid
+    # MCP 工具调用（codex 0.146.1）：`item.completed` 里 item.type == "mcp_tool_call"，
+    # 形如 {"server":"terminate-signal","tool":"end_discussion","arguments":{"reason":...}}。
+    # 必须映射成与 claude 侧完全一致的 ("tool_use", {...})，否则编排层的终止状态机
+    # 收不到 codex 的投票（表现为「codex 只会说话、不会投终止票」）。
+    # 只认 item.completed：mcp_tool_call 会发 started + completed 两条，取 completed
+    # 既保证「必有」、又不会重复产事件（agent_message 也只发 completed）。
+    item = ev.get("item")
+    if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
+        if ev.get("type") == "item.completed" and "end_discussion" in str(item.get("tool") or ""):
+            args = item.get("arguments") or {}
+            return [("tool_use", {
+                "name": "end_discussion",
+                "input": {"reason": str(args.get("reason", "") or "")},
+            })]
+        return []   # 其余 mcp 事件既不产文本、也不重复产 tool_use
     t = _codex_text(ev)
     if t:
         return [("text", t)]
