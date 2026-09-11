@@ -299,8 +299,14 @@ class AgentRuntime:
             else:
                 yield kind, payload
 
-    async def _run_codex(self, prompt: str, cwd: str, timeout: int):
-        cmd = ["codex", "exec", "--json"]
+    def _codex_cmd(self, prompt: str) -> list[str]:
+        # --skip-git-repo-check（2026-09-11）：codex 默认拒绝在「非 git 仓库、且不在
+        # ~/.codex/config.toml 受信项目列表（[projects."..."] trust_level = "trusted"）」的
+        # 目录里运行，直接退出码 1：Not inside a trusted directory and
+        # --skip-git-repo-check was not specified.（实测 /Users/stalitz/www/aitest/test3 必现）。
+        # 本 app 的项目目录由用户任选、不可能都预先受信，故默认带上该 flag ——
+        # 对应 claude 侧的 --dangerously-skip-permissions，codex 侧原先漏了这层豁免。
+        cmd = ["codex", "exec", "--json", "--skip-git-repo-check"]
         if self.agent.model:
             cmd += ["-m", self.agent.model]
         if self.agent.cli_args:
@@ -308,6 +314,10 @@ class AgentRuntime:
         if self.cli_session_id is not None:
             cmd += ["resume", self.cli_session_id]
         cmd += [prompt]
+        return cmd
+
+    async def _run_codex(self, prompt: str, cwd: str, timeout: int):
+        cmd = self._codex_cmd(prompt)
         async for ev in _stream_subprocess(cmd, cwd, timeout, parse="codex", runtime=self):
             yield ev
 
@@ -577,6 +587,16 @@ def _codex_text(ev: dict) -> str:
     delta = ev.get("delta")
     if isinstance(delta, dict) and isinstance(delta.get("text"), str) and delta["text"]:
         return delta["text"]
+    # codex 0.146.1 的真实结构（2026-09-11 实测 codex exec --json）：
+    #   {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"..."}}
+    # 文本嵌在 item.text 里、不在顶层——原先没这条分支，会导致 codex 跑成功但界面收不到
+    # 任何输出（表现为"codex 没反应"）。item 也可能是 reasoning / command_execution，
+    # 这里只取带 text 的（agent_message 即正式发言）。
+    item = ev.get("item")
+    if isinstance(item, dict):
+        it = item.get("text")
+        if isinstance(it, str) and it:
+            return it
     return ""
 
 
