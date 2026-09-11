@@ -1418,9 +1418,23 @@ function modelSrcOf(a) {
   return 'custom';
 }
 
+// 类型切换时构造「临时实体」：保留当前表单已填值 + 目标类型（编辑时保留 id），
+// 供 openAgentForm 重新渲染——既不丢已输入内容，也不会弹回原类型。
+function agentDraft(a, newType) {
+  return {
+    id: (a && a.id) ? a.id : null,
+    type: newType,
+    name: v('name'),
+    role: v('role'),
+    base_url: v('base_url'),
+    model: v('model'),
+    api_key: v('api_key'),
+  };
+}
 function openAgentForm(a) {
   editingId = a ? a.id : null; editingKind = 'agent';
-  var isCC = (a ? a.type : 'claude-code') === 'claude-code';
+  var curType = a ? a.type : 'claude-code';   // 本表单当前渲染所用的类型（切类型时的比较基准）
+  var isCC = curType === 'claude-code';
   var src = modelSrcOf(a);
   var showDefault = (isCC && src === 'default');
   var c = document.getElementById('modalCard');
@@ -1428,7 +1442,7 @@ function openAgentForm(a) {
   var html = '<h3>' + (a ? '编辑 Agent' : '新建 Agent') + '</h3>' +
     f('name', '名称', a ? a.name : '') +
     f('role', 'System Prompt / 系统提示', a ? a.role : '') +
-    sel('type', '类型', [['claude-code', 'Claude Code'], ['codex', 'Codex'], ['fake', 'Fake（调试假 agent，不烧 token）']], a ? a.type : 'claude-code');
+    sel('type', '类型', [['claude-code', 'Claude Code'], ['codex', 'Codex'], ['fake', 'Fake（调试假 agent，不烧 token）']], curType);
   if (isCC) {
     html += sel('modelSrc', '模型来源', [
       ['default', '默认（' + effectiveModelName({ type: 'claude-code' }) + '）'],
@@ -1450,12 +1464,14 @@ function openAgentForm(a) {
     html += f('model', '模型(可选)', a ? (a.model || '') : '') +
       '<div class="hint">codex 类型填模型 tag（如 deepseek-v4-flash），留空走 Codex 全局默认。</div>';
   }
-  html += formButtons('submitAgent', a);
+  html += formButtons('submitAgent', (a && a.id) ? a : null);   // 仅编辑已有 agent 才显示「删除」
   c.innerHTML = html;
   var sync = function () {
     var t = v('type');
-    // 切类型时重载表单，正确显示「模型来源」或普通「模型」字段（简单可靠，编辑时少切类型）
-    if (t !== (a ? a.type : 'claude-code')) { openAgentForm(a); return; }
+    // 切类型 → 用「当前已填值 + 新类型」重渲染：既正确切换字段组，又不丢已输入内容。
+    // 注意比较基准必须是本表单渲染时的 curType，不能是原始实体 a.type——
+    // 否则新建时（a 为空、基准恒为 claude-code）选 codex/fake 会被判成"没变"而弹回 claude-code。
+    if (t !== curType) { openAgentForm(agentDraft(a, t)); return; }
     if (t !== 'claude-code') return;
     var s = v('modelSrc');
     var loc = document.getElementById('locBox'), def = document.getElementById('defBox');
