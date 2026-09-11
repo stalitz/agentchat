@@ -37,8 +37,11 @@ def test_reorder_by_ts():
     assert [m["round"] for m in msgs] == [0, 1, 2]
 
 
-def test_reconcile_fills_ts_and_reorders(tmp_path):
-    proj = str(tmp_path)
+def test_reconcile_fills_ts_and_reorders():
+    # 不用 pytest 的 tmp_path：本机（WorkBuddy 沙箱）禁止在系统临时目录下创建
+    # pytest-of-* 目录，会让用例在 setup 阶段直接 ERROR（与逻辑无关）。
+    import tempfile
+    proj = tempfile.mkdtemp(prefix="agentchat_reconcile_", dir="/tmp")
     # 本地缺 g2 最后一轮（abort 缺口），且「会话结束」已落在正确位置
     t_human = store._claude_ts_to_local("2026-01-01T00:00:00Z")
     t_g2a = store._claude_ts_to_local("2026-01-01T00:00:01Z")

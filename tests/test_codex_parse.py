@@ -27,7 +27,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from backend.executor import AgentRuntime, _parse_codex_line, _codex_text  # noqa: E402
+from backend.executor import (  # noqa: E402
+    AgentRuntime, _parse_codex_line, _codex_text,
+    _parse_codex_transcript, _codex_reasoning_texts, _codex_parse_args,
+)
+import json  # noqa: E402
+import os  # noqa: E402
+import tempfile  # noqa: E402
 from backend.models import AgentConfig  # noqa: E402
 
 
@@ -233,3 +239,129 @@ def test_mcp_item_emits_no_text():
     import json
     assert _codex_text(json.loads(EV_MCP_COMPLETED)) == ""
     assert _codex_text(json.loads(EV_MCP_STARTED)) == ""
+
+
+# ---------------- codex rollout 解析（历史重建）+ reasoning 回收 ----------------
+# fixture 用 codex 0.146.1 的**真实 schema**（2026-09-11 从 rollout 原文抄的字段结构）：
+#   {"type":"response_item","payload":{...}} / {"type":"event_msg","payload":{...}}
+# 旧的 _parse_codex_transcript 读顶层 o["message"]/o["role"]，对这种格式返回 0 回合 →
+# codex 的历史重建（reconcile）完全失效。
+
+def _rollout(lines):
+    """写一个临时 rollout 文件。
+
+    不用 pytest 的 tmp_path fixture —— 本机（WorkBuddy 沙箱）禁止在
+    /private/var/folders/.../pytest-of-* 建目录，会 PermissionError。
+    """
+    fd, path = tempfile.mkstemp(suffix=".jsonl", prefix="agentchat_rollout_", dir="/tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(json.dumps(x, ensure_ascii=False) for x in lines))
+    return path
+
+
+def _ri(payload):
+    return {"type": "response_item", "payload": payload}
+
+
+def _em(payload):
+    return {"type": "event_msg", "payload": payload}
+
+
+ROLLOUT_LINES = [
+    {"type": "session_meta", "payload": {"session_id": "tid-1", "cli_version": "0.146.1"}},
+    _ri({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "permissions..."}]}),
+    # ---- 回合 1：user 提示 → 思考 → 正文（event_msg/agent_message 与正文重复，不得双计）----
+    _ri({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "第一轮提示"}]}),
+    # event_msg/user_message 也是 message 字符串，但那是**用户提示词**、不是 assistant 正文
+    _em({"type": "user_message", "message": "你是：选手1。\n\n人工介入 / 任务：提示词"}),
+    _ri({"type": "reasoning", "summary": [],
+         "content": [{"type": "reasoning_text", "text": "思考一：先看工具列表。"}]}),
+    _em({"type": "agent_message", "message": "正文一"}),  # 与下一行 response_item 内容完全一致（真实 rollout 即如此）
+    _ri({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "正文一"}]}),
+    # ---- 回合 2：user 提示 → 工具搜索 → 思考 → 工具调用 → 正文 ----
+    _ri({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "第二轮提示"}]}),
+    _ri({"type": "tool_search_call", "arguments": {"query": "end_discussion"}}),
+    _ri({"type": "tool_search_output", "tools": []}),
+    _ri({"type": "reasoning", "summary": [],
+         "content": [{"type": "reasoning_text", "text": "思考二：没有这个工具。"}]}),
+    _ri({"type": "function_call", "name": "end_discussion", "arguments": '{"reason": "达成一致"}'}),
+    _ri({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "正文二"}]}),
+]
+
+
+def test_codex_transcript_parses_two_turns():
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_LINES))
+    assert len(turns) == 2, f"应按 user 消息切出 2 个回合，实际 {len(turns)}（旧实现是 0）"
+    assert turns[0]["content"] == "正文一"
+    assert turns[0]["thinking"] == "思考一：先看工具列表。"
+    assert turns[1]["content"] == "正文二"
+    assert turns[1]["thinking"] == "思考二：没有这个工具。"
+
+
+def test_codex_transcript_does_not_double_count_event_msg():
+    """event_msg/agent_message 与 response_item 的 assistant message 内容重复（真实 rollout
+    里两份文本完全一致），正文只能出现一次、不得被拼两遍。"""
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_LINES))
+    assert turns[0]["content"] == "正文一"
+    assert turns[0]["content"].count("正文一") == 1
+    assert [b["text"] for b in turns[0]["blocks"] if b["type"] == "text"] == ["正文一"]
+
+
+def test_codex_transcript_does_not_leak_user_prompt(tmp_path_unused=None):
+    """event_msg/user_message 的 message 是用户提示词，绝不能被当成 assistant 正文。
+
+    这是实测踩到的回归：把「message 为字符串」当成 assistant 正文后，提示词
+    （"你是：5子棋选手1。\n\n人工介入 / 任务：..."）会整段混进正文。
+    """
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_LINES))
+    for t in turns:
+        assert not t["content"].startswith("你是："), t["content"][:60]
+        assert "人工介入" not in t["content"]
+
+
+def test_codex_transcript_thinking_block_precedes_text():
+    """时间线 blocks 必须按原生顺序：思考在前、正文在后（不另造顺序逻辑）。"""
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_LINES))
+    types = [b["type"] for b in turns[0]["blocks"]]
+    assert types == ["thinking", "text"], types
+
+
+def test_codex_transcript_extracts_tool_use_from_function_call():
+    """function_call 的 arguments 是 JSON 字符串，须解析成 input.reason。"""
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_LINES))
+    t1 = turns[1]
+    assert t1["tool_calls"] == [{"name": "end_discussion", "input": {"reason": "达成一致"}}]
+    blocks = [b for b in t1["blocks"] if b["type"] == "tool_use"]
+    assert blocks and blocks[0]["input"] == {"reason": "达成一致"}
+
+
+def test_codex_reasoning_texts_in_order():
+    texts = _codex_reasoning_texts(_rollout(ROLLOUT_LINES))
+    assert texts == ["思考一：先看工具列表。", "思考二：没有这个工具。"]
+
+
+def test_codex_new_reasoning_incremental(monkeypatch):
+    """_codex_new_reasoning 必须只返回「新增」部分，避免同一段思考被重复吐。"""
+    import backend.executor as ex
+    path = _rollout(ROLLOUT_LINES)
+    monkeypatch.setattr(ex, "_codex_transcript_path", lambda sid: path)
+    rt = _runtime(session_id="tid-1")
+    first = rt._codex_new_reasoning(0)
+    assert first == ["思考一：先看工具列表。", "思考二：没有这个工具。"]
+    assert rt._codex_new_reasoning(len(first)) == [], "已吐过的思考不得重复返回"
+
+
+def test_codex_new_reasoning_survives_missing_file(monkeypatch):
+    """读不到 rollout 时必须安静返回空，绝不能打断本轮运行。"""
+    import backend.executor as ex
+    monkeypatch.setattr(ex, "_codex_transcript_path", lambda sid: "/nonexistent/x.jsonl")
+    rt = _runtime(session_id="tid-1")
+    assert rt._codex_new_reasoning(0) == []
+    assert _runtime(session_id=None)._codex_new_reasoning(0) == []
+
+
+def test_codex_parse_args_variants():
+    assert _codex_parse_args('{"reason": "r"}') == {"reason": "r"}
+    assert _codex_parse_args({"reason": "r"}) == {"reason": "r"}
+    assert _codex_parse_args("not json") == {}
+    assert _codex_parse_args(None) == {}

@@ -334,10 +334,36 @@ class AgentRuntime:
         cmd += [prompt]
         return cmd
 
+    def _codex_new_reasoning(self, seen: int) -> list[str]:
+        """返回 rollout 里第 seen 条之后新增的 reasoning 文本；读不到就返回空（绝不影响主流程）。"""
+        if not self.cli_session_id:
+            return []
+        try:
+            p = _codex_transcript_path(self.cli_session_id)
+            if not p:
+                return []
+            texts = _codex_reasoning_texts(p)
+        except Exception:
+            return []
+        return texts[seen:] if len(texts) > seen else []
+
     async def _run_codex(self, prompt: str, cwd: str, timeout: int):
         cmd = self._codex_cmd(prompt)
+        # codex 的 `--json` 事件流不含 reasoning（见 _codex_reasoning_texts 注释），而它的
+        # **正文是整块**（item.completed/agent_message）在回合末才到达、reasoning 早已写进
+        # rollout —— 所以在吐「正文 / 工具调用」之前，先把新增的 reasoning 作为 thinking
+        # 吐出去，顺序天然对齐原生（思考在前、正文在后），不另造顺序逻辑。
+        seen = 0
         async for ev in _stream_subprocess(cmd, cwd, timeout, parse="codex", runtime=self):
+            if ev[0] in ("text", "tool_use"):
+                fresh = self._codex_new_reasoning(seen)
+                seen += len(fresh)
+                for txt in fresh:
+                    yield ("thinking", txt)
             yield ev
+        # 回合收尾：只有推理、没有正文的情况（如只调了工具）也别漏
+        for txt in self._codex_new_reasoning(seen):
+            yield ("thinking", txt)
 
 
 # ---------------- 通用子进程流式读取 ----------------
@@ -866,10 +892,14 @@ def _parse_claude_transcript(path: str) -> list:
     return turns
 
 
-def _parse_codex_transcript(path: str) -> list:
-    """解析 codex JSONL（格式多变，尽力而为）：解析不出内容则返回空列表，对账时该 agent 跳过。"""
-    import re as _re
-    turns = []
+def _codex_iter_payloads(path: str):
+    """逐行读 codex rollout，产出 (payload, 原始行对象)。
+
+    codex 0.146.1 的 rollout（`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`）外层是
+    `{"type": "response_item"|"event_msg"|..., "payload": {...}}`，**真实内容全在 payload 下**。
+    旧实现直接读顶层的 `o["message"]` / `o["role"]`（chat-completions 风格），对这种格式
+    解析出 0 个回合 —— 导致 codex agent 的历史重建（reconcile）完全失效。
+    """
     with open(path, encoding="utf-8") as fh:
         for ln in fh:
             ln = ln.strip()
@@ -879,27 +909,153 @@ def _parse_codex_transcript(path: str) -> list:
                 o = json.loads(ln)
             except json.JSONDecodeError:
                 continue
-            content = None
-            if isinstance(o.get("message"), dict) and o["message"].get("role") == "assistant":
-                content = o["message"].get("content")
-            elif o.get("role") == "assistant":
-                content = o.get("content")
-            if content is None:
+            if isinstance(o, dict):
+                # 新格式（0.146.1）内容在 payload 下；老格式（早期版本）把 message 放在顶层、
+                # 无 payload 键 —— 此时退回整行对象，交给下面的形态判定兼容处理。
+                yield (o.get("payload") or o), o
+
+
+def _codex_content_text(content) -> str:
+    """从 codex 的 content 里取正文文本（str，或 [{type: text|output_text, text}]）。"""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") in ("text", "output_text"):
+                t = b.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t)
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _codex_assistant_text(pl: dict) -> str:
+    """从各个 codex 版本的 payload 形态里取 assistant 正文。
+
+    - 新（0.146.1）：`response_item/message`，role=assistant，content[].type=output_text；
+      另有 `event_msg/agent_message`（message 为字符串）内容**与之重复**。
+    - 旧（早期版本）：`event_msg` + 顶层/ payload 里的 `message{role:assistant, content[]}`。
+    重复由调用方按「文本去重」处理，不在这里判类型，以免某个版本只发其中一种时漏读。
+    """
+    msg = pl.get("message")
+    # 只认 agent_message —— `event_msg/user_message` 也是 message 字符串（那是**用户提示词**，
+    # 不是 assistant 正文）；漏掉这个类型判断会把提示词混进正文。
+    if isinstance(msg, str) and msg.strip() and pl.get("type") == "agent_message":
+        return msg.strip()
+    if isinstance(msg, dict) and msg.get("role") == "assistant":
+        return _codex_content_text(msg.get("content"))
+    if pl.get("role") == "assistant":
+        return _codex_content_text(pl.get("content"))
+    return ""
+
+
+def _codex_reasoning_texts(path: str) -> list[str]:
+    """按文件顺序取出 rollout 里全部 reasoning 明文（用于展示 codex 的「思考」）。
+
+    codex `exec --json` 的事件流**不含 reasoning**（2026-09-11 实测：只有 thread.started /
+    turn.started / item.completed / turn.completed，推理只以 `usage.reasoning_output_tokens`
+    计数出现；`hide_agent_reasoning=false` + `show_raw_agent_reasoning=true` 也不会输出）。
+    但 rollout 里写明文：`response_item` → payload.type == "reasoning" →
+    content[].text（type == "reasoning_text"；summary 为空、encrypted_content 只是短 id）。
+    """
+    out: list[str] = []
+    try:
+        for pl, _raw in _codex_iter_payloads(path):
+            if pl.get("type") != "reasoning":
                 continue
-            txt, thinking = "", ""
-            if isinstance(content, str):
-                txt = content
-            elif isinstance(content, list):
-                for b in content:
-                    if isinstance(b, dict):
-                        if b.get("type") in ("text",):
-                            txt += b.get("text", "")
-                        elif b.get("type") in ("thinking", "reasoning"):
-                            thinking += (b.get("thinking") or b.get("text", ""))
-            if txt.strip() or thinking.strip():
-                c = _re.sub(r"^\s*---\s*", "", _re.sub(r"\s*---\s*$", "", _clean_sentinels(txt).strip())).strip()
-                th = _clean_sentinels(thinking).strip()
-                turns.append(_normalize_turn(c, th))
+            for b in (pl.get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "reasoning_text":
+                    t = (b.get("text") or "").strip()
+                    if t:
+                        out.append(t)
+    except OSError:
+        pass
+    return out
+
+
+def _codex_parse_args(raw) -> dict:
+    """codex function_call 的 arguments 是 JSON 字符串（如 '{"reason": "..."}'）。"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            d = json.loads(raw)
+            return d if isinstance(d, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _parse_codex_transcript(path: str) -> list:
+    """解析 codex rollout 为一个 agent 的回合序列（供对账覆盖本地历史）。
+
+    把 codex 的原生 item 映射成**与 claude 同一套块类型**、复用 `_normalize_claude_blocks`
+    产出时间线 blocks，前后端不需要第二套 schema。
+    codex 0.146.1 实测 payload 形态：
+    - `message`（role=user）→ 一次新回合的起点（收口上一回合）
+    - `reasoning` → content[].type=reasoning_text：**思考**
+    - `message`（role=assistant）→ content[].type=output_text：**正文**
+    - `function_call` → name / arguments（JSON 字符串）
+    - `event_msg/agent_message` 与 assistant message **内容重复**，一律不取（避免双计）；
+      `event_msg/task_complete` 同理不取。
+    """
+    turns: list = []
+    pending = None
+
+    def flush():
+        nonlocal pending
+        if pending is None:
+            return
+        content = _clean_sentinels("\n\n".join(pending["ans"]).strip()).strip()
+        thinking = _clean_sentinels("\n\n".join(pending["think"])).strip()
+        tc = pending["tc"]
+        if content or thinking or tc:
+            t = _normalize_turn(content, thinking, tc)
+            t["blocks"] = _normalize_claude_blocks(pending["seq"])
+            if pending.get("ts"):
+                t["ts"] = pending["ts"]
+            turns.append(t)
+        pending = None
+
+    def _open(ts):
+        nonlocal pending
+        if pending is None:
+            pending = {"think": [], "ans": [], "tc": [], "seq": [], "seen": set(), "ts": ts}
+
+    for pl, raw in _codex_iter_payloads(path):
+        pt = pl.get("type")
+        ts = raw.get("timestamp")
+        if pt == "message" and pl.get("role") == "user":
+            flush()
+            _open(ts)
+            continue
+        if pt == "reasoning":
+            _open(ts)
+            for b in (pl.get("content") or []):
+                if isinstance(b, dict) and b.get("type") == "reasoning_text" and (b.get("text") or "").strip():
+                    pending["think"].append(b["text"])
+                    pending["seq"].append({"type": "thinking", "thinking": b["text"]})
+            continue
+        # assistant 正文：兼容多种版本形态；event_msg/agent_message 与 response_item 的
+        # assistant message **内容重复**，故按文本去重（否则正文会被拼两遍）。
+        txt = _codex_assistant_text(pl)
+        if txt:
+            _open(ts)
+            if txt not in pending["seen"]:
+                pending["seen"].add(txt)
+                pending["ans"].append(txt)
+                pending["seq"].append({"type": "text", "text": txt})
+            continue
+        if pt == "function_call":
+            name = pl.get("name") or ""
+            if "end_discussion" in name:
+                _open(ts)
+                tc = {"name": "end_discussion", "input": _codex_parse_args(pl.get("arguments"))}
+                pending["tc"].append(tc)
+                pending["seq"].append({"type": "tool_use", "name": tc["name"], "input": tc["input"]})
+            continue
+    flush()
     return turns
 
 
