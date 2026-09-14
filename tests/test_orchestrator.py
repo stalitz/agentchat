@@ -917,5 +917,209 @@ class TestGwUrl(unittest.TestCase):
         self.assertIsNone(s._gw_url(a), "无 base_url（真实 claude / codex 直连）返回 None")
 
 
+class CaptureRuntime:
+    """可观测桩：记录收到的 prompt，按脚本吐内容。"""
+
+    def __init__(self, chunks):
+        self.cli_session_id = None
+        self._chunks = chunks
+        self.prompts = []
+
+    async def run(self, prompt, project_path, timeout, meta=None):
+        self.prompts.append(prompt)
+        for kind, text in self._chunks:
+            yield (kind, text)
+
+
+class BlockingRuntime:
+    """会在中途挂住的桩：模拟「正在生成的发言」，由中断（abort）放行。"""
+
+    def __init__(self):
+        self.cli_session_id = None
+        self.interrupted = 0
+        self.released = asyncio.Event()
+        self.prompts = []
+
+    async def run(self, prompt, project_path, timeout, meta=None):
+        self.prompts.append(prompt)
+        yield ("text", "这是被中止前的半截发言")
+        await self.released.wait()
+
+    async def interrupt(self):
+        self.interrupted += 1
+        self.released.set()   # 模拟中断生效：流随即收尾（真实后端发 result / turn/completed）
+        return "turn_interrupt"
+
+
+class TestAbortAndResume(unittest.TestCase):
+    """「中止 / 继续」：turn 级中断 + 被中止的 agent 重新发言（与轮边界的暂停/停止互不干扰）。"""
+
+    def setUp(self):
+        self.proj = "/tmp/agentchat_test_abort_" + str(id(self))
+        self.sid = store.create_session(self.proj, "中止测试")["id"]
+
+    def _two_agents(self, max_rounds=6):
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=max_rounds)
+        return s, rec
+
+    def test_abort_interrupts_inflight_turn_and_voids_it(self):
+        s, rec = self._two_agents()
+        blk = BlockingRuntime()
+        s.runtimes["A"] = blk
+        s.runtimes["B"] = CaptureRuntime([("text", "B 不该发言")])
+
+        async def drive():
+            task = asyncio.create_task(s.start("议题"))
+            await asyncio.sleep(0.05)
+            channel = await s.abort()
+            await task
+            return channel
+
+        channel = asyncio.run(drive())
+        self.assertEqual(channel, "turn_interrupt", "应走 runtime.interrupt() 的中断通道")
+        self.assertEqual(blk.interrupted, 1, "在途 turn 必须被真正中断一次")
+        # 中止后整场停下：B 不得发言
+        self.assertNotIn("B", [e.get("agent") for e in rec.events if e.get("type") == "turn_start"])
+        # 半截发言落盘可见，但标记作废
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        hit = [m for m in msgs if m.get("speaker") == "A"]
+        self.assertEqual(len(hit), 1)
+        self.assertTrue(hit[0]["interrupted"], "被中止的发言必须标 interrupted（落盘留痕但作废）")
+        self.assertIn("半截发言", hit[0]["content"], "已生成内容要保留（用户要求能看出中间出过错）")
+        # 待续接记录：哪个 agent、哪一轮
+        self.assertEqual(store.get_pending_turn(self.proj, self.sid), {"agent": "A", "round_i": 0})
+        # 前端要能立刻切到「继续」态
+        self.assertTrue([e for e in rec.events if e.get("type") == "turn_end" and e.get("interrupted")])
+        self.assertTrue([e for e in rec.events if e.get("type") == "run_end" and e.get("aborted")])
+
+    def test_resume_lets_interrupted_agent_speak_again_same_round(self):
+        # max_rounds=1 → 一轮 = A、B 各一次：续接替 A 补说这一轮后，本场即到轮次上限
+        s, rec = self._two_agents(max_rounds=1)
+        s.runtimes["A"] = BlockingRuntime()
+        s.runtimes["B"] = CaptureRuntime([("text", "B 发言")])
+
+        async def abort_first():
+            task = asyncio.create_task(s.start("议题"))
+            await asyncio.sleep(0.05)
+            await s.abort()
+            await task
+
+        asyncio.run(abort_first())
+        rec.events = []
+        # 续接：换掉 A 的 runtime 让这一轮能正常说完
+        cap = CaptureRuntime([("text", "重新完整发言")])
+        s.runtimes["A"] = cap
+        asyncio.run(asyncio.wait_for(s.start("", resume=True), 5))
+
+        starts = [e.get("agent") for e in rec.events if e.get("type") == "turn_start"]
+        self.assertEqual(starts[0], "A", "续接必须由被中止的那个 agent 重新发言，而不是回到第一个 agent")
+        self.assertTrue(any("中止" in p for p in cap.prompts), "需注入「上次被中止」提示，避免接着半句续写")
+        # 有效发言兑现后：待续接清除、interrupted 记录仍在（留痕）
+        self.assertIsNone(store.get_pending_turn(self.proj, self.sid))
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        a_msgs = [m for m in msgs if m.get("speaker") == "A"]
+        self.assertEqual(len(a_msgs), 2)
+        self.assertTrue(a_msgs[0]["interrupted"])
+        self.assertFalse(a_msgs[1].get("interrupted"), "重说的发言是有效发言")
+
+    def test_resume_derives_round_so_other_agents_turn_order_continues(self):
+        # 中止发生在 A（round_i=0）之后、B（round_i=1）之上：续接必须回到 round_i=0（A），
+        # 而不是重置回第一个 agent 或跳到 B——轮次与顺序都从待续接记录恢复
+        s, rec = self._two_agents()
+        blk = BlockingRuntime()
+        s.runtimes["A"] = blk
+        s.runtimes["B"] = CaptureRuntime([("text", "B 发言")])
+
+        async def drive():
+            task = asyncio.create_task(s.start("议题"))
+            await asyncio.sleep(0.05)
+            await s.abort()
+            await task
+
+        asyncio.run(drive())
+        self.assertEqual(store.get_pending_turn(self.proj, self.sid)["round_i"], 0)
+
+    def test_interrupted_message_excluded_from_other_agent_context(self):
+        # 作废口径：被中止的内容落盘可见，但**不喂给其他 agent**
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, rec = make_session([a1, a2], self.proj, self.sid, max_rounds=6)
+        s.history = [
+            {"round": 0, "speaker": "human", "role": "任务", "content": "议题"},
+            {"round": 1, "speaker": "B", "role": "", "content": "B 半截作废内容", "interrupted": True},
+        ]
+        s._initial_task = "议题"
+        prompt = s._build_prompt(a1, None, 1)
+        self.assertNotIn("B 半截作废内容", prompt, "被中止的发言不得进入他人上下文")
+
+    def test_conclusion_skips_interrupted_message(self):
+        s, rec = self._two_agents()
+        s.history = [
+            {"speaker": "A", "content": "有效结论"},
+            {"speaker": "B", "content": "被中止的半截", "interrupted": True},
+        ]
+        self.assertEqual(s._format_conclusion(), "有效结论")
+
+    def test_chat_mode_abort_keeps_human_message_and_resume_not_duplicate(self):
+        # 单 agent 对话模式：中止 → 继续 时不得重复追加用户消息（agent 侧已有该条）
+        a1 = models.AgentConfig(name="A", type="fake")
+        s, rec = make_session([a1], self.proj, self.sid, max_rounds=1)
+        blk = BlockingRuntime()
+        s.runtimes["A"] = blk
+
+        async def drive():
+            task = asyncio.create_task(s.start("你好"))
+            await asyncio.sleep(0.05)
+            await s.abort()
+            await task
+
+        asyncio.run(drive())
+        cap = CaptureRuntime([("text", "重新回复")])
+        s.runtimes["A"] = cap
+        asyncio.run(asyncio.wait_for(s.start("", resume=True), 5))
+        msgs = store.read_session(self.proj, self.sid)["messages"]
+        humans = [m for m in msgs if m.get("speaker") == "human"]
+        self.assertEqual(len(humans), 1, "继续不应把用户消息再记一遍")
+        self.assertIsNone(store.get_pending_turn(self.proj, self.sid))
+
+    def test_abort_is_idempotent(self):
+        s, rec = self._two_agents()
+        blk = BlockingRuntime()
+        s.runtimes["A"] = blk
+
+        async def drive():
+            task = asyncio.create_task(s.start("议题"))
+            await asyncio.sleep(0.05)
+            await s.abort()
+            await s.abort()   # 重复点：不重复发中断帧
+            await task
+
+        asyncio.run(drive())
+        self.assertEqual(blk.interrupted, 1, "重复点「中止」不应重复中断")
+
+    def test_abort_flag_reset_between_runs(self):
+        # 中止标记是「本次在途发言」的状态，不是整场状态：下一次 run 必须复位
+        s, rec = self._two_agents()
+        blk = BlockingRuntime()
+        s.runtimes["A"] = blk
+
+        async def drive():
+            task = asyncio.create_task(s.start("议题"))
+            await asyncio.sleep(0.05)
+            await s.abort()
+            await task
+
+        asyncio.run(drive())
+        s.runtimes["A"] = CaptureRuntime([("text", "新轮次正常发言")])
+        s.runtimes["B"] = CaptureRuntime([("text", "B 正常发言")])
+        rec.events = []
+        asyncio.run(asyncio.wait_for(s.start("新议题"), 5))
+        self.assertFalse(any(e.get("aborted") for e in rec.events if e.get("type") == "run_end"))
+        starts = [e.get("agent") for e in rec.events if e.get("type") == "turn_start"]
+        self.assertEqual(starts[0], "A", "新议题 = 新一轮 run，从第一个 agent 开始（原行为）")
+
+
 if __name__ == "__main__":
     unittest.main()

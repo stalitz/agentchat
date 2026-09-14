@@ -45,7 +45,8 @@ clients: set[WebSocket] = set()
 # 只锁自己，互不干扰（事件均带 sid，前端按会话归属渲染）。
 sessions: dict[str, Session] = {}
 
-ACTION_CN = {"stop": "停止", "pause": "暂停", "resume": "继续", "inject": "介入"}
+ACTION_CN = {"stop": "停止", "pause": "暂停", "resume": "继续", "inject": "介入",
+             "abort": "中止", "resume_turn": "继续"}
 
 
 async def broadcast(event: dict):
@@ -181,6 +182,65 @@ async def handle_start(msg: dict):
     asyncio.create_task(sess.start(msg.get("task", "")))
 
 
+async def handle_abort(msg: dict):
+    """「中止」：掐断当前正在生成的输出（turn 级）。
+
+    与「暂停 / 恢复 / 停止」是两套东西，互不干扰——那三个是辩论模式专属、且只在轮边界生效
+    （当前发言必须跑完）；「中止」两种模式都支持（单 agent 对话最容易被死循环卡住），
+    且当场打断，被打断的这次发言作废（落盘可见、不计轮次、不喂其他 agent）。
+    """
+    sid = msg.get("session_id")
+    s = sessions.get(sid) if sid else None
+    if not (s and s.running):
+        await broadcast({"type": "error", "text": "当前没有正在生成的发言，「中止」无效。"})
+        return
+    channel = await s.abort()
+    await broadcast({"type": "system",
+                     "msg": f"已请求中止当前发言（中断通道：{channel}）。该次发言作废，"
+                            "点「继续」可由该 agent 重新发言。"})
+
+
+async def handle_resume_turn(msg: dict):
+    """「继续」：让被中止的 agent 重新发言（turn 级续接）。
+
+    与底部「继续讨论」不同：那个是**新议题 = 新一轮 run**（必须输入内容）；本入口不要输入，
+    只兑现会话里的待续接记录（哪个 agent、哪一轮），因此既不会把「继续」记成新议题，
+    也不会把发言顺序重置回第一个 agent，轮次预算接着算。
+    """
+    sid = msg.get("session_id")
+    if sid and sessions.get(sid) and sessions[sid].running:
+        await broadcast({"type": "error", "text": "该会话正在运行，无法继续。"})
+        return
+    proj = store.get_project(msg.get("project_id") or "")
+    if not proj:
+        await broadcast({"type": "error", "text": "项目不存在"})
+        return
+    pending = store.get_pending_turn(proj["path"], sid) if sid else None
+    if not pending:
+        await broadcast({"type": "error", "text": "没有待继续的发言（可能已被新的发言兑现）。"})
+        return
+    sess = sessions.get(sid)
+    if sess is None:
+        # 服务重启/会话未在内存：按会话已存的 Team 重建（与发起路径同一套解析）
+        stored = store.read_session(proj["path"], sid) or {}
+        team = store.get_team(stored.get("team_id") or msg.get("team_id") or "")
+        agents = []
+        for aid in (team or {}).get("agent_ids", []):
+            ad = store.get_agent(aid)
+            if ad:
+                agents.append(AgentConfig(**ad))
+        if not agents:
+            await broadcast({"type": "error", "text": "会话的 Team 已失效，无法继续。"})
+            return
+        settings = store.get_settings()
+        sess = Session(proj["path"], sid, agents,
+                       int(msg.get("max_rounds") or settings.get("default_max_rounds", 12)),
+                       broadcast, timeout=settings.get("default_timeout", 300),
+                       tone=stored.get("tone") or "", project_id=proj["id"])
+        sessions[sid] = sess
+    asyncio.create_task(sess.start("", resume=True))
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -192,6 +252,12 @@ async def ws_endpoint(ws: WebSocket):
             action = msg.get("action")
             if action == "start":
                 await handle_start(msg)
+            elif action == "abort":
+                # turn 级：两种模式都放行（与下面 debate-only 的暂停/恢复/停止分开处理）
+                await handle_abort(msg)
+            elif action == "resume_turn":
+                # turn 级续接：不需要议题输入，兑现「待续接」记录
+                await handle_resume_turn(msg)
             elif action in ("stop", "pause", "resume", "inject"):
                 # 按 session_id 路由到对应会话（只操作目标会话，其他会话并行不受影响）
                 sid = msg.get("session_id")
@@ -272,6 +338,8 @@ async def get_session(pid: str, sid: str):
         "messages": s.get("messages", []),
         "agent_sessions": s.get("agent_sessions", {}),
         "think": think,
+        # 待续接记录：某次发言被「中止」后尚未兑现 → 前端主按钮显示「继续」
+        "pending_turn": s.get("pending_turn") or None,
         "exists": True,
     }
 

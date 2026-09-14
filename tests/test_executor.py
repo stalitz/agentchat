@@ -560,8 +560,99 @@ class TestCliTranscriptParse(unittest.TestCase):
         self.assertEqual(len(turns), 1)
         self.assertEqual(turns[0]["content"], "codex 答案")
         # 无法识别的结构 → 返回空列表（不报错）
-        p2 = self._write([json.dumps({"type": "world_state", "foo": "bar"})])
+        p2 = self._write(json.dumps({"type": "world_state", "foo": "bar"}))
         self.assertEqual(executor._parse_codex_transcript(p2), [])
+
+
+class FakeStdin:
+    def __init__(self):
+        self.frames = []
+
+    def write(self, b):
+        self.frames.append(b.decode("utf-8"))
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class FakeProc:
+    def __init__(self, returncode=None):
+        self.stdin = FakeStdin()
+        self.returncode = returncode
+
+
+class TestInterrupt(unittest.TestCase):
+    """turn 级中断（「中止」功能）：codex 走 turn/interrupt、claude 走 control_request、兜底整组硬停。"""
+
+    def _rt(self, atype):
+        return executor.AgentRuntime(models.AgentConfig(name="A", type=atype))
+
+    def test_user_frame_ends_with_newline(self):
+        # stream-json 输入是按行解析的 NDJSON：stdin 保持打开后缺换行会让 claude 卡在等这一行
+        frame = executor._user_frame("议题")
+        self.assertTrue(frame.endswith(b"\n"), "输入帧必须以换行结尾")
+
+    def test_is_claude_turn_end(self):
+        self.assertTrue(executor._is_claude_turn_end(
+            json.dumps({"type": "result", "subtype": "success"})))
+        self.assertTrue(executor._is_claude_turn_end(
+            json.dumps({"type": "result", "subtype": "error_during_execution"})))
+        self.assertFalse(executor._is_claude_turn_end(
+            json.dumps({"type": "assistant", "message": {"content": []}})))
+        self.assertFalse(executor._is_claude_turn_end("不是 json"))
+
+    def test_codex_interrupt_sends_turn_interrupt(self):
+        rt = self._rt("codex")
+        rt._appserver_proc = FakeProc()
+        rt._appserver_thread_id = "th_1"
+        rt._as_turn_id = "turn_1"
+        ch = asyncio.run(rt.interrupt())
+        self.assertEqual(ch, "turn_interrupt")
+        frames = [json.loads(f) for f in rt._appserver_proc.stdin.frames]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["method"], "turn/interrupt")
+        self.assertEqual(frames[0]["params"], {"threadId": "th_1", "turnId": "turn_1"})
+
+    def test_codex_interrupt_without_turn_id_is_noop(self):
+        # 尚未拿到 turn id（turn/start 应答未回）→ 不发帧，交给编排层看门狗硬停兜底
+        rt = self._rt("codex")
+        rt._appserver_proc = FakeProc()
+        rt._appserver_thread_id = "th_1"
+        self.assertEqual(asyncio.run(rt.interrupt()), "none")
+        self.assertEqual(rt._appserver_proc.stdin.frames, [])
+
+    def test_claude_interrupt_writes_control_request(self):
+        rt = self._rt("claude-code")
+        rt._live_proc = FakeProc()
+        ch = asyncio.run(rt.interrupt())
+        self.assertEqual(ch, "control_request")
+        frame = json.loads(rt._live_proc.stdin.frames[0])
+        self.assertEqual(frame["type"], "control_request")
+        self.assertEqual(frame["request"]["subtype"], "interrupt")
+        self.assertTrue(frame["request"]["cancel_queued"])
+        self.assertTrue(frame["request_id"])
+
+    def test_interrupt_none_when_nothing_in_flight(self):
+        rt = self._rt("claude-code")
+        self.assertEqual(asyncio.run(rt.interrupt()), "none")
+        rt._live_proc = FakeProc(returncode=0)   # 进程已退出
+        self.assertEqual(asyncio.run(rt.interrupt()), "none")
+
+    def test_codex_exec_fallback_falls_back_to_killpg(self):
+        # codex exec（无 app-server）没有协议中断通道 → 整组硬停
+        rt = self._rt("codex")
+        killed = []
+        orig = executor._kill_proc_group
+        executor._kill_proc_group = lambda p, grace=0.6: killed.append(p)
+        try:
+            rt._live_proc = FakeProc()
+            self.assertEqual(asyncio.run(rt.interrupt()), "killpg")
+        finally:
+            executor._kill_proc_group = orig
+        self.assertEqual(len(killed), 1)
 
 
 if __name__ == "__main__":

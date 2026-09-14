@@ -35,6 +35,14 @@ def _is_end_discussion(name) -> bool:
     return isinstance(name, str) and name.endswith("end_discussion")
 
 
+# 「中止 → 继续」时发给被中止 agent 的提示：那半截内容已作废，必须显式告知别再往下接，
+# 否则它会在 CLI 会话里接着自己的半句继续说（历史上下文里那半截仍在），出现「从中间续写」。
+_RESUME_NOTICE = (
+    "（你上一次的发言被用户中止了，那半截内容已作废、不作为讨论依据，也请不要接着它继续写。"
+    "请就当前议题重新完整发言一遍。）"
+)
+
+
 def _now_str() -> str:
     """本地时间，与 store._now 同格式（工具日志 ts 用）。"""
     import time as _t
@@ -140,6 +148,13 @@ class Session:
         # 而 asyncio.Event.wait() 在事件已 set 时立即返回 —— 暂停形同虚设。
         self.resume_event = asyncio.Event()
         self.resume_event.set()
+        # 「中止」（turn 级，与轮边界的暂停/停止**互不干扰**）：立即掐断正在生成的输出。
+        # 与 stop_event 分开，是因为两者语义不同：stop = 跑完当前发言后不再开下一轮；
+        # abort = 当场打断当前发言，且这次发言作废（落盘可见、不计轮次、不喂他人）。
+        self._abort_requested = False
+        self._current_runtime = None   # 当前在途 turn 的 runtime（中止时定位中断目标）
+        self._turn_in_flight = False   # 当前是否有 turn 在执行（看门狗据此决定是否硬停）
+        self.last_abort_channel = ""   # 实际使用的中断通道（诊断用）
         self.inject_queue: asyncio.Queue = asyncio.Queue()
         self.running = False
         # end_discussion 终止状态机（FR5.3b 多数同意）：
@@ -206,6 +221,40 @@ class Session:
     def paused(self) -> bool:
         return not self.resume_event.is_set()
 
+    @property
+    def aborted(self) -> bool:
+        return self._abort_requested
+
+    async def abort(self) -> str:
+        """中止**当前在途 turn**（turn 级中断），返回实际使用的中断通道。
+
+        与 stop()/pause() 是不同层的能力，互不干扰：
+        - pause(): 当前发言跑完，在下一位开始前挂起（轮边界）；
+        - stop():  当前发言跑完，不再开下一轮（轮边界）；
+        - abort(): 当场掐断正在生成的输出，且**这次发言作废**。
+
+        作废口径（用户确认）：被中止的半截发言仍然落盘并显示（标 interrupted，可追溯「中间出过错」），
+        但不计入轮次、不作为其他 agent 的上下文、不作为结论来源；续接时仍由**被中止的这个 agent
+        重新发言**（round_i 从待续接记录恢复，不重置回第一个 agent）。
+        """
+        if self._abort_requested:
+            return self.last_abort_channel  # 幂等：重复点不重复发帧
+        self._abort_requested = True
+        rt = self._current_runtime
+        self.last_abort_channel = (await rt.interrupt()) if rt is not None else "none"
+        if self._turn_in_flight and self.last_abort_channel != "none":
+            # 看门狗：协议帧发出后 turn 仍未收尾（个别后端/版本可能不响应中断）→ 整组硬停，
+            # 否则「中止」形同虚设，死循环照样跑下去。
+            asyncio.create_task(self._abort_watchdog(rt, 2.5))
+        return self.last_abort_channel
+
+    async def _abort_watchdog(self, rt, grace: float):
+        await asyncio.sleep(grace)
+        if self._turn_in_flight and rt is not None:
+            rt.hard_kill()
+            await self._emit(type="system",
+                             msg="中断未及时生效，已强制终止该 agent 的进程（本次发言作废）。")
+
     async def inject(self, text: str):
         await self.inject_queue.put(text)
 
@@ -257,6 +306,8 @@ class Session:
             others = [
                 m for m in self.history[my_idx + 1:]
                 if m.get("speaker") not in (agent.name, "system", "human")
+                # 被中止的发言已作废：不喂给其他 agent（用户口径：作废但仍落盘可见）
+                and not m.get("interrupted")
             ]
             if others:
                 delta = "\n\n".join(
@@ -371,9 +422,12 @@ class Session:
         await self._emit(type="system", msg=msg)
 
     def _format_conclusion(self) -> str:
-        """从历史中取最近一条 agent 发言（即达成一致的收敛发言），去掉 TERMINATE 行，作为格式化结论。"""
+        """从历史中取最近一条 agent 发言（即达成一致的收敛发言），去掉 TERMINATE 行，作为格式化结论。
+
+        跳过被中止（interrupted）的发言：那半截内容已作废，不能当结论。
+        """
         for m in reversed(self.history):
-            if m.get("speaker") not in ("system", "human"):
+            if m.get("speaker") not in ("system", "human") and not m.get("interrupted"):
                 text = "\n".join(l for l in m["content"].splitlines() if l.strip() != "TERMINATE")
                 return text.strip()
         return ""
@@ -400,6 +454,9 @@ class Session:
             pass
         await self._emit(type="turn_start", agent=agent.name, role=agent.role, atype=agent.type)
         runtime = self.runtimes[agent.name]
+        # 登记在途 turn：中止动作据此定位中断目标（runtime）与是否仍需要硬停（_turn_in_flight）
+        self._current_runtime = runtime
+        self._turn_in_flight = True
         collected = []
         thinking_parts = []
         errors: list[str] = []
@@ -459,6 +516,8 @@ class Session:
                     tool_use_errors.append(content)
                 await self._emit(type="tool_result", agent=agent.name, is_error=is_err, content=content)
             # done: 忽略
+        # 流已结束 → 本轮不再是「在途」，看门狗不应再硬停（硬停会误杀已闲置的 app-server 长连接）
+        self._turn_in_flight = False
         full = "".join(collected).strip()
         # 剥离 gemma 等推理模型在 reasoning/answer 之间输出的 '---' 分隔符噪声
         # （Ollama 常把 --- 作为思考与答案的分界，原样落库会被前端显示成一条横线）
@@ -472,6 +531,13 @@ class Session:
         if runtime.cli_session_id and self.agent_sessions.get(agent.name) != runtime.cli_session_id:
             self.agent_sessions[agent.name] = runtime.cli_session_id
             store.set_agent_session_id(self.project_path, self.session_id, agent.name, runtime.cli_session_id)
+        # 被中止：本次发言作废（落盘可见但不计入轮次/他人上下文），并记录「待续接」。
+        # 必须在终止状态机之前返回——半截发言不该产生 end_discussion 投票。
+        if self._abort_requested:
+            await self._finish_aborted_turn(
+                agent, round_i, content=full,
+                thinking="\n\n".join(thinking_parts).strip(), blocks=blocks)
+            return "", []
         await self._emit(type="turn_end", agent=agent.name)
         # 兜底：模型未拿到工具 schema（deepseek 走云端直连）时会把 end_discussion 调用
         # 写成文本 json（prompt 指令约定）。解析后并入 tool_uses，与真 tool_use 块等价，
@@ -585,9 +651,44 @@ class Session:
         if full or thinking_text or tool_calls or tool_results:
             self.history.append(entry)
             store.append_message(self.project_path, self.session_id, entry)
+            # 落盘一条**有效**发言即视为「待续接」已被兑现：清除待续接标记。
+            # 单一规则，覆盖两种情形：① 续接后该 agent 正常说完 ② 用户改发新议题把它顶掉。
+            store.clear_pending_turn(self.project_path, self.session_id)
         # 工具轮的错误已由状态机消化（claude 对注入工具报「未知工具」是预期行为），
         # 返回空 errors，_debate 据此继续下一轮而非中止。
         return full, ([] if tool_intent else errors)
+
+    async def _finish_aborted_turn(self, agent: AgentConfig, round_i: int,
+                                   content: str, thinking: str, blocks: list):
+        """收尾一次被中止的发言：内容照落盘（可见、可追溯「中间出过错」），但标记作废。
+
+        作废口径（用户确认）：
+        - 落盘 + 显示：半截内容保留，前端标「已中止」，用户能看到被告知曾出错；
+        - 不计入轮次 / 不作为其他 agent 的上下文（_build_prompt 的 others 过滤掉 interrupted）；
+        - 不作为结论来源（_format_conclusion 跳过）；
+        - 记 pending_turn：续接时仍由**这个** agent、从**这个** round_i 重新发言，
+          既不重置回第一个 agent，也不消耗轮次预算。
+        """
+        entry = {
+            "round": len(self.history), "speaker": agent.name, "role": agent.role,
+            "content": content,
+            "thinking": thinking,
+            "tool_calls": [],
+            "tool_results": [],
+            "blocks": blocks,
+            # 作废标记：前端据此置灰 + 标「已中止」，编排层据此排除出轮次/上下文/结论
+            "interrupted": True,
+        }
+        self.history.append(entry)
+        store.append_message(self.project_path, self.session_id, entry)
+        store.set_pending_turn(self.project_path, self.session_id, {
+            "agent": agent.name, "round_i": round_i,
+        })
+        await self._emit(type="turn_end", agent=agent.name, interrupted=True)
+        await self._record_system(
+            f"{agent.name} 的本次发言已被中止（内容作废，不计入轮次）。"
+            f"点「继续」将由 {agent.name} 就当前议题重新完整发言。"
+        )
 
     # ---------------- 入口 ----------------
     async def _close_runtimes(self):
@@ -598,18 +699,35 @@ class Session:
             except Exception:
                 pass
 
-    async def start(self, initial_task: str):
+    async def start(self, initial_task: str, resume: bool = False):
+        """执行一次运行（run）。
+
+        resume=False：常规发起 / 续跑（底部「开始讨论 / 继续讨论」）——传入内容是**新议题**，
+          发言顺序从第一个 agent 开始、轮次预算重新计。
+        resume=True：**中止后的继续**（主按钮槽位的「继续」）——不追加议题，从待续接记录恢复
+          round_i 与发言 agent，让被中止的那个 agent 重新发言（作废半轮不消耗轮次）。
+        """
         self.running = True
+        # 中止标记只管「这一次在途发言」，不是整场的持久状态 → 每次 run 复位
+        self._abort_requested = False
+        self.last_abort_channel = ""
+        # 同一个 Session 实例可被多次 run 复用（点「继续」/「继续讨论」续跑）：
+        # 上一场的 stop_event（「停止」留下的）与暂停态必须复位，否则新 run 一进循环就退出。
+        self.stop_event.clear()
+        self.resume_event.set()
+        if not resume:
+            # 常规发起/续跑以新议题开始，旧的待续接标记随之作废（被顶掉，不再提示续接）
+            store.clear_pending_turn(self.project_path, self.session_id)
         try:
             if self.mode == "chat":
-                await self._chat_turn(initial_task)
+                await self._chat_turn(initial_task, resume=resume)
             else:
-                await self._debate(initial_task)
+                await self._debate(initial_task, resume=resume)
         finally:
             self.running = False
             await self._close_runtimes()
 
-    async def _chat_turn(self, text: str):
+    async def _chat_turn(self, text: str, resume: bool = False):
         """单 agent 对话模式：一次调用 = 用户一条 + agent 一条。
         用户本轮消息作为 delta 发给 agent（其 CLI 会话已持有完整历史）。"""
         # 模式提示只在会话开头播一次，否则每发一条都刷一行系统气泡
@@ -619,27 +737,49 @@ class Session:
                 msg="单 agent 模式 · 对话模式：直接输入消息发送，agent 逐条回复（轮次 / 介入 / 暂停不适用）",
             )
         text = (text or "").strip()
-        if text:
-            await self._record_human(text, "用户")
+        if resume:
+            # 中止后继续：不重复追加用户消息（agent 侧已有该条），只发「上次被中止」提示
+            await self._run_turn(self.agents[0], len(self.history), _RESUME_NOTICE)
+        else:
+            if text:
+                await self._record_human(text, "用户")
+            await self._run_turn(self.agents[0], len(self.history), text or None)
         # 失败时 _run_turn 已落 system 错误消息并广播 error；单 agent 本轮即结束，无需额外处理
-        await self._run_turn(self.agents[0], len(self.history), text or None)
-        await self._emit(type="run_end", mode="chat")
+        await self._emit(type="run_end", mode="chat", aborted=self._abort_requested)
 
-    async def _debate(self, initial_task: str):
-        await self._emit(
-            type="system",
-            msg=f"会话开始 · agent 数={len(self.agents)} · 上限 {self.max_rounds} 轮",
-        )
-        # 记录本场议题：任务只在 round0 经 inject 传给第一个 agent，
-        # 后续 agent 首轮需要它作「任务背景」补齐（否则可能无法从上一 agent 发言推断议题，象棋实测走偏）。
-        self._initial_task = initial_task or ""
-        if (initial_task or "").strip():
-            await self._record_human(initial_task.strip(), "任务")
-        round_i = 0
-        pending_inject = initial_task
+    async def _debate(self, initial_task: str, resume: bool = False):
+        pending = store.get_pending_turn(self.project_path, self.session_id) if resume else None
+        if resume and not pending:
+            resume = False  # 待续接已被兑现/清除 → 退回常规行为，避免空跑
+        if resume:
+            # 续接沿用语会已存的议题（不追加 human「任务」，否则会被当成新议题）
+            self._initial_task = ""
+            for m in self.history:
+                if m.get("speaker") == "human" and m.get("role") == "任务":
+                    self._initial_task = m.get("content") or ""
+            round_i = int(pending.get("round_i") or 0)
+            pending_inject = _RESUME_NOTICE
+            await self._emit(
+                type="system",
+                msg=f"继续讨论：由 {pending.get('agent')} 重新发言（上一次发言已作废，不消耗轮次）",
+            )
+        else:
+            await self._emit(
+                type="system",
+                msg=f"会话开始 · agent 数={len(self.agents)} · 上限 {self.max_rounds} 轮",
+            )
+            # 记录本场议题：任务只在 round0 经 inject 传给第一个 agent，
+            # 后续 agent 首轮需要它作「任务背景」补齐（否则可能无法从上一 agent 发言推断议题，象棋实测走偏）。
+            self._initial_task = initial_task or ""
+            if (initial_task or "").strip():
+                await self._record_human(initial_task.strip(), "任务")
+            round_i = 0
+            pending_inject = initial_task
         # max_rounds 语义 = 「每个 agent 发言次数」（N 轮 = 每个 agent 发 N 次 = N×agent数 次发言）。
         # 故循环上限为 max_rounds * agent数；TERMINATE 收敛门槛沿用「至少两轮完整往返」(见下)。
         while round_i < self.max_rounds * len(self.agents) and not self.stop_event.is_set():
+            if self._abort_requested:
+                break  # 轮边界处被中止（极端时序）：同样结束本场，等「继续」重说
             if self.paused:
                 await self._emit(type="system", msg="已暂停")
                 await self.resume_event.wait()
@@ -650,6 +790,11 @@ class Session:
             current = self.agents[round_i % len(self.agents)]
             full, errors = await self._run_turn(current, round_i, pending_inject)
             pending_inject = None
+
+            # 发言被中止：整场停下（不推进 round_i、不喂给下一位），等「继续」由同一 agent 重说。
+            # 中止 ≠ 停止：停止是「跑完当前发言不再开下一轮」，中止是当场作废这次发言。
+            if self._abort_requested:
+                break
 
             # agent 执行失败（API 错误 / 空响应 / resume 异常）：不把报错信息当议题继续讨论，
             # 直接中止（_run_turn 已落 system 错误消息说明原因）。
@@ -681,5 +826,10 @@ class Session:
 
             round_i += 1
 
-        await self._record_system("会话结束")
-        await self._emit(type="run_end", mode="debate")
+        if self._abort_requested:
+            # 中止收尾：本次在途发言已作废（_finish_aborted_turn 已落消息与待续接记录），
+            # 这里只标一个场次结束语，明确「不是正常结束」。
+            await self._record_system("本场已中止（点「继续」由被中止的 agent 重新发言，轮次接着算）")
+        else:
+            await self._record_system("会话结束")
+        await self._emit(type="run_end", mode="debate", aborted=self._abort_requested)

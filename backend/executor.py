@@ -34,11 +34,16 @@ _MCP_SCRIPT = str(Path(__file__).resolve().parent / "terminate_signal_mcp.py")
 
 
 def _user_frame(prompt: str) -> bytes:
-    """stream-json 输入帧：把一轮 prompt 封装为 user 消息（SDK 同款格式）。"""
-    return json.dumps({
+    """stream-json 输入帧：把一轮 prompt 封装为 user 消息（SDK 同款格式）。
+
+    结尾必须带换行：stream-json 输入是**按行**解析的 NDJSON。原先因为写完就关 stdin，
+    靠 EOF 断行才没暴露；现在 stdin 要保持打开（给中断帧留通道），缺换行会让 claude
+    一直等这一行写完、首轮就卡死。SDK 自身也是 `JSON.stringify(msg) + "\\n"`。
+    """
+    return (json.dumps({
         "type": "user",
         "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
-    }, ensure_ascii=False).encode("utf-8")
+    }, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def _ensure_project_mcp(cwd: str, config_dir: str | None = None) -> None:
@@ -176,6 +181,14 @@ class AgentRuntime:
         self._as_reasoning_seen = 0    # 已吐出的 rollout reasoning 条数（仅当无 live 增量时兜底用）
         self._as_stderr_tail = []      # app-server stderr 尾部（最多 _AS_STDERR_TAIL 行）：断流诊断用
         self._as_returncode = None     # app-server 退出码（读循环 EOF 时记录）
+
+        # 「中止」目标定位（turn 级中断，与轮边界的暂停/停止互不干扰）：
+        # - _live_proc：当前在途 turn 的子进程（claude / codex exec 兜底），中断时按后端
+        #   分别走协议帧或整组硬停；turn 结束即注销，避免误伤下一轮。
+        # - _as_turn_id：当前在途 turn 的 codex turn id（app-server 的 turn/interrupt 必需参数，
+        #   来自 turn/start 应答或 turn/started 通知）。
+        self._live_proc = None
+        self._as_turn_id = None
 
     @property
     def is_fresh(self) -> bool:
@@ -434,7 +447,11 @@ class AgentRuntime:
         _ensure_project_mcp(cwd, self._claude_config_dir())
         self._section = None  # 新一轮：重置思考/答案归属状态
         async for kind, payload in _stream_subprocess(cmd, cwd, timeout, parse="claude", env=env,
-                                                      runtime=self, stdin_data=_user_frame(prompt)):
+                                                      runtime=self, stdin_data=_user_frame(prompt),
+                                                      # keep_stdin：保住 stdin 才能在 turn 中途
+                                                      # 写 control_request 中断帧（中止功能，
+                                                      # 与轮边界的暂停/停止互不干扰）
+                                                      keep_stdin=True):
             # text / thinking 整块回放为逐字流（claude 外壳对本地模型整块输出时的兜底）
             if kind in ("text", "thinking") and payload:
                 async for seg in _replay(kind, payload):
@@ -533,6 +550,7 @@ class AgentRuntime:
         tid = self._appserver_thread_id
         # 清掉上一轮残留通知（status/tokenUsage 等），避免误判为新一轮事件
         await self._as_drain_stale()
+        self._as_turn_id = None  # 上一轮 turn id 作废，避免中止动作打到已结束的 turn
         got_reasoning = False
         rid = self._next_id()
         self._as_send({"jsonrpc": "2.0", "id": rid, "method": "turn/start",
@@ -556,8 +574,19 @@ class AgentRuntime:
                 if o.get("_tool_use") is not None:
                     yield ("tool_use", o["_tool_use"])
                     continue
+                # turn/start 的应答：记录 turn id（turn/interrupt 必需参数）。
+                # 应答与通知共用一个队列，必须在此消费掉，否则会被当成未知通知忽略。
+                if o.get("id") == rid and isinstance(o.get("result"), dict):
+                    _turn = (o["result"].get("turn") or {})
+                    if _turn.get("id"):
+                        self._as_turn_id = _turn["id"]
+                    continue
                 m = o.get("method")
-                if m == "item/agentMessage/delta":
+                if m == "turn/started":
+                    _turn = (o.get("params") or {}).get("turn") or {}
+                    if _turn.get("id"):
+                        self._as_turn_id = _turn["id"]
+                elif m == "item/agentMessage/delta":
                     d = (o.get("params") or {}).get("delta") or ""
                     if d:
                         yield ("text", d)
@@ -581,6 +610,7 @@ class AgentRuntime:
                     yield ("error", str(params.get("message") or params.get("data") or params))
                     return
                 elif m == "turn/completed":
+                    self._as_turn_id = None
                     break
                 # 其余通知（thread/status/changed、tokenUsage、mcpServer/* 等）忽略
         finally:
@@ -863,21 +893,85 @@ class AgentRuntime:
         """会话结束回收 codex app-server 长连接（由编排层 Session.start() finally 调用）。"""
         self._kill_appserver()
 
+    # ---------------- turn 级中断（「中止」功能） ----------------
+    async def interrupt(self) -> str:
+        """中断**当前在途 turn**，返回实际使用的通道（诊断用）。
+
+        与轮边界的 pause/stop 是不同层的东西：pause/stop 只在下一位发言前生效（当前 turn 跑完
+        才停），本方法直接掐断正在生成的输出。通道按「协议优先、硬停兜底」分级：
+
+        - codex app-server：`turn/interrupt{threadId,turnId}` JSON-RPC（实测毫秒级生效），
+          且长连接与 thread 都保留，续接能继续复用同一会话 —— 首选。
+        - claude：往 stdin 写 `control_request{subtype:interrupt}`。claude 中止当前回合后照常
+          发 result 收尾、进程正常退出（不留会话锁，续接走 `--resume`）。
+        - 其余（codex exec 兜底路径 / 协议帧写失败）：`_kill_proc_group` 整组硬停。
+        返回 "turn_interrupt" / "control_request" / "killpg" / "none"（无在途 turn）。
+        """
+        proc = self._appserver_proc
+        if proc is not None and getattr(proc, "returncode", None) is None and self._as_turn_id:
+            self._as_send({"jsonrpc": "2.0", "id": self._next_id(), "method": "turn/interrupt",
+                           "params": {"threadId": self._appserver_thread_id,
+                                      "turnId": self._as_turn_id}})
+            return "turn_interrupt"
+        live = self._live_proc
+        if live is not None and getattr(live, "returncode", None) is None:
+            if self.agent.type == "claude-code" and live.stdin is not None:
+                try:
+                    frame = json.dumps({
+                        "type": "control_request", "request_id": "int-1",
+                        "request": {"subtype": "interrupt", "cancel_queued": True},
+                    }, ensure_ascii=False) + "\n"
+                    live.stdin.write(frame.encode("utf-8"))
+                    await live.stdin.drain()
+                    return "control_request"
+                except Exception:
+                    pass
+            _kill_proc_group(live)
+            return "killpg"
+        return "none"
+
+    def hard_kill(self) -> None:
+        """兜底硬停：中断帧发出后 turn 仍未收尾时，整组掐掉在途进程/连接（看门狗调用）。"""
+        live = self._live_proc
+        if live is not None and getattr(live, "returncode", None) is None:
+            _kill_proc_group(live)
+            self._live_proc = None
+        if self._appserver_proc is not None:
+            self._kill_appserver()
+
 
 class _CodexAppServerUnavailable(Exception):
     """codex app-server 握手/启动失败：调用方应回退到 codex exec 兜底。"""
+def _is_claude_turn_end(text: str) -> bool:
+    """判断一行 stream-json 是否为「单轮结束」（claude 的 result 事件）。
+
+    stdin 保持打开时（可中断模式，见 _stream_subprocess 的 keep_stdin）claude 收到 result 后
+    不会自行退出——它在等后续消息，读循环会永远阻塞在下一次 readline，turn 永不结束。
+    故必须据此主动收尾。正常完成与被打断（aborted）都以 result 收尾，只认 type 即可。
+    """
+    try:
+        ev = json.loads(text)
+    except Exception:
+        return False
+    return isinstance(ev, dict) and ev.get("type") == "result"
+
+
 async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runtime=None, env=None,
-                             stdin_data: bytes | None = None):
+                             stdin_data: bytes | None = None, keep_stdin: bool = False):
     """启动子进程并按行产出 ("text", str) 或 ("error", str)。
 
     env：显式传入则完全覆盖子进程环境变量（用于 per-agent 网关隔离）；
     为 None 时继承当前进程环境（默认行为）。
     stdin_data：非空时写入子进程 stdin 后关闭（stream-json 输入帧用）。
+    keep_stdin：**保持 stdin 打开**（claude 用）。claude 的 turn 级中断只能靠往 stdin 写
+      `control_request{subtype:interrupt}` 帧实现，关掉 stdin 就没通道了。代价是 claude 收到
+      `result` 后不会自行退出（它在等后续消息），故此时由本函数**按 result 事件收尾**并主动
+      关 stdin 让其正常退出（SIGKILL 会残留会话锁，见 _run_claude 自愈路径）。仅 claude 需要。
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd, env=env,
-            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+            stdin=asyncio.subprocess.PIPE if (stdin_data is not None or keep_stdin) else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             # 自成进程组：超时/异常时整组回收，避免 claude/codex 的子进程孤儿化
             # （见 _kill_proc_group）。
@@ -887,6 +981,10 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
         yield ("error", f"启动失败: {e}")
         return
     assert proc.stdout is not None
+    # 登记「当前在途 turn 的进程」：编排层中止时据此定位目标（claude 写中断帧 / 兜底整组硬停）。
+    if runtime is not None:
+        runtime._live_proc = proc
+
     # --verbose 会把调试信息大量写入 stderr，不消费会撑满管道阻塞 claude 子进程；
     # 这里异步排空，仅保留尾部（错误报告时用）。
     stderr_tail: list[bytes] = []
@@ -913,10 +1011,11 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
         except Exception:
             pass
         finally:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
+            if not keep_stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
     try:
         while True:
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
@@ -926,13 +1025,30 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
             if parse == "claude":
                 for kind, payload in _parse_claude_line(text, runtime):
                     yield kind, payload
+                # stdin 保持着时 claude 不会在 result 后退出，必须按 result 事件收尾，
+                # 否则本生成器永远阻塞在下一次 readline（turn 永不结束）。
+                if keep_stdin and _is_claude_turn_end(text):
+                    break
             elif parse == "codex":
                 for kind, payload in _parse_codex_line(text, runtime):
                     yield kind, payload
             else:
                 if text.strip():
                     yield ("text", text)
-        await proc.wait()
+        if keep_stdin and proc.returncode is None:
+            # 主动收尾：关 stdin 让 claude 正常退出（不 SIGKILL，避免残留会话锁）
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                _kill_proc_group(proc)
+                await proc.wait()
+        else:
+            await proc.wait()
         if proc.returncode not in (0, None):
             err = ""
             if stderr_tail:
@@ -951,6 +1067,10 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
         if not drain_task.done():
             drain_task.cancel()
         yield ("error", f"执行异常: {e}")
+    finally:
+        # 注销在途进程登记（本轮已结束，避免中止动作误伤下一轮）
+        if runtime is not None and runtime._live_proc is proc:
+            runtime._live_proc = None
 
 
 _REPLAY_CHUNK = 3

@@ -208,6 +208,53 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(ev.get("type"), "error")
         self.assertIn("空", ev.get("text", ""))
 
+    def test_ws_abort_without_running_session_reports_error(self):
+        # 「中止」没有在跑的发言时给明确反馈（不静默丢弃）
+        main.sessions.clear()
+        with self.client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "abort", "session_id": "s_none"})
+            ev = ws.receive_json()
+        self.assertEqual(ev.get("type"), "error")
+        self.assertIn("中止", ev.get("text", ""))
+
+    def test_ws_resume_turn_without_pending_reports_error(self):
+        # 没有待续接记录时点「继续」→ 明确报错（不空跑一轮）
+        main.sessions.clear()
+        sid = store.create_session(str(TMP / "api_proj"), "无待续接")["id"]
+        with self.client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "resume_turn", "project_id": self.pr_id, "session_id": sid})
+            ev = ws.receive_json()
+        self.client.delete(f"/api/session/{self.pr_id}/{sid}")  # 清理，避免污染共享项目目录
+        self.assertEqual(ev.get("type"), "error")
+        self.assertIn("没有待继续的发言", ev.get("text", ""))
+
+    def test_ws_abort_allowed_in_chat_mode(self):
+        # 「中止」是 turn 级能力，两种模式都放行——单 agent 对话最容易被死循环卡住
+        # （对比：pause/resume/stop 在 chat 模式必须继续被拒，二者互不干扰）
+        sid = store.create_session(str(TMP / "api_proj"), "对话")["id"]
+        with self.client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "start", "project_id": self.pr_id,
+                          "team_id": self.tm_id, "session_id": sid, "task": "你好", "max_rounds": 1})
+            ws.receive_json()  # 会话开始 / turn_start 等首个事件
+            ws.send_json({"action": "abort", "session_id": sid})
+            seen = []
+            for _ in range(30):
+                ev = ws.receive_json()
+                seen.append(ev)
+                if ev.get("type") == "run_end":
+                    break
+        self.client.delete(f"/api/session/{self.pr_id}/{sid}")  # 清理，避免污染共享项目目录
+        texts = [e.get("text", "") + e.get("msg", "") for e in seen]
+        self.assertFalse(any("不适用" in t for t in texts), "chat 模式下「中止」不应被当作不适用动作拒绝")
+
+    def test_get_session_exposes_pending_turn(self):
+        # 前端靠 GET 会话的 pending_turn 决定主按钮是否显示「继续」（刷新后仍要准）
+        sid = store.create_session(str(TMP / "api_proj"), "待续接")["id"]
+        store.set_pending_turn(str(TMP / "api_proj"), sid, {"agent": "假A", "round_i": 0})
+        d = self.client.get(f"/api/session/{self.pr_id}/{sid}").json()
+        self.client.delete(f"/api/session/{self.pr_id}/{sid}")  # 清理，避免污染共享项目目录
+        self.assertEqual(d.get("pending_turn"), {"agent": "假A", "round_i": 0})
+
     def test_fs_list_returns_subdirs(self):
         # 建一个含子目录的临时目录
         base = TMP / "fs_test"

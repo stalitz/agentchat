@@ -411,6 +411,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
         msgs = s.setdefault("messages", [])
         idxs = [i for i, m in enumerate(msgs) if m.get("speaker") == agent_name]
         role = msgs[idxs[0]].get("role", "") if idxs else ""
+        # 被中止（interrupted）的发言是「作废但留痕」的记录：覆盖时只改内容/思考/工具/时间，
+        # 不碰 interrupted 标记本身（下面各处赋值均按字段写，天然保留）。
+        # 但**禁止在存在中止记录时追加**：中止的那一轮在 CLI transcript 里可能是半截内容
+        # （与我们留的半截不完全一致 → 内容匹配不上），照常追加会凭空多出一个重复气泡。
+        has_interrupted = any(m.get("interrupted") for m in msgs if m.get("speaker") == agent_name)
         if len(cli_turns) == len(idxs):
             # 数量一致：按顺序覆盖（原语义，以 agent 为准修正内容/思考）
             for k, turn in enumerate(cli_turns):
@@ -459,7 +464,7 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                             hit = j
                             break
                 if hit is None:
-                    if len(cli_turns) > len(idxs):
+                    if len(cli_turns) > len(idxs) and not has_interrupted:
                         msgs.append({
                             "round": len(msgs), "speaker": agent_name, "role": role,
                             "content": new_content, "thinking": new_think,
@@ -502,6 +507,9 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 unmatched = [i for i in idxs if i not in matched]
                 for i in sorted(unmatched, reverse=True):
                     m = msgs[i]
+                    # 中止记录不删：它是「中间出过错」的留痕（用户明确要求落盘可见）
+                    if m.get("interrupted"):
+                        continue
                     if (m.get("thinking") or "") and not (m.get("content") or ""):
                         msgs.pop(i)
                         changed += 1
@@ -529,6 +537,45 @@ def set_agent_session_id(project_path: str, sid: str, agent_name: str, cli_sessi
             "id": sid, "title": "会话", "created_at": now, "updated_at": now,
             "messages": [], "agent_sessions": {agent_name: cli_session_id}, "conclusion": "",
         })
+    _save_sessions(project_path, sessions)
+
+
+def set_pending_turn(project_path: str, sid: str, info: dict) -> None:
+    """记录「待续接」的发言：某 agent 的一次发言被中止，等用户点「继续」时由它重新发言。
+
+    info = {"agent": 名称, "round_i": 该次发言的轮次下标}。存 session 级字段（而非从
+    messages 推导）：一轮的 round_i 会因偶发空轮（未落盘的 agent 发言）与「有效发言条数」
+    发生偏移，推导会把续接指到错误的 agent 上；记录实测值才是确定式的。
+    """
+    sessions = _load_sessions(project_path)
+    for s in sessions:
+        if s["id"] == sid:
+            s["pending_turn"] = dict(info or {})
+            s["updated_at"] = _now()
+            break
+    else:
+        return
+    _save_sessions(project_path, sessions)
+
+
+def get_pending_turn(project_path: str, sid: str) -> Optional[dict]:
+    """读「待续接」记录；无则返回 None（前端据此决定主按钮是否显示「继续」）。"""
+    s = read_session(project_path, sid)
+    info = (s or {}).get("pending_turn") or {}
+    return info if info.get("agent") else None
+
+
+def clear_pending_turn(project_path: str, sid: str) -> None:
+    """清除待续接记录（被一次有效发言兑现，或被新议题顶掉）。幂等：无记录时不动。"""
+    sessions = _load_sessions(project_path)
+    for s in sessions:
+        if s["id"] == sid:
+            if s.pop("pending_turn", None) is None:
+                return
+            s["updated_at"] = _now()
+            break
+    else:
+        return
     _save_sessions(project_path, sessions)
 
 

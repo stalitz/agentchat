@@ -332,15 +332,32 @@ setTimeout(async () => {
     check(doc.getElementById('btnStart').textContent.indexOf('讨论') >= 0, '辩论模式主按钮文案应含「讨论」');
 
     // ---- run_end 事件：结束后有议题则按钮恢复可点；空议题仍禁用（避免 agent 空跑）----
+    // ---- 运行中：主按钮槽位变「中止」（turn 级中断，不再禁用——禁用就没法中止死循环）----
     dom.window.curSid = 's_test';
+    dom.window.pendingBySid = {};
     dom.window.runningBySid = { s_test: true }; dom.window.refreshSendBtn();
-    check(doc.getElementById('btnStart').disabled === true, '运行中主按钮应禁用');
+    check(doc.getElementById('btnStart').disabled === false, '运行中主按钮应可点（此时是「中止」）');
+    check(doc.getElementById('btnStart').textContent.indexOf('中止') >= 0, '运行中主按钮文案应为「中止」');
     doc.getElementById('task').value = '下一代架构怎么定';   // 有议题才允许继续
     dom.window.handleEvent({ type: 'run_end', mode: 'debate', sid: 's_test' });
     check(doc.getElementById('btnStart').disabled === false, '收到 run_end 且输入议题后主按钮应恢复可点');
     doc.getElementById('task').value = '';
     dom.window.refreshSendBtn();
     check(doc.getElementById('btnStart').disabled === true, '辩论模式空议题时主按钮应禁用（达成一致后空点继续不应让 agent 空跑）');
+
+    // ---- 中止后（有待续接发言）：主按钮变「继续」，且不需要输入内容 ----
+    dom.window.pendingBySid = { s_test: { agent: 'g1' } };
+    doc.getElementById('task').value = '';
+    dom.window.refreshSendBtn();
+    check(doc.getElementById('btnStart').disabled === false, '有待续接发言时主按钮应可点（续接不需要输入）');
+    check(doc.getElementById('btnStart').textContent.indexOf('继续') >= 0, '有待续接发言时主按钮文案应为「继续」');
+    check(doc.getElementById('btnStart').textContent.indexOf('g1') >= 0, '「继续」应标明由哪个 agent 重新发言');
+    // 被中止的气泡：作废但仍保留内容可见（灰化 + 「已中止」角标）
+    dom.window.renderHistoryEntry({ speaker: 'g1', content: '半截发言', interrupted: true, blocks: [] });
+    var bubbles = doc.querySelectorAll('#chat .bubble.interrupted');
+    check(bubbles.length === 1, '被中止的发言气泡应带 interrupted 样式类');
+    check((bubbles[0].textContent || '').indexOf('已中止') >= 0, '被中止的气泡应显示「已中止」标记');
+    dom.window.pendingBySid = {};
 
     // ---- 多会话并行：其他会话在跑时当前会话按钮不受影响；其他会话事件不渲染到当前聊天区 ----
     dom.window.curSid = 's_b';

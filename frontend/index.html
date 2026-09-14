@@ -168,6 +168,14 @@
   textarea { width:100%; resize:vertical; min-height:46px; }
   .status { font-size:12px; color:var(--muted); margin-left:auto; }
   button:disabled { opacity:.5; cursor:not-allowed; }
+  /* 「中止」：出现在主按钮槽位（生成中），用警示色与常规发送/开始按钮区分 */
+  button.abort-btn { background:#c0392b; border-color:#a5301f; color:#fff; }
+  /* 被中止的发言气泡：作废但仍保留内容可见（灰化 + 角标），与正常发言一眼可分 */
+  .bubble.interrupted { opacity:.62; }
+  .bubble.interrupted .abort-tag {
+    margin-left:8px; padding:1px 7px; border-radius:10px; font-size:10px; font-weight:500;
+    background:#f6d9d4; color:#a5301f; border:1px solid #e8b3a9;
+  }
   /* 对话模式（单 agent）：轮次 / 暂停继续停止 / 人工介入 均不适用，隐藏以免误点 */
   body.chat-mode #roundRow, body.chat-mode #injectRow, body.chat-mode .debate-only { display:none !important; }
   #modeTag { padding:1px 7px; border-radius:10px; background:#eef1f5; }
@@ -308,11 +316,11 @@
         <span class="ctx-meta" id="composerProj">项目：—</span>
         <label>Team <select id="selTeam" onchange="updateRoundControl()"></select></label>
         <span class="ctx-meta" id="modeTag"></span>
-        <button class="primary" id="btnStart" onclick="startSession()">开始讨论</button>
+        <button class="primary" id="btnStart" onclick="mainAction()" title="对话模式：发送；生成中：中止">开始讨论</button>
         <span id="ctrlBtns" class="debate-only" style="display:inline-flex; gap:8px;">
-          <button onclick="ctrl('pause')">暂停</button>
-          <button onclick="ctrl('resume')">继续</button>
-          <button onclick="ctrl('stop')">停止</button>
+          <button onclick="ctrl('pause')" title="当前发言跑完，在下一位开始前挂起（轮边界生效）">暂停</button>
+          <button onclick="ctrl('resume')" title="解除暂停（轮边界，不需要输入内容）">恢复</button>
+          <button onclick="ctrl('stop')" title="当前发言跑完后不再开下一轮（轮边界生效）">停止</button>
         </span>
         <span class="status" id="status">未连接</span>
       </div>
@@ -384,6 +392,9 @@ var curTid = null;          // 当前会话所用 Team id（composer 下拉 / �
 var curProjSessions = [];   // 当前项目的会话列表
 var curMsgCount = 0;        // 当前会话已有消息条数（决定主按钮文案）
 var runningBySid = {};   // sid -> bool：各会话是否正在跑（多会话并行，只禁用正在跑的会话）
+// sid -> {agent} | null：该会话是否有「被中止、等待重新发言」的发言（主按钮据此显示「继续」）。
+// 权威值来自 GET /api/session 的 pending_turn；这里缓存一份，避免流式结束后要重载才知道状态。
+var pendingBySid = {};
 function isRunning(sid) { return sid ? !!runningBySid[sid] : false; }
 var expanded = { projects: {}, teams: {} };  // 树展开状态
 
@@ -478,6 +489,8 @@ function handleEvent(ev) {
   if (ev.sid && ev.sid !== curSid) {
     if (ev.type === 'run_end') {
       runningBySid[ev.sid] = false;
+      // 中止收尾：该会话留下「待续接」标记（切换到它时主按钮显示「继续」）
+      pendingBySid[ev.sid] = ev.aborted ? {} : null;
       refreshSendBtn();
       if (curPid) refreshSessionList(curPid);
     }
@@ -489,6 +502,9 @@ function handleEvent(ev) {
     // 辩论模式重载为持久化后的权威内容。
     case 'run_end':
       if (ev.sid) runningBySid[ev.sid] = false;
+      // 被中止的 run：记下待续接（主按钮立刻变「继续」，不必等重载）；
+      // 正常结束则清掉（该会话的待续接已被有效发言兑现）
+      if (ev.sid) pendingBySid[ev.sid] = ev.aborted ? { agent: curTurnAgent || '' } : null;
       refreshSendBtn();
       if (!curPid) break;
       refreshSessionList(curPid);
@@ -552,6 +568,9 @@ function handleEvent(ev) {
           cur.appendChild(p);
         }
         endThinking();
+        // 被中止：给当前气泡打「已中止」标记（内容保留可见，仅灰化）——
+        // 与刷新后 renderHistoryEntry 走 interrupted 标记的渲染保持一致
+        if (ev.interrupted) markInterrupted(cur);
       }
       curTurnAgent = null; cur = null; curAnswer = null; break;
   }
@@ -965,18 +984,44 @@ function applyMode() {
   }
   refreshSendBtn();
 }
-// 主按钮文案随模式与会话状态变化：对话模式=发送；辩论模式=开始/继续讨论
+// 主按钮槽位（三态复用，用户确认的方案——不新增常驻按钮，也避免出现两个「继续」）：
+//   生成中        → 「中止」（turn 级中断：当场掐断输出，两种模式都可用）
+//   有待续接发言   → 「继续」（让被中止的 agent 重新发言，不需要输入内容）
+//   其余          → 「发送」/「开始讨论」/「继续讨论」（原行为，需输入内容）
 function refreshSendBtn() {
   var b = document.getElementById('btnStart');
   if (!b) return;
-  if (isRunning(curSid)) { b.disabled = true; b.textContent = isChatMode() ? '回复中…' : '讨论进行中…'; return; }
+  b.classList.remove('abort-btn');
+  if (isRunning(curSid)) {
+    b.disabled = false;
+    b.classList.add('abort-btn');
+    b.textContent = '中止';
+    b.title = '立刻掐断正在生成的输出；本次发言作废（不计轮次、不喂给其他 agent），点「继续」可由该 agent 重新发言';
+    return;
+  }
+  var pend = curSid ? pendingBySid[curSid] : null;
+  if (pend) {
+    b.disabled = false;  // 续接不需要输入内容
+    b.textContent = pend.agent ? ('继续（' + pend.agent + ' 重新发言）') : '继续';
+    b.title = '被中止的那次发言已作废；由该 agent 就当前议题重新完整发言，轮次接着算（不消耗半轮）';
+    return;
+  }
   // 输入为空时禁用：对话模式不能发空消息；辩论模式不能发起/继续空议题
   // （达成一致后若想继续，必须输入新议题；空点「继续讨论」不应再让 agent 空跑）
   var empty = !document.getElementById('task').value.trim();
   b.disabled = empty;
+  b.title = '';
   b.textContent = isChatMode()
     ? '发送'
     : (curMsgCount > 0 ? '继续讨论（已有 ' + curMsgCount + ' 条）' : '开始讨论');
+}
+
+// 主按钮的动作分发：同一个按钮承载「中止 / 继续 / 发送（开始讨论）」
+function mainAction() {
+  if (!curPid) { alert('请先在左侧选择一个项目'); return; }
+  if (isRunning(curSid)) { ctrl('abort'); return; }
+  if (curSid && pendingBySid[curSid]) { ctrl('resume_turn'); return; }
+  startSession();
 }
 
 function startSession() {
@@ -992,17 +1037,26 @@ function startSession() {
   var ready = curSid ? Promise.resolve(curSid) : createSessionOnServer((task.trim() || '新会话').slice(0, 24), tid);
   ready.then(function (sid) {
     curSid = sid;
+    // 新议题 = 新一轮 run，会顶掉待续接记录（服务端 start(resume=False) 同样清除）：
+    // 本地同步清掉，主按钮立刻从「继续」回到「发送 / 继续讨论」
+    pendingBySid[sid] = null;
     runningBySid[sid] = true; refreshSendBtn();
     WS.send(JSON.stringify({ action: 'start', project_id: curPid, team_id: tid, session_id: sid, task: task, max_rounds: mr, tone: tone }));
     document.getElementById('task').value = '';  // 内容已作为消息回显，输入框清空
   }).catch(function (e) { if (curSid) runningBySid[curSid] = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
 }
 function ctrl(a) {
-  // 「继续」按钮走 resume：必须立即标记会话正在跑（与 startSession 一致），否则 run_end 的
+  // 「恢复」按钮走 resume：必须立即标记会话正在跑（与 startSession 一致），否则 run_end 的
   // 250ms 重载守卫（if (runningBySid[curSid]) return）对续接路径永远失效——续接首个 agent
   // 刚流式渲染的内容会被重载抹掉（g1 输出消失）。startSession 已在发送前置位，resume 此前漏了。
   if (a === 'resume' && curSid) { runningBySid[curSid] = true; refreshSendBtn(); }
-  WS.send(JSON.stringify({ action: a, session_id: curSid }));
+  // 「继续」（resume_turn，让被中止的 agent 重说）同理：立刻置位 running，保住刚流式出来的内容
+  if (a === 'resume_turn' && curSid) { runningBySid[curSid] = true; refreshSendBtn(); }
+  var payload = { action: a, session_id: curSid };
+  // turn 级动作需要 project_id（服务端按项目路径读写会话文件；中止/续接都可能发生在
+  // 服务端内存里没有该 Session 的时候，如服务重启后直接点「继续」）
+  if (a === 'abort' || a === 'resume_turn') payload.project_id = curPid;
+  WS.send(JSON.stringify(payload));
 }
 function doInject() {
   var x = document.getElementById('inject').value.trim();
@@ -1141,6 +1195,8 @@ function openSession(sid) {
     var d = res[0];
     var td = res[1];
     curToolLog = (td && td.tools) || [];
+    // 待续接状态（权威值）：该会话有「被中止、等待重新发言」的发言 → 主按钮显示「继续」
+    pendingBySid[sid] = d.pending_turn || null;
     // 会话级「思考」开关：按 get_session 返回的 think（会话显式值或全局默认）初始化
     var chk = document.getElementById('chkThink');
     if (chk) chk.checked = d.think !== false;
@@ -1190,13 +1246,30 @@ function toggleThink(on) {
 }
 
 // ---------- 单气泡渲染（方案 B：一个 agent 回合 = 一个气泡，内部按 思考→调用工具→工具结果→正文 顺序） ----------
-function openTurn(name, atype, ts) {
+function openTurn(name, atype, ts, interrupted) {
   var row = document.createElement('div'); row.className = 'row';
-  var b = document.createElement('div'); b.className = 'bubble ' + (atype || 'claude-code');
-  b.innerHTML = '<div class="who">' + esc(name) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '') + '</div><div class="turn-body"></div>';
+  var b = document.createElement('div');
+  b.className = 'bubble ' + (atype || 'claude-code') + (interrupted ? ' interrupted' : '');
+  b.innerHTML = '<div class="who">' + esc(name) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '')
+    + (interrupted ? '<span class="abort-tag">已中止（本次发言作废）</span>' : '')
+    + '</div><div class="turn-body"></div>';
   row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
   cur = b.querySelector('.turn-body');  // 修复：懒建必须挂到全局 cur（此前漏赋，实时流 appendThinking/appendToken 会崩）
   return cur;
+}
+// 给气泡打「已中止」标记（内容保留可见、仅灰化 + 角标）。
+// 实时流（turn_end.interrupted）与历史渲染（entry.interrupted）共用，保证刷新前后渲染一致。
+function markInterrupted(bodyEl) {
+  if (!bodyEl || !bodyEl.closest) return;
+  var b = bodyEl.closest('.bubble');
+  if (!b) return;
+  b.classList.add('interrupted');
+  var who = b.querySelector('.who');
+  if (who && !who.querySelector('.abort-tag')) {
+    var tag = document.createElement('span'); tag.className = 'abort-tag';
+    tag.textContent = '已中止（本次发言作废）';
+    who.appendChild(tag);
+  }
 }
 function makeThinkingBlock(name, text, atype, open_) {
   var det = document.createElement('details'); det.className = 'turn-block thinking' + (atype ? ' ' + atype : '');
@@ -1259,7 +1332,7 @@ function renderHistoryEntry(h) {
   if (h.speaker === 'system') { addRow('sys', h.role || '系统', h.content || '', h.ts); return; }
   if (h.speaker === 'human') { addRow('human', h.role || '人工介入', h.content || '', h.ts); return; }
   var type = cfg_agents_by_name(h.speaker) || 'claude-code';
-  var body = openTurn(h.speaker, type, h.ts);
+  var body = openTurn(h.speaker, type, h.ts, !!h.interrupted);
   // 时间线渲染：优先按后端产出的有序 blocks（思考/正文/工具调用/工具结果 按发生顺序），
   // 旧消息无 blocks 时回退到固定顺序（思考 → 工具调用 → 工具结果 → 正文）。
   var blocks = h.blocks;

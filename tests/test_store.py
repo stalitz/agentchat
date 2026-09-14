@@ -327,5 +327,56 @@ class TestStore(unittest.TestCase):
         self.assertEqual(store.get_settings()["default_model_codex"], "pinned-codex-model")
 
 
+class TestPendingTurn(unittest.TestCase):
+    """待续接记录（中止后的「继续」依据）：哪个 agent、哪一轮。"""
+
+    def setUp(self):
+        fresh_config()
+        self.proj = str(TMP / "pending_proj")
+        self.sid = store.create_session(self.proj, "s")["id"]
+
+    def test_set_get_clear(self):
+        self.assertIsNone(store.get_pending_turn(self.proj, self.sid))
+        store.set_pending_turn(self.proj, self.sid, {"agent": "A", "round_i": 3})
+        self.assertEqual(store.get_pending_turn(self.proj, self.sid), {"agent": "A", "round_i": 3})
+        store.clear_pending_turn(self.proj, self.sid)
+        self.assertIsNone(store.get_pending_turn(self.proj, self.sid))
+
+    def test_clear_is_idempotent(self):
+        store.clear_pending_turn(self.proj, self.sid)  # 无记录时不报错、不写坏会话
+        self.assertEqual(store.read_session(self.proj, self.sid)["id"], self.sid)
+
+    def test_pending_survives_message_append(self):
+        # 中止时先落 message 再记录待续接：两者必须共存（不能被覆盖）
+        store.append_message(self.proj, self.sid,
+                             {"round": 0, "speaker": "A", "content": "半截", "interrupted": True})
+        store.set_pending_turn(self.proj, self.sid, {"agent": "A", "round_i": 0})
+        s = store.read_session(self.proj, self.sid)
+        self.assertTrue(s["messages"][0]["interrupted"], "interrupted 字段必须原样落盘")
+        self.assertEqual(store.get_pending_turn(self.proj, self.sid)["agent"], "A")
+
+    def test_reconcile_keeps_interrupted_flag(self):
+        # 对账（以 CLI transcript 为准覆盖内容）不得抹掉 interrupted 标记
+        store.append_message(self.proj, self.sid,
+                             {"round": 0, "speaker": "A", "content": "半截内容", "interrupted": True})
+        store.reconcile_agent_messages(self.proj, self.sid, "A",
+                                       [{"content": "半截内容", "thinking": ""}])
+        m = store.read_session(self.proj, self.sid)["messages"][0]
+        self.assertTrue(m.get("interrupted"), "对账覆盖内容不应清掉作废标记")
+
+    def test_reconcile_does_not_append_duplicate_after_abort(self):
+        # 中止后 CLI transcript 里的半截若与本地留痕不相似，也不得再追加一个气泡（重复）
+        store.append_message(self.proj, self.sid,
+                             {"round": 0, "speaker": "A", "content": "本地留痕的半截", "interrupted": True})
+        store.reconcile_agent_messages(self.proj, self.sid, "A", [
+            {"content": "CLI 里那次被中断回合的另一版半截", "thinking": ""},
+            {"content": "续接后的完整发言", "thinking": ""},
+        ])
+        msgs = [m for m in store.read_session(self.proj, self.sid)["messages"]
+                if m.get("speaker") == "A"]
+        self.assertEqual(len(msgs), 1, "存在中止留痕时不得追加重复气泡")
+        self.assertTrue(msgs[0].get("interrupted"))
+
+
 if __name__ == "__main__":
     unittest.main()
