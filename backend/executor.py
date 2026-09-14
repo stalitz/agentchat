@@ -109,6 +109,17 @@ class AgentRuntime:
         self._streamed_think = False
         self._partial_messages = True  # 若该 claude 版本不认此 flag，自愈降级为 False（见 _run_claude）
 
+        # codex app-server 持久连接（真流式）：一个 AgentRuntime 持有一条长连接，
+        # 跨本会话内多轮复用同一 thread（无需每轮 resume），会话结束由 aclose() 回收。
+        # 旧版本 codex 无 app-server 子命令 / 启动失败时，run() 自动回退 codex exec（见 _run_codex）。
+        self._appserver_proc = None
+        self._appserver_thread_id = None
+        self._as_queue = None          # asyncio.Queue：读循环把通知/应答推入，轮生成器消费
+        self._as_reader_task = None
+        self._as_stderr_task = None
+        self._as_req_id = 100          # JSON-RPC 请求 id 计数器（initialize/thread/turn 用）
+        self._as_reasoning_seen = 0    # 已吐出的 rollout reasoning 条数（仅当无 live 增量时兜底用）
+
     @property
     def is_fresh(self) -> bool:
         return self.cli_session_id is None
@@ -292,9 +303,14 @@ class AgentRuntime:
             async for ev in self._run_claude(prompt, cwd, timeout):
                 yield ev
             return
-        # codex
-        async for ev in self._run_codex(prompt, cwd, timeout):
-            yield ev
+        # codex：优先 app-server 真流式（JSON-RPC over stdio，逐 delta 增量）；
+        # 握手/启动失败（旧版本无 app-server、进程崩溃等）自动回退 codex exec（兜底）。
+        try:
+            async for ev in self._run_codex_appserver(prompt, cwd, timeout):
+                yield ev
+        except _CodexAppServerUnavailable:
+            async for ev in self._run_codex(prompt, cwd, timeout):
+                yield ev
 
     # ---------------- fake / mock agent（调试用，不调用真实 CLI） ----------------
     async def _run_fake(self, prompt: str, meta: dict):
@@ -431,7 +447,321 @@ class AgentRuntime:
             yield ("thinking", txt)
 
 
-# ---------------- 通用子进程流式读取 ----------------
+    # ---------------- codex app-server：真流式（JSON-RPC over stdio） ----------------
+
+    async def _run_codex_appserver(self, prompt, cwd, timeout):
+        """codex app-server 真流式：JSON-RPC over stdio，逐 delta 增量产出。
+
+        与 `codex exec --json` 的根本区别：
+        - exec 只在回合末发整块文本、reasoning 只落 rollout 文件（非真流式）；
+        - app-server 通过 `item/agentMessage/delta` / `item/reasoning/textDelta` 实时增量推送，
+          且 source=vscode 时会话在 ChatGPT 桌面端可见。
+
+        连接模型（经真实二进制核实 codex-cli 0.146.1）：
+        - 一条长连接跨本会话多轮复用（initialize → thread/start → 多次 turn/start）；
+          同一 thread 在进程内持续，故跨轮记忆天然保留，**无需每轮 resume**。
+        - 审批类 ServerRequest（执行命令/打补丁/权限/MCP 询问/动态工具）由读循环**就地自动批准**，
+          否则 codex 会一直阻塞等应答、回合卡死。
+        - `thread/resume` 在跨进程恢复时实测会静默断开（EOF），故只在「历史会话重开」时带超时尝试，
+          失败则回落 thread/start 新建（历史经 rollout reconcile 仍可见，仅丢失模型 in-context 记忆）。
+        - 握手阶段（initialize / thread 建立）若失败，抛 `_CodexAppServerUnavailable`，
+          run() 据此回退 codex exec；握手成功后的单轮错误则按 ("error", ...) 产出，不回退。
+        """
+        await self._ensure_appserver(cwd)  # 握手；失败抛 _CodexAppServerUnavailable
+        tid = self._appserver_thread_id
+        # 清掉上一轮残留通知（status/tokenUsage 等），避免误判为新一轮事件
+        await self._as_drain_stale()
+        got_reasoning = False
+        rid = self._next_id()
+        self._as_send({"jsonrpc": "2.0", "id": rid, "method": "turn/start",
+                       "params": {"threadId": tid, "input": [{"type": "text", "text": prompt}]}})
+        try:
+            while True:
+                try:
+                    o = await asyncio.wait_for(self._as_queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # 单轮超时：杀掉持久进程，下一轮重建（与 exec 超时等价）
+                    self._kill_appserver()
+                    yield ("error", f"单轮超时（>{timeout}s）已终止")
+                    return
+                if o.get("_eof"):
+                    yield ("error", "codex app-server 连接断开")
+                    return
+                if o.get("_tool_use") is not None:
+                    yield ("tool_use", o["_tool_use"])
+                    continue
+                m = o.get("method")
+                if m == "item/agentMessage/delta":
+                    d = (o.get("params") or {}).get("delta") or ""
+                    if d:
+                        yield ("text", d)
+                elif m == "item/reasoning/textDelta":
+                    d = (o.get("params") or {}).get("delta") or ""
+                    if d:
+                        got_reasoning = True
+                        yield ("thinking", d)
+                elif m == "item/reasoning/summaryTextDelta":
+                    d = (o.get("params") or {}).get("delta") or ""
+                    if d:
+                        got_reasoning = True
+                        yield ("thinking", d)
+                elif m == "item/completed":
+                    it = (o.get("params") or {}).get("item") or {}
+                    if it.get("type") == "mcp_tool_call" and "end_discussion" in str(it.get("tool") or ""):
+                        yield ("tool_use", {"name": "end_discussion",
+                                             "input": _codex_parse_args(it.get("arguments"))})
+                elif m == "error":
+                    params = o.get("params") or {}
+                    yield ("error", str(params.get("message") or params.get("data") or params))
+                    return
+                elif m == "turn/completed":
+                    break
+                # 其余通知（thread/status/changed、tokenUsage、mcpServer/* 等）忽略
+        finally:
+            pass
+        # 回合结束：若本模型未发 reasoning 增量（如 deepseek 高 effort 不吐 reasoning delta），
+        # 从 rollout 文件兜底补推理（仅补本轮新增，避免跨轮重复）。
+        if not got_reasoning:
+            try:
+                fresh = self._codex_new_reasoning(self._as_reasoning_seen)
+                self._as_reasoning_seen += len(fresh)
+                for txt in fresh:
+                    yield ("thinking", txt)
+            except Exception:
+                pass
+        yield ("done", "")
+
+
+    async def _ensure_appserver(self, cwd: str):
+        """拉起（若尚未拉起）codex app-server 长连接并完成握手，确定本会话 thread id。
+
+        失败（进程起不来 / initialize 无响应 / thread 建立失败）抛 _CodexAppServerUnavailable。
+        """
+        if self._appserver_proc is not None and self._appserver_proc.returncode is None:
+            return
+        cmd = ["codex", "app-server", "--listen", "stdio://"]
+        # 复用 terminate-signal MCP（与 exec 同款），注入方式一致（`-c` 点号路径，不动用户 config.toml）。
+        # 注意：app-server 不接受 `--skip-git-repo-check`（实测 rejected），但实测 thread/start
+        # 在非 git/未受信目录也能直接成功，故无需该 flag。
+        cmd += ["-c", f"mcp_servers.terminate-signal.command='{sys.executable}'"]
+        cmd += ["-c", f"mcp_servers.terminate-signal.args=['{_MCP_SCRIPT}']"]
+        cmd += ["-c", 'mcp_servers.terminate-signal.default_tools_approval_mode="approve"']
+        if self.agent.model:
+            # 注意：app-server 不接受 `-m` 参数（实测 "unexpected argument '-m'" 直接退出）；
+            # 模型经 `-c` 配置覆盖设置，并在 thread/start 的 model 参数再确认（与已验证探针一致）。
+            cmd += ["-c", f"model='{self.agent.model}'"]
+        if self.agent.cli_args:
+            cmd += self.agent.cli_args.split()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=cwd,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            raise _CodexAppServerUnavailable(f"启动失败: {e}")
+        self._appserver_proc = proc
+        self._as_queue = asyncio.Queue()
+        self._as_reader_task = asyncio.create_task(self._as_read_loop())
+        self._as_stderr_task = asyncio.create_task(self._as_drain_stderr())
+        # 1) initialize
+        iid = self._next_id()
+        self._as_send({"jsonrpc": "2.0", "id": iid, "method": "initialize",
+                       "params": {"clientInfo": {"name": "agentchat", "version": "1.0"}}})
+        try:
+            init = await asyncio.wait_for(self._as_wait_response(iid), timeout=15)
+        except (asyncio.TimeoutError, _CodexAppServerUnavailable):
+            self._kill_appserver()
+            raise _CodexAppServerUnavailable("initialize 无响应（可能 codex 版本不支持 app-server）")
+        if "error" in init:
+            self._kill_appserver()
+            raise _CodexAppServerUnavailable(f"initialize 错误: {init.get('error')}")
+        # 2) thread：有历史 cli_session_id 则尝试 resume（带超时兜底），否则新建
+        try:
+            tid = await self._as_ensure_thread(cwd)
+        except _CodexAppServerUnavailable:
+            self._kill_appserver()
+            raise
+        self._appserver_thread_id = tid
+        self.cli_session_id = tid
+
+
+    async def _as_ensure_thread(self, cwd: str) -> str:
+        """建立本连接的 thread：优先 resume 历史 id，失败则新建。返回 thread id。"""
+        if self.cli_session_id:
+            rid = self._next_id()
+            self._as_send({"jsonrpc": "2.0", "id": rid, "method": "thread/resume",
+                           "params": {"threadId": self.cli_session_id}})
+            try:
+                resp = await asyncio.wait_for(self._as_wait_response(rid), timeout=10)
+                if "result" in resp:
+                    return (resp.get("result") or {}).get("thread", {}).get("id") or self.cli_session_id
+            except (asyncio.TimeoutError, _CodexAppServerUnavailable):
+                pass  # resume 不可靠 → 回落新建
+        rid = self._next_id()
+        params = {"cwd": cwd}
+        if self.agent.model:
+            params["model"] = self.agent.model
+        self._as_send({"jsonrpc": "2.0", "id": rid, "method": "thread/start", "params": params})
+        try:
+            resp = await asyncio.wait_for(self._as_wait_response(rid), timeout=15)
+        except (asyncio.TimeoutError, _CodexAppServerUnavailable):
+            raise _CodexAppServerUnavailable("thread/start 无响应")
+        if "error" in resp:
+            raise _CodexAppServerUnavailable(f"thread/start 错误: {resp.get('error')}")
+        tid = (resp.get("result") or {}).get("thread", {}).get("id")
+        if not tid:
+            raise _CodexAppServerUnavailable("thread/start 未返回 thread.id")
+        return tid
+
+
+    async def _as_wait_response(self, iid):
+        """从队列消费，直到出现 id==iid 的应答（result/error）或 EOF。"""
+        while True:
+            o = await asyncio.wait_for(self._as_queue.get(), timeout=15)
+            if o.get("_eof"):
+                raise _CodexAppServerUnavailable("连接断开")
+            if o.get("id") == iid and ("result" in o or "error" in o):
+                return o
+            # 其余通知（thread/started、status 等）暂存丢弃，不影响等待
+
+
+    async def _as_read_loop(self):
+        """后台读循环：解析 stdout 行，审批类请求就地自动批准，其余推入队列。"""
+        proc = self._appserver_proc
+        if proc is None:
+            return
+        stdout = proc.stdout
+        try:
+            while True:
+                line = await stdout.readline()
+                if not line:
+                    break
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                # 动态工具调用（含 end_discussion 经 client 路由的罕见情况）：先捕获投票，再自动应答
+                if o.get("method") == "item/tool/call":
+                    it = o.get("params") or {}
+                    tool = str(it.get("tool") or "")
+                    if "end_discussion" in tool:
+                        try:
+                            await self._as_queue.put(
+                                {"_tool_use": {"name": "end_discussion",
+                                              "input": _codex_parse_args(it.get("arguments"))}})
+                        except Exception:
+                            pass
+                # 需客户端应答的 ServerRequest（审批类）：就地自动批准，不进队列
+                if "method" in o and "id" in o and isinstance(o.get("id"), (str, int)):
+                    if self._as_autoanswer(o["method"], o["id"], o.get("params") or {}):
+                        continue
+                try:
+                    await self._as_queue.put(o)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            try:
+                await self._as_queue.put({"_eof": True})
+            except Exception:
+                pass
+
+
+    async def _as_drain_stderr(self):
+        """排空 app-server stderr（verbose 日志），避免管道撑满阻塞子进程。"""
+        proc = self._appserver_proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = await proc.stderr.readline()
+                if not chunk:
+                    break
+        except Exception:
+            pass
+
+
+    async def _as_drain_stale(self):
+        """清掉上一轮残留通知，避免误判为新一轮事件。"""
+        if self._as_queue is None:
+            return
+        while True:
+            try:
+                await asyncio.wait_for(self._as_queue.get(), timeout=0.3)
+            except (asyncio.TimeoutError, Exception):
+                return
+
+
+    def _as_autoanswer(self, method, rid, params: dict) -> bool:
+        """审批类 ServerRequest 自动应答。返回 True 表示已处理（不进队列）。"""
+        if method in ("execCommandApproval", "item/commandExecution/requestApproval"):
+            self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"decision": "accept"}})
+            return True
+        if method in ("applyPatchApproval", "item/fileChange/requestApproval"):
+            self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"decision": "approved"}})
+            return True
+        if method == "mcpServer/elicitation/request":
+            self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"action": "accept"}})
+            return True
+        if method == "item/tool/requestUserInput":
+            self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"answers": {}}})
+            return True
+        if method == "item/permissions/requestApproval":
+            # 回授请求中声明的权限 profile（scope=session），等效放行本回合权限申请
+            self._as_send({"jsonrpc": "2.0", "id": rid,
+                           "result": {"permissions": params.get("permissions", {}), "scope": "session"}})
+            return True
+        if method == "item/tool/call":
+            # 未注册的动态工具：返回空成功，避免阻塞（end_discussion 已在读循环捕获投票）
+            self._as_send({"jsonrpc": "2.0", "id": rid,
+                           "result": {"contentItems": [], "success": True}})
+            return True
+        return False
+
+
+    def _as_send(self, obj: dict):
+        """写一条 JSON-RPC 帧到 app-server stdin。"""
+        if self._appserver_proc is None or self._appserver_proc.stdin is None:
+            return
+        try:
+            self._appserver_proc.stdin.write(
+                (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception:
+            pass
+
+
+    def _next_id(self):
+        self._as_req_id += 1
+        return self._as_req_id
+
+
+    def _kill_appserver(self):
+        """终止持久 app-server 进程与读循环（超时/错误/会话结束时回收）。"""
+        proc = self._appserver_proc
+        if proc is not None:
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            except Exception:
+                pass
+            self._appserver_proc = None
+        t = getattr(self, "_as_reader_task", None)
+        if t is not None:
+            t.cancel()
+            self._as_reader_task = None
+        self._appserver_thread_id = None
+        self._as_queue = None
+
+
+    def aclose(self):
+        """会话结束回收 codex app-server 长连接（由编排层 Session.start() finally 调用）。"""
+        self._kill_appserver()
+
+
+class _CodexAppServerUnavailable(Exception):
+    """codex app-server 握手/启动失败：调用方应回退到 codex exec 兜底。"""
 async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runtime=None, env=None,
                              stdin_data: bytes | None = None):
     """启动子进程并按行产出 ("text", str) 或 ("error", str)。

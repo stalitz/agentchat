@@ -573,6 +573,14 @@ class Session:
         return full, ([] if tool_intent else errors)
 
     # ---------------- 入口 ----------------
+    async def _close_runtimes(self):
+        """回收各 agent 的 CLI 会话运行时（codex app-server 长连接在此 kill）。"""
+        for rt in self.runtimes.values():
+            try:
+                await rt.aclose()
+            except Exception:
+                pass
+
     async def start(self, initial_task: str):
         self.running = True
         try:
@@ -582,6 +590,7 @@ class Session:
                 await self._debate(initial_task)
         finally:
             self.running = False
+            await self._close_runtimes()
 
     async def _chat_turn(self, text: str):
         """单 agent 对话模式：一次调用 = 用户一条 + agent 一条。
