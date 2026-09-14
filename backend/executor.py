@@ -4,7 +4,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -74,6 +76,53 @@ def _ensure_project_mcp(cwd: str, config_dir: str | None = None) -> None:
         pass
 
 
+_AS_STDERR_TAIL = 24  # 保留 app-server stderr 尾部行数（断流诊断用）
+
+
+def _kill_proc_group(proc, grace: float = 0.6) -> None:
+    """终止子进程及其**整个进程组**（子进程须以 `start_new_session=True` 启动）。
+
+    为什么不能只 `proc.kill()`：`codex` 是两层进程 —— `node /usr/local/bin/codex`（壳）
+    再 spawn 真正的原生 app-server 子进程。只杀壳会让原生子进程被 init 收养（PPID=1）
+    继续存活，仍持有 codex thread 与 stdio 管道 → 进程泄漏；下次「继续」新起进程再
+    resume 同一 thread 时出现「同一 thread 被两个进程持有」，是断流（连接断开）的隐患。
+    （2026-09-14 实测：壳 49585 → 原生子 49586；只 kill 壳后 49586 仍存活；killpg 整组后归零。）
+
+    `start_new_session=True` 让子进程自成进程组（pgid == 子进程 pid），故 killpg 不会误伤
+    本服务自身；本函数再校验 `pgid != 自身 pgid` 作双保险。先 SIGTERM 给优雅退出机会
+    （codex 借机落盘 rollout），超时再 SIGKILL 兜底；无法整组时退回单体 kill。
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
+    if pgid is not None and pgid != os.getpgid(0):  # 仅当子进程自成一组的才可整组杀
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except Exception:
+            pgid = None
+        if pgid is not None:
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                if proc.returncode is not None:
+                    return
+                time.sleep(0.05)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+            return
+    # 兜底：未自成进程组 / 无权限整组杀时，单体杀
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
 class AgentRuntime:
     """每个 agent 在某一 app 会话内的「持续 CLI 会话」运行时。
 
@@ -125,6 +174,8 @@ class AgentRuntime:
         self._as_stderr_task = None
         self._as_req_id = 100          # JSON-RPC 请求 id 计数器（initialize/thread/turn 用）
         self._as_reasoning_seen = 0    # 已吐出的 rollout reasoning 条数（仅当无 live 增量时兜底用）
+        self._as_stderr_tail = []      # app-server stderr 尾部（最多 _AS_STDERR_TAIL 行）：断流诊断用
+        self._as_returncode = None     # app-server 退出码（读循环 EOF 时记录）
 
     @property
     def is_fresh(self) -> bool:
@@ -496,7 +547,11 @@ class AgentRuntime:
                     yield ("error", f"单轮超时（>{timeout}s）已终止")
                     return
                 if o.get("_eof"):
-                    yield ("error", "codex app-server 连接断开")
+                    # 给 stderr 排空任务一点时间收尾，尽量把崩溃原因一并带出（此前一律丢弃）。
+                    await asyncio.sleep(0.15)
+                    detail = self._as_eof_detail()
+                    self._kill_appserver()  # 回收僵死进程与读循环，下一轮重建
+                    yield ("error", "codex app-server 连接断开" + detail)
                     return
                 if o.get("_tool_use") is not None:
                     yield ("tool_use", o["_tool_use"])
@@ -571,6 +626,9 @@ class AgentRuntime:
                 *cmd, cwd=cwd,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # 自成进程组：codex 是「node 壳 → 原生 app-server 子进程」两层，
+                # 回收时须整组杀（见 _kill_proc_group），否则原生子进程会孤儿化。
+                start_new_session=True,
             )
         except Exception as e:
             raise _CodexAppServerUnavailable(f"启动失败: {e}")
@@ -678,13 +736,22 @@ class AgentRuntime:
             pass
         finally:
             try:
+                self._as_returncode = proc.returncode
+            except Exception:
+                pass
+            try:
                 await self._as_queue.put({"_eof": True})
             except Exception:
                 pass
 
 
     async def _as_drain_stderr(self):
-        """排空 app-server stderr（verbose 日志），避免管道撑满阻塞子进程。"""
+        """排空 app-server stderr（verbose 日志），避免管道撑满阻塞子进程。
+
+        额外保留**尾部若干行**（`_AS_STDERR_TAIL`）：app-server 是崩溃/断流时才由它给出
+        真实原因（如 sqlite 忙、panic、provider 报错），此前一律丢弃，导致线上「连接断开」
+        只能看到一句无信息量的错误、无法定位。退出后在 EOF 错误里一并带出。
+        """
         proc = self._appserver_proc
         if proc is None or proc.stderr is None:
             return
@@ -693,8 +760,25 @@ class AgentRuntime:
                 chunk = await proc.stderr.readline()
                 if not chunk:
                     break
+                try:
+                    self._as_stderr_tail.append(chunk.decode(errors="replace").rstrip())
+                except Exception:
+                    pass
+                if len(self._as_stderr_tail) > _AS_STDERR_TAIL:
+                    del self._as_stderr_tail[0]
         except Exception:
             pass
+
+    def _as_eof_detail(self) -> str:
+        """断流时的补充诊断：退出码 + stderr 尾部（无信息时返回空串）。"""
+        bits = []
+        rc = self._as_returncode
+        if rc is not None:
+            bits.append(f"退出码 {rc}")
+        tail = [ln for ln in self._as_stderr_tail if ln.strip()]
+        if tail:
+            bits.append("stderr 尾部: " + " | ".join(tail[-6:])[:600])
+        return ("（" + "；".join(bits) + "）") if bits else ""
 
 
     async def _as_drain_stale(self):
@@ -752,21 +836,27 @@ class AgentRuntime:
 
 
     def _kill_appserver(self):
-        """终止持久 app-server 进程与读循环（超时/错误/会话结束时回收）。"""
+        """终止持久 app-server 进程与读循环（超时/错误/会话结束时回收）。
+
+        必须**整组**回收：`codex` 是「node 壳 → 原生 app-server 子进程」两层，只杀壳会
+        留下孤儿原生进程（PPID=1）继续持有 thread 与管道（见 `_kill_proc_group`）。
+        """
         proc = self._appserver_proc
         if proc is not None:
-            try:
-                if proc.returncode is None:
-                    proc.kill()
-            except Exception:
-                pass
+            _kill_proc_group(proc)
             self._appserver_proc = None
         t = getattr(self, "_as_reader_task", None)
         if t is not None:
             t.cancel()
             self._as_reader_task = None
+        st = getattr(self, "_as_stderr_task", None)
+        if st is not None:
+            st.cancel()
+            self._as_stderr_task = None
         self._appserver_thread_id = None
         self._as_queue = None
+        self._as_stderr_tail = []
+        self._as_returncode = None
 
 
     def aclose(self):
@@ -789,6 +879,9 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
             *cmd, cwd=cwd, env=env,
             stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            # 自成进程组：超时/异常时整组回收，避免 claude/codex 的子进程孤儿化
+            # （见 _kill_proc_group）。
+            start_new_session=True,
         )
     except Exception as e:  # 命令不存在 / 权限问题
         yield ("error", f"启动失败: {e}")
@@ -848,16 +941,13 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
         if not drain_task.done():
             drain_task.cancel()
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill_proc_group(proc)
         await proc.wait()
         if not drain_task.done():
             drain_task.cancel()
         yield ("error", f"单轮超时（>{timeout}s）已终止")
     except Exception as e:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _kill_proc_group(proc)
         if not drain_task.done():
             drain_task.cancel()
         yield ("error", f"执行异常: {e}")
