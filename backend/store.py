@@ -99,7 +99,8 @@ def get_settings() -> dict:
         "default_model_codex": pinned_codex if pinned_codex else detect_codex_default_model(),
         "ollama_base_url": s.get("ollama_base_url", "http://localhost:11434"),
         "ollama_num_ctx": int(s.get("ollama_num_ctx", 16384)),
-        "ollama_think": bool(s.get("ollama_think", True)),
+        # 兼容 #104 旧字段 ollama_think（旧 config.json 只写了它）
+        "think": bool(s.get("think", s.get("ollama_think", True))),
         "claude_max_output_tokens": int(s.get("claude_max_output_tokens", 64000)),
         "prompt_templates": s.get("prompt_templates") or {},
         # 提示词默认模板（供前端「显示默认 / 恢复默认」）：与后端实际生效的缺省值同源
@@ -543,21 +544,43 @@ def set_session_tone(project_path: str, sid: str, tone: str) -> None:
 
 
 def set_session_think(project_path: str, sid: str, think: bool) -> bool:
-    """记录会话级「思考」开关（覆盖全局默认 ollama_think）；返回是否找到该会话。
+    """记录会话级「思考」开关（覆盖全局默认，优先级高于 agent 级与全局）；返回是否找到该会话。
 
-    仅 claude-code 类、base_url 指向本网关的 agent 真正生效（网关据此给 Ollama 带 think:false）。
-    会话未显式设置时网关回退到全局默认，故本函数只在用户切换时写入显式值。"""
+    全局开关（AppSettings.think）作用于全部 agent；agent 级（AgentConfig.think）覆盖全局；
+    会话级最高。Ollama 经本网关时网关据此带 think:false；codex 降 model_reasoning_effort；
+    真实 claude 直连无干净开关（仅经网关路由的 Ollama 真正生效）。"""
     sessions = _load_sessions(project_path)
     found = False
     for s in sessions:
         if s["id"] == sid:
-            s["ollama_think"] = bool(think)
+            s["think"] = bool(think)
             s["updated_at"] = _now()
             found = True
             break
     if found:
         _save_sessions(project_path, sessions)
     return found
+
+
+def resolve_think(agent: "AgentConfig", session: dict, settings: dict) -> bool:
+    """解析某 agent 在某会话下的「思考」生效值（三级：会话 > agent > 全局）。
+
+    - 全局：settings.get("think", True)
+    - agent 级：agent.think（None=继承全局）
+    - 会话级：session 的 "think"（兼容旧字段 "ollama_think"），None=未显式设置则回退
+    优先级：会话级 > agent 级 > 全局（最具体者胜）。"""
+    app = bool((settings or {}).get("think", True))
+    ag = (agent or {}).get("think") if isinstance(agent, dict) else getattr(agent, "think", None)
+    agent_val = None if ag is None else bool(ag)
+    sess_raw = (session or {}).get("think")
+    if sess_raw is None:
+        sess_raw = (session or {}).get("ollama_think")  # 兼容 #104 旧字段
+    sess_val = None if sess_raw is None else bool(sess_raw)
+    if sess_val is not None:
+        return sess_val
+    if agent_val is not None:
+        return agent_val
+    return app
 
 
 def set_session_title(project_path: str, sid: str, title: str) -> bool:

@@ -260,10 +260,12 @@ async def get_session(pid: str, sid: str):
     _reconcile_with_cli(proj["path"], sid, s.get("agent_sessions", {}))
     s = store.read_session(proj["path"], sid)  # 重新读回对账后的最新消息
     # 会话级「思考」开关的当前生效值：会话显式设置过用会话值，否则回退全局默认
-    # （前端据此初始化开关状态；切换时写入显式值）。
-    think = s.get("ollama_think")
+    # （前端据此初始化开关状态；切换时写入显式值）。兼容 #104 旧字段 ollama_think。
+    think = s.get("think")
     if think is None:
-        think = bool((store.get_settings()).get("ollama_think", True))
+        think = s.get("ollama_think")
+    if think is None:
+        think = bool((store.get_settings()).get("think", True))
     return {
         "id": s["id"], "title": s.get("title", "会话"),
         "team_id": s.get("team_id", ""),
@@ -387,9 +389,19 @@ async def anthropic_messages(req: Request):
     return await gateway.handle_messages(req, store.get_settings())
 
 
-# 会话级思考开关：把 sid 编进 base_url 路径（/gw/<pid>/<sid>/v1/messages），
-# 网关据此按会话读取 ollama_think 覆盖全局默认。claude-code 的 ANTHROPIC_BASE_URL
-# 由编排层按会话拼成此路径（见 orchestrator.Session._gw_url）。
+# 三级思考开关：把 sid 与「编排层按 会话>agent>全局 算好的 think 生效值」编进 base_url **路径**，
+# 形如 /gw/<pid>/<sid>/think/<0|1>/v1/messages。用路径段而非查询参数——claude-code 是以
+# `base_url + "/v1/messages"` 字符串拼接发起请求，base_url 带 ?query 会被拼坏
+# （→ ...?think=0/v1/messages），故只能走路径。网关据此直接采用该值（含 agent 维度）。
+@app.post("/gw/{pid}/{sid}/think/{flag}/v1/messages")
+async def anthropic_messages_session_think(req: Request, pid: str, sid: str, flag: str):
+    proj = store.get_project(pid)
+    project_path = proj["path"] if proj else pid
+    return await gateway.handle_messages(req, store.get_settings(), project_path=project_path, sid=sid,
+                                         think_override=(flag == "1"))
+
+
+# 兼容旧路径（不带 think 段）：网关按 会话级 > 全局 自行解析（无 agent 维度；仅外部手配 base_url 走到）。
 @app.post("/gw/{pid}/{sid}/v1/messages")
 async def anthropic_messages_session(req: Request, pid: str, sid: str):
     proj = store.get_project(pid)

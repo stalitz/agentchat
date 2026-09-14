@@ -92,12 +92,18 @@ class AgentRuntime:
     - fake：纯内存模拟，维护 `_fake_history` 以忠实复现「有状态会话」（agent 自身记得前文）。
     """
 
-    def __init__(self, agent: AgentConfig, cli_session_id: str | None = None, session_base_url: str | None = None):
+    def __init__(self, agent: AgentConfig, cli_session_id: str | None = None, session_base_url: str | None = None,
+                 think: bool | None = None):
         self.agent = agent
         self.cli_session_id = cli_session_id  # None = 本 app 会话内该 agent 尚未开过 CLI 会话
-        # 会话级网关地址（含 /gw/<pid>/<sid> 路径）：编排层按会话拼好传入，
-        # 据此让网关按会话读取思考开关。None 时回落到 agent.base_url（全局默认）。
+        # 会话级网关地址（含 /gw/<pid>/<sid>?think=… 路径）：编排层按会话拼好传入，
+        # 据此让网关按会话/agent 读取思考开关。None 时回落到 agent.base_url（全局默认）。
         self.session_base_url = session_base_url
+        # 三级「思考」开关的生效值（会话>agent>全局，编排层算好传入）。None=未指定（按开处理）。
+        # 作用于：① codex → 关时注入 -c model_reasoning_effort=low（降/关 reasoning）
+        #         ② 网关路径已由 session_base_url 的 ?think= 携带，此处不重复处理
+        #         ③ 真实 claude 直连无干净开关（已知限制）
+        self.think = think
         self._force_new_session = False  # 自愈：True 时下一轮用全新 id 注册（绕过已占用的旧锁）
         self._fake_history: list[str] = []
         self._section = None  # 当前文本分片归属：None / "think" / "ans"（跨 claude 多事件续接用）
@@ -406,6 +412,11 @@ class AgentRuntime:
         cmd += ["-c", f"mcp_servers.terminate-signal.command='{sys.executable}'"]
         cmd += ["-c", f"mcp_servers.terminate-signal.args=['{_MCP_SCRIPT}']"]
         cmd += ["-c", 'mcp_servers.terminate-signal.default_tools_approval_mode="approve"']
+        # 三级「思考」开关（生效值 False）：降 codex 的 reasoning effort，减少/关闭思考生成。
+        # codex 无 --think 类开关，只能经 `-c` 配置覆盖（不动用户 ~/.codex/config.toml）。
+        # 取最低档 "low"（best-effort：provider/模型不支持 reasoning effort 时可能无效）。
+        if self.think is False:
+            cmd += ["-c", 'model_reasoning_effort="low"']
         if self.agent.model:
             cmd += ["-m", self.agent.model]
         if self.agent.cli_args:
@@ -546,6 +557,9 @@ class AgentRuntime:
         cmd += ["-c", f"mcp_servers.terminate-signal.command='{sys.executable}'"]
         cmd += ["-c", f"mcp_servers.terminate-signal.args=['{_MCP_SCRIPT}']"]
         cmd += ["-c", 'mcp_servers.terminate-signal.default_tools_approval_mode="approve"']
+        # 三级「思考」开关（生效值 False）：降 reasoning effort（同 exec 路径，best-effort）。
+        if self.think is False:
+            cmd += ["-c", 'model_reasoning_effort="low"']
         if self.agent.model:
             # 注意：app-server 不接受 `-m` 参数（实测 "unexpected argument '-m'" 直接退出）；
             # 模型经 `-c` 配置覆盖设置，并在 thread/start 的 model 参数再确认（与已验证探针一致）。

@@ -297,7 +297,7 @@
       </div>
       <button class="ghost" onclick="openPromptLog()">提示词</button>
       <button class="ghost" onclick="openToolLog()">工具</button>
-      <label class="head-toggle" title="会话级开关：开=保留模型思考过程（thinking 块）；关=大幅降低输出量，gemma 等推理模型适用。仅对走本网关的 claude agent 生效">
+      <label class="head-toggle" title="会话级开关（优先级最高：会话 &gt; agent &gt; 全局）：开=保留模型思考过程；关=不输出思考。对 Ollama（经内置网关）与 codex 生效；真实 claude 直连无干净开关">
         💡 思考 <input type="checkbox" id="chkThink" onchange="toggleThink(this.checked)">
       </label>
     </div>
@@ -1178,8 +1178,8 @@ function updateCtxHead(s) {
   document.getElementById('ctxMeta').textContent = meta.join(' · ');
 }
 
-// 会话级「思考」开关：当前会话展开时切换。仅对走本网关的 claude agent 生效
-// （网关按 /gw/<pid>/<sid> 读取会话 ollama_think 覆盖全局默认）。
+// 会话级「思考」开关：当前会话展开时切换。三级开关最高优先级（会话 > agent > 全局）：
+// 编排层按会话+agent 算好生效值随 /gw/<pid>/<sid>?think= 下发；网关据此带 think:false。
 function toggleThink(on) {
   if (!curPid || !curSid) return;
   fetch('/api/session/' + curPid + '/' + curSid + '/think', {
@@ -1448,6 +1448,7 @@ function agentDraft(a, newType) {
     base_url: v('base_url'),
     model: v('model'),
     api_key: v('api_key'),
+    think: v('think'),
   };
 }
 function openAgentForm(a) {
@@ -1483,6 +1484,14 @@ function openAgentForm(a) {
     html += f('model', '模型(可选)', a ? (a.model || '') : '') +
       '<div class="hint">codex 类型填模型 tag（如 deepseek-v4-flash），留空走 Codex 全局默认。</div>';
   }
+  // agent 级「思考」开关（三级：会话 > agent > 全局）。三态：继承 / 开 / 关。
+  html += sel('think', '思考（本 agent）', [
+    ['', '继承全局'],
+    ['1', '开 · 保留思考过程'],
+    ['0', '关 · 不输出思考'],
+  ], (a && a.think === true) ? '1' : ((a && a.think === false) ? '0' : '')) +
+    '<div class="hint">覆盖全局「思考」开关。<b>对 Ollama（经内置网关）与 codex 生效</b>；' +
+    '真实 claude 直连无干净开关（Claude Code CLI 无 --think 开关）。</div>';
   html += formButtons('submitAgent', (a && a.id) ? a : null);   // 仅编辑已有 agent 才显示「删除」
   c.innerHTML = html;
   var sync = function () {
@@ -1625,7 +1634,7 @@ function openSettings() {
   var dmc = s.default_model_codex || '';
   var ol = s.ollama_base_url || 'http://localhost:11434';
   var mo = s.claude_max_output_tokens != null ? s.claude_max_output_tokens : 64000;
-  var th = s.ollama_think !== false;
+  var th = s.think !== false;
   var ptCfg = (s.prompt_templates && s.prompt_templates.debate) || {};
   var ptDef = (s.prompt_template_defaults && s.prompt_template_defaults.debate) || {};
   // 显示「当前生效」文本：配置有就用配置，否则显示内置默认（可改、可恢复默认）
@@ -1666,10 +1675,11 @@ function openSettings() {
     '<div class="set-grid">' +
       field('gMaxOut', 'Claude 输出上限 (token)', mo, 'claude 单次响应 output 上限；思考长/输出大时可调大防报错', 'number') +
       '<div class="set-field">' +
-        '<label class="set-label" for="gThink">Ollama 思考 (thinking)</label>' +
+        '<label class="set-label" for="gThink">思考（全局）</label>' +
         '<label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); cursor:pointer;">' +
-        '<input id="gThink" type="checkbox"' + (th ? ' checked' : '') + '> 保留模型思考块（关掉可大幅降低输出量，gemma 推理模型适用）' +
+        '<input id="gThink" type="checkbox"' + (th ? ' checked' : '') + '> 保留模型思考过程（作用全部 agent；可被 agent 级/会话级覆盖）' +
         '</label>' +
+        '<div class="set-help">关掉后：Ollama 经网关带 think:false；codex 降 reasoning effort；真实 claude 直连无干净开关（仅经网关的 Ollama 生效）</div>' +
       '</div>' +
     '</div>' +
     '<div class="set-field wide" style="padding:0 22px;">' +
@@ -1721,7 +1731,7 @@ function submitSettings() {
     default_model_codex: v('gDefaultModelCodex').trim(),
     ollama_base_url: v('gOllama').trim() || 'http://localhost:11434',
     ollama_num_ctx: parseInt(v('gCtx'), 10) || 16384,
-    ollama_think: document.getElementById('gThink').checked,
+    think: document.getElementById('gThink').checked,
     claude_max_output_tokens: parseInt(v('gMaxOut'), 10) || 64000,
     prompt_templates: (function () {
       var old = (cfg.settings && cfg.settings.prompt_templates) || {};
@@ -1817,6 +1827,9 @@ function submitAgent() {
     body.base_url = null;
     body.api_key = null;
   }
+  // agent 级「思考」：''＝继承全局（null）；'1'＝开；'0'＝关
+  var thinkSel = v('think');
+  body.think = (thinkSel === '1') ? true : ((thinkSel === '0') ? false : null);
   if (editingId) body.id = editingId;
   return fetch('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); })

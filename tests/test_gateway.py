@@ -610,8 +610,8 @@ class TestOllamaNativeGateway(unittest.TestCase):
         self.assertIn('"output_tokens": 3', out)
         self.assertLess(out.index("thinking_delta"), out.index("tool_use"), "思考块应在工具块之前")
 
-    def test_stream_route_respects_ollama_think_switch(self):
-        # ollama_think=False → 请求带 think:false（gemma 关思考，防 thinking 爆 output token）；
+    def test_stream_route_respects_think_switch(self):
+        # think=False → 请求带 think:false（gemma 关思考，防 thinking 爆 output token）；
         # 默认 True 不带该字段（对不支持 think 参数的模型无影响）
         def send(settings):
             orig = gateway.httpx.AsyncClient
@@ -628,10 +628,10 @@ class TestOllamaNativeGateway(unittest.TestCase):
                 gateway.httpx.AsyncClient = orig
             return _FakeCaptureBody.captured
 
-        body_on = send({"ollama_base_url": "http://x", "ollama_think": True})
-        self.assertNotIn("think", body_on, "ollama_think=True 时不应传 think 字段")
-        body_off = send({"ollama_base_url": "http://x", "ollama_think": False})
-        self.assertIs(body_off.get("think"), False, "ollama_think=False 时应传 think:false")
+        body_on = send({"ollama_base_url": "http://x", "think": True})
+        self.assertNotIn("think", body_on, "think=True 时不应传 think 字段")
+        body_off = send({"ollama_base_url": "http://x", "think": False})
+        self.assertIs(body_off.get("think"), False, "think=False 时应传 think:false")
         # 未配置默认 True
         body_default = send({"ollama_base_url": "http://x"})
         self.assertNotIn("think", body_default)
@@ -711,10 +711,10 @@ class TestOllamaNativeGateway(unittest.TestCase):
 
 
 class TestSessionThinkOverride(unittest.TestCase):
-    """会话级「思考」开关：网关按会话读取 ollama_think 覆盖全局默认。"""
+    """三级「思考」开关：网关按 会话级 > 全局（+ 编排层 think_override）解析。"""
 
     def _setup_session(self, think_value):
-        """建临时会话并（可选地）写入会话级 ollama_think；返回 (project_path, sid)。"""
+        """建临时会话并（可选地）写入会话级 think；返回 (project_path, sid)。"""
         import tempfile
         import pathlib
         import backend.store as store
@@ -745,9 +745,9 @@ class TestSessionThinkOverride(unittest.TestCase):
         proj_path, sid, prev = self._setup_session(None)
         try:
             # 全局 True、会话未设置 → 回退 True
-            self.assertTrue(gateway._resolve_ollama_think({"ollama_think": True}, proj_path, sid))
+            self.assertTrue(gateway._resolve_think({"think": True}, proj_path, sid))
             # 全局 False、会话未设置 → 回退 False
-            self.assertFalse(gateway._resolve_ollama_think({"ollama_think": False}, proj_path, sid))
+            self.assertFalse(gateway._resolve_think({"think": False}, proj_path, sid))
         finally:
             self._restore(prev)
 
@@ -755,8 +755,8 @@ class TestSessionThinkOverride(unittest.TestCase):
         # 会话显式关思考 → 即使全局开，也应为 False
         proj_path, sid, prev = self._setup_session(False)
         try:
-            self.assertFalse(gateway._resolve_ollama_think({"ollama_think": True}, proj_path, sid))
-            self.assertFalse(gateway._resolve_ollama_think({"ollama_think": False}, proj_path, sid))
+            self.assertFalse(gateway._resolve_think({"think": True}, proj_path, sid))
+            self.assertFalse(gateway._resolve_think({"think": False}, proj_path, sid))
         finally:
             self._restore(prev)
 
@@ -764,15 +764,38 @@ class TestSessionThinkOverride(unittest.TestCase):
         # 会话显式开思考 → 即使全局关，也应为 True（会话级覆盖全局）
         proj_path, sid, prev = self._setup_session(True)
         try:
-            self.assertTrue(gateway._resolve_ollama_think({"ollama_think": False}, proj_path, sid))
-            self.assertTrue(gateway._resolve_ollama_think({"ollama_think": True}, proj_path, sid))
+            self.assertTrue(gateway._resolve_think({"think": False}, proj_path, sid))
+            self.assertTrue(gateway._resolve_think({"think": True}, proj_path, sid))
         finally:
             self._restore(prev)
 
     def test_no_sid_falls_back_to_global(self):
         # 不带 sid（无会话路径的 /v1/messages 路由）→ 只看全局默认
-        self.assertTrue(gateway._resolve_ollama_think({"ollama_think": True}, None, None))
-        self.assertFalse(gateway._resolve_ollama_think({"ollama_think": False}, None, None))
+        self.assertTrue(gateway._resolve_think({"think": True}, None, None))
+        self.assertFalse(gateway._resolve_think({"think": False}, None, None))
+
+    def test_override_wins_over_session_and_global(self):
+        # 编排层 think_override（已按 会话>agent>全局 算好）优先级最高：
+        # 全局开 + 会话未设 + override=False（agent 级关）→ False
+        proj_path, sid, prev = self._setup_session(None)
+        try:
+            self.assertFalse(gateway._resolve_think({"think": True}, proj_path, sid, think_override=False))
+        finally:
+            self._restore(prev)
+        # 全局关 + override=True（agent/会话级开）→ True
+        self.assertTrue(gateway._resolve_think({"think": False}, None, None, think_override=True))
+
+
+class TestThinkRouteRegistered(unittest.TestCase):
+    """三级思考开关经 **路径段** think/<0|1> 传入（claude 以 base_url + "/v1/messages"
+    字符串拼接，base_url 带 ?query 会被拼坏），确认新路由已注册、旧路由保留。"""
+
+    def test_think_path_routes_registered(self):
+        from backend.main import app
+        paths = {getattr(r, "path", "") for r in app.routes}
+        self.assertIn("/gw/{pid}/{sid}/think/{flag}/v1/messages", paths,
+                      "带 think 路径段的路由应已注册（agent 级生效值经此下发）")
+        self.assertIn("/gw/{pid}/{sid}/v1/messages", paths, "旧路由保留（无 agent 维度的会话/全局解析）")
 
 
 if __name__ == "__main__":

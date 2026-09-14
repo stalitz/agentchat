@@ -13,7 +13,7 @@ class TestStore(unittest.TestCase):
     def test_get_settings_defaults_include_new_fields(self):
         # 新配置项缺省兜底：输出上限/思考开关/提示词模板（空配置不报错、有默认值）
         s = store.get_settings()
-        self.assertEqual(s["ollama_think"], True, "思考开关默认开（保持现状）")
+        self.assertEqual(s["think"], True, "全局思考开关默认开（保持现状）")
         self.assertEqual(s["claude_max_output_tokens"], 64000, "输出上限默认 64000")
         self.assertEqual(s["prompt_templates"], {}, "提示词模板默认空（回退内置默认）")
         # 默认模板应返回给前端（显示默认/恢复默认用），与内置默认同源
@@ -22,12 +22,35 @@ class TestStore(unittest.TestCase):
         self.assertTrue(s["prompt_template_defaults"]["debate"]["consensus"].startswith("请基于以上继续推进"),
                         "默认共识模板应为内置文本")
         # 写入后可读回
-        store.update_settings({"ollama_think": False, "claude_max_output_tokens": 99999,
+        store.update_settings({"think": False, "claude_max_output_tokens": 99999,
                                "prompt_templates": {"debate": {"consensus": "自定义"}}})
         s2 = store.get_settings()
-        self.assertIs(s2["ollama_think"], False)
+        self.assertIs(s2["think"], False)
         self.assertEqual(s2["claude_max_output_tokens"], 99999)
         self.assertEqual(s2["prompt_templates"]["debate"]["consensus"], "自定义")
+
+    def test_think_back_compat_old_key(self):
+        # 兼容 #104 旧字段 ollama_think（旧 config.json 只写了它）→ 读为 think
+        store.update_settings({"ollama_think": False})
+        self.assertIs(store.get_settings()["think"], False, "旧 ollama_think=False 应被读为 think=False")
+
+    def test_resolve_think_three_levels(self):
+        # 三级优先级：会话 > agent > 全局
+        ag_on = models.AgentConfig(name="a", type="claude-code", think=True)
+        ag_off = models.AgentConfig(name="b", type="claude-code", think=False)
+        ag_inherit = models.AgentConfig(name="c", type="claude-code")  # None=继承
+        # 仅全局
+        self.assertTrue(store.resolve_think(ag_inherit, {}, {"think": True}))
+        self.assertFalse(store.resolve_think(ag_inherit, {}, {"think": False}))
+        # agent 覆盖全局
+        self.assertTrue(store.resolve_think(ag_on, {}, {"think": False}))
+        self.assertFalse(store.resolve_think(ag_off, {}, {"think": True}))
+        # 会话覆盖 agent 与全局
+        self.assertFalse(store.resolve_think(ag_on, {"think": False}, {"think": True}))
+        self.assertTrue(store.resolve_think(ag_off, {"think": True}, {"think": False}))
+        # 会话无显式值 → 回退 agent；会话旧字段 ollama_think 亦生效
+        self.assertTrue(store.resolve_think(ag_on, {}, {"think": False}))
+        self.assertFalse(store.resolve_think(ag_on, {"ollama_think": False}, {"think": True}))
 
     def test_agent_crud(self):
         a = models.AgentConfig(name="架构师", type="claude-code", role="r")

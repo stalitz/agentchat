@@ -882,18 +882,26 @@ class TestGwUrl(unittest.TestCase):
     """会话级网关地址：_gw_url 仅对指向本服务（localhost:8777）的 base_url 注入
     /gw/<pid>/<sid> 路径，外部网关/无 base_url 原样返回。"""
 
-    def _session(self, project_id, base_url):
-        a = models.AgentConfig(id="", name="A", type="claude-code", role="r", base_url=base_url)
+    def _session(self, project_id, base_url, think=None):
+        a = models.AgentConfig(id="", name="A", type="claude-code", role="r", base_url=base_url, think=think)
         s = orch.Session("/tmp/p", "s_x", [a], 6, Recorder(), timeout=300, project_id=project_id)
         return s, a
 
     def test_local_gateway_gets_session_path(self):
         s, a = self._session("pr_1", "http://127.0.0.1:8777")
-        self.assertEqual(s._gw_url(a), "http://127.0.0.1:8777/gw/pr_1/s_x")
+        # 默认全局开 → 末段 /think/1（编排层算好的生效值，供网关直接采用）。
+        # 用路径段而非 ?query：claude 以 base_url + "/v1/messages" 拼接，带 query 会拼坏。
+        self.assertEqual(s._gw_url(a), "http://127.0.0.1:8777/gw/pr_1/s_x/think/1")
 
     def test_localhost_variant(self):
         s, a = self._session("pr_1", "http://localhost:8777")
-        self.assertEqual(s._gw_url(a), "http://localhost:8777/gw/pr_1/s_x")
+        self.assertEqual(s._gw_url(a), "http://localhost:8777/gw/pr_1/s_x/think/1")
+
+    def test_agent_level_think_off_encodes_path(self):
+        # agent 级 think=False（覆盖全局）→ /think/0 随网关 URL 下发（网关只能看 pid/sid）
+        s, a = self._session("pr_1", "http://127.0.0.1:8777", think=False)
+        self.assertEqual(s._gw_url(a), "http://127.0.0.1:8777/gw/pr_1/s_x/think/0")
+        self.assertFalse(s.think_by_agent["A"], "agent 级 think=False 应被 resolve_think 采纳")
 
     def test_no_project_id_returns_plain(self):
         # 缺 project_id 时无法编码会话路径 → 回落原始 base_url（全局默认生效）

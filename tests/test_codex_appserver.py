@@ -97,6 +97,24 @@ class TestAppServerSendSafety(unittest.TestCase):
         rt._as_send({"jsonrpc": "2.0"})
 
 
+class TestCodexThinkSwitch(unittest.TestCase):
+    """三级「思考」开关生效值 False → codex 注入最低 reasoning effort（best-effort，见 FR13）。"""
+
+    def _cmd(self, think):
+        rt = AgentRuntime(AgentConfig(name="C", type="codex", model="deepseek-v4-flash"), think=think)
+        return rt._codex_cmd("hi")
+
+    def test_think_false_injects_reasoning_effort(self):
+        cmd = self._cmd(False)
+        self.assertIn('model_reasoning_effort="low"', cmd, "think=False 应经 -c 降 reasoning effort")
+        self.assertIn("-c", cmd)
+
+    def test_think_true_or_none_no_injection(self):
+        self.assertNotIn('model_reasoning_effort="low"', self._cmd(True))
+        self.assertNotIn('model_reasoning_effort="low"', self._cmd(None),
+                         "think=None（未指定）不应注入")
+
+
 class TestCodexFallback(unittest.IsolatedAsyncioTestCase):
     async def test_run_falls_back_to_exec_on_handshake_failure(self):
         rt = _rt(model="deepseek-v4-flash")

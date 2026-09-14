@@ -114,14 +114,24 @@ class Session:
         # 通用辩论提示词模板快照：会话启动时读一次，改配置对新会话生效（运行中会话不受影响）。
         # 结构 settings.prompt_templates.debate.<slot>，缺省槽位回退代码内置默认（PROMPT_TEMPLATES_DEBATE）。
         try:
-            _pt_cfg = (store.get_settings().get("prompt_templates") or {}).get("debate") or {}
+            _settings = store.get_settings()
+        except Exception:
+            _settings = {}
+        try:
+            _pt_cfg = (_settings.get("prompt_templates") or {}).get("debate") or {}
         except Exception:
             _pt_cfg = {}
         self._pt = {**PROMPT_TEMPLATES_DEBATE, **(_pt_cfg if isinstance(_pt_cfg, dict) else {})}
+        # 三级「思考」开关生效值（会话级 > agent 级 > 全局），按 agent 各解析一次。用于：
+        #   ① 注入网关 URL 查询（Ollama 路径，网关据此带 think:false）
+        #   ② 传给 AgentRuntime（codex 据此降 model_reasoning_effort）
+        #   ③ 真实 claude 直连无干净开关（已知限制，见需求文档）
+        self.think_by_agent = {a.name: store.resolve_think(a, sess or {}, _settings) for a in agents}
         # 每个 agent 的「持续 CLI 会话」id，用于 1:1 续接；从磁盘读回（历史会话恢复用）
         self.agent_sessions = (sess or {}).get("agent_sessions", {})
         self.runtimes = {a.name: AgentRuntime(a, self.agent_sessions.get(a.name),
-                                               session_base_url=self._gw_url(a)) for a in agents}
+                                               session_base_url=self._gw_url(a),
+                                               think=self.think_by_agent.get(a.name)) for a in agents}
         self.single = len(agents) < 2
         self.mode = "chat" if self.single else "debate"
         self.stop_event = asyncio.Event()
@@ -150,12 +160,15 @@ class Session:
         self._peer_rejected = None
 
     def _gw_url(self, agent: AgentConfig) -> str | None:
-        """按会话拼出 claude 网关地址；仅对指向本服务的 base_url 注入 /gw/<pid>/<sid> 路径。
+        """按会话拼出 claude 网关地址；仅对指向本服务的 base_url 注入 /gw/<pid>/<sid>/think/<0|1> 路径。
 
-        该路径让网关（/gw/{pid}/{sid}/v1/messages）按会话读取 ollama_think 覆盖全局默认，
-        实现「思考」会话级开关。判定「本服务」：host 为 localhost/127.0.0.1/::1 且端口 8777
-        （即本网关标准端口）。外部网关（litellm 等）不加路径、保持原样，避免 404。
-        非 base_url agent（如真实 claude / codex 直连）返回 None，走各自原生后端。
+        该路径让网关（/gw/{pid}/{sid}/think/{flag}/v1/messages）按会话读取 think 覆盖全局默认；
+        末段 /think/<0|1> 是编排层按 会话>agent>全局 算好的生效值，供网关直接采用 —— 使 agent 级
+        开关对走网关的 Ollama agent 也生效（网关本身只能看到 pid/sid，看不到 agent）。
+        **用路径段而非查询参数**：claude-code 以 base_url + "/v1/messages" 字符串拼接，带 ?query 会拼坏。
+        判定「本服务」：host 为 localhost/127.0.0.1/::1 且端口 8777（即本网关标准端口）。
+        外部网关（litellm 等）不加路径、保持原样，避免 404。非 base_url agent（如真实
+        claude / codex 直连）返回 None，走各自原生后端。
         """
         bu = agent.base_url
         if not bu or not self.project_id:
@@ -164,7 +177,11 @@ class Session:
             from urllib.parse import urlparse
             p = urlparse(bu)
             if (p.hostname or "").lower() in ("127.0.0.1", "localhost", "::1") and p.port == 8777:
-                return f"{bu.rstrip('/')}/gw/{self.project_id}/{self.session_id}"
+                base = f"{bu.rstrip('/')}/gw/{self.project_id}/{self.session_id}"
+                think = getattr(self, "think_by_agent", {}).get(agent.name)
+                if think is not None:
+                    base += f"/think/{1 if think else 0}"
+                return base
         except Exception:
             pass
         return bu
