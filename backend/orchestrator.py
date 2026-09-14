@@ -98,9 +98,11 @@ class Session:
     """
 
     def __init__(self, project_path: str, session_id: str, agents: list[AgentConfig],
-                 max_rounds: int, broadcast, timeout: int = 300, tone: str = ""):
+                 max_rounds: int, broadcast, timeout: int = 300, tone: str = "",
+                 project_id: str | None = None):
         self.project_path = project_path
         self.session_id = session_id
+        self.project_id = project_id or ""
         self.agents = agents
         self.max_rounds = max_rounds
         self.timeout = timeout
@@ -118,7 +120,8 @@ class Session:
         self._pt = {**PROMPT_TEMPLATES_DEBATE, **(_pt_cfg if isinstance(_pt_cfg, dict) else {})}
         # 每个 agent 的「持续 CLI 会话」id，用于 1:1 续接；从磁盘读回（历史会话恢复用）
         self.agent_sessions = (sess or {}).get("agent_sessions", {})
-        self.runtimes = {a.name: AgentRuntime(a, self.agent_sessions.get(a.name)) for a in agents}
+        self.runtimes = {a.name: AgentRuntime(a, self.agent_sessions.get(a.name),
+                                               session_base_url=self._gw_url(a)) for a in agents}
         self.single = len(agents) < 2
         self.mode = "chat" if self.single else "debate"
         self.stop_event = asyncio.Event()
@@ -145,6 +148,26 @@ class Session:
         # 需知道「对方尝试终止但被系统拒绝」——否则弱模型把对方被拒的调用误读为「已提议终止、
         # 等我确认」（实测「谁聪明」gemma 因此连调 2 次 end_discussion 去"确认"）。
         self._peer_rejected = None
+
+    def _gw_url(self, agent: AgentConfig) -> str | None:
+        """按会话拼出 claude 网关地址；仅对指向本服务的 base_url 注入 /gw/<pid>/<sid> 路径。
+
+        该路径让网关（/gw/{pid}/{sid}/v1/messages）按会话读取 ollama_think 覆盖全局默认，
+        实现「思考」会话级开关。判定「本服务」：host 为 localhost/127.0.0.1/::1 且端口 8777
+        （即本网关标准端口）。外部网关（litellm 等）不加路径、保持原样，避免 404。
+        非 base_url agent（如真实 claude / codex 直连）返回 None，走各自原生后端。
+        """
+        bu = agent.base_url
+        if not bu or not self.project_id:
+            return bu
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(bu)
+            if (p.hostname or "").lower() in ("127.0.0.1", "localhost", "::1") and p.port == 8777:
+                return f"{bu.rstrip('/')}/gw/{self.project_id}/{self.session_id}"
+        except Exception:
+            pass
+        return bu
 
     async def _emit(self, **kw):
         # 所有事件带 sid（会话 id）：多会话并发时前端据此区分事件归属，

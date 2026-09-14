@@ -92,9 +92,12 @@ class AgentRuntime:
     - fake：纯内存模拟，维护 `_fake_history` 以忠实复现「有状态会话」（agent 自身记得前文）。
     """
 
-    def __init__(self, agent: AgentConfig, cli_session_id: str | None = None):
+    def __init__(self, agent: AgentConfig, cli_session_id: str | None = None, session_base_url: str | None = None):
         self.agent = agent
         self.cli_session_id = cli_session_id  # None = 本 app 会话内该 agent 尚未开过 CLI 会话
+        # 会话级网关地址（含 /gw/<pid>/<sid> 路径）：编排层按会话拼好传入，
+        # 据此让网关按会话读取思考开关。None 时回落到 agent.base_url（全局默认）。
+        self.session_base_url = session_base_url
         self._force_new_session = False  # 自愈：True 时下一轮用全新 id 注册（绕过已占用的旧锁）
         self._fake_history: list[str] = []
         self._section = None  # 当前文本分片归属：None / "think" / "ans"（跨 claude 多事件续接用）
@@ -131,20 +134,47 @@ class AgentRuntime:
         except Exception:
             pass
         if self.agent.base_url:
+            # 会话级网关地址（含 /gw/<pid>/<sid> 路径）优先；否则回落 agent.base_url。
+            # 两者都可能被 claude 2.x 的 settings.json env 合并覆盖，故下方把最终 base_url
+            # 同步写进隔离配置目录的 settings.json env（见 _sync_claude_base_url），保证生效。
+            base_url = self.session_base_url or self.agent.base_url
             # claude 2.x 会把 ~/.claude/settings.json 的 env 合并进运行时并**覆盖**同名进程环境变量，
             # 仅靠子进程 env 注入 ANTHROPIC_BASE_URL 会被全局配置（如指向 deepseek）盖掉、per-agent 网关失效。
             # 故改用隔离配置目录：复制用户 settings（去插件以避免临时目录缺失插件文件报错）、
             # 改写 env.ANTHROPIC_BASE_URL 为目标网关，并用 CLAUDE_CONFIG_DIR 指向它——
             # 子进程只读这份隔离配置，完全不动用户全局 ~/.claude。
             env["CLAUDE_CONFIG_DIR"] = self._claude_config_dir()
-            env["ANTHROPIC_BASE_URL"] = self.agent.base_url
+            env["ANTHROPIC_BASE_URL"] = base_url
             # claude 仍要求一个 key 头；网关侧放行任意值，故为空时补 dummy
             env["ANTHROPIC_API_KEY"] = self.agent.api_key or "local-gateway"
             # 让 claude 接受任意 model id（网关按此路由到具体本地模型），跳过内置校验
             if self.agent.model:
                 env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = self.agent.model
                 env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = self.agent.model
+            # 隔离配置目录的 settings.json env 会覆盖进程 env，必须把当前（会话级）base_url 写进去，
+            # 否则会话路径 /gw/<pid>/<sid> 丢失、思考开关退化为全局。
+            self._sync_claude_base_url(base_url)
         return env
+
+    def _sync_claude_base_url(self, base_url: str) -> None:
+        """把当前（会话级）base_url 写进隔离配置目录的 settings.json env.ANTHROPIC_BASE_URL。
+
+        claude 2.x 合并 settings.json env 并覆盖进程 env，故仅设进程 env 不够——必须落到
+        隔离配置目录文件。每次拉起子进程前调用，保证本会话的请求走正确的 /gw/<pid>/<sid> 路径。
+        配置目录由 _claude_config_dir 创建（若不存在），这里只负责刷新已存在文件的 base_url。
+        """
+        try:
+            root = Path.home() / ".cache" / "agentchat" / "claude-cfg" / _safe_name(self.agent.name)
+            sfile = root / "settings.json"
+            if not sfile.exists():
+                return  # _claude_config_dir 创建时会写入正确的 base_url
+            d = json.loads(sfile.read_text(encoding="utf-8"))
+            d.setdefault("env", {})
+            if d["env"].get("ANTHROPIC_BASE_URL") != base_url:
+                d["env"]["ANTHROPIC_BASE_URL"] = base_url
+                sfile.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     def _claude_config_dir(self) -> str | None:
         """为带 base_url 的 claude agent 生成隔离配置目录，使 per-agent 网关真正生效（详见 _claude_env）。
@@ -162,12 +192,16 @@ class AgentRuntime:
         root = Path.home() / ".cache" / "agentchat" / "claude-cfg" / _safe_name(self.agent.name)
         root.mkdir(parents=True, exist_ok=True)
         sfile = root / "settings.json"
+        # 隔离配置目录的 settings.json env.ANTHROPIC_BASE_URL：优先用会话级 base_url
+        # （含 /gw/<pid>/<sid> 路径），否则回落 agent.base_url。进程 env 会被 claude 2.x
+        # 合并 settings.json env 覆盖，故这里必须写正确地址，会话级思考开关才能生效。
+        _cfg_base_url = self.session_base_url or self.agent.base_url
         if not sfile.exists():
             src = Path.home() / ".claude" / "settings.json"
             d: dict = json.loads(src.read_text(encoding="utf-8")) if src.exists() else {}
             d.pop("enabledPlugins", None)  # 避免临时目录缺失插件文件导致加载报错
             d.setdefault("env", {})
-            d["env"]["ANTHROPIC_BASE_URL"] = self.agent.base_url
+            d["env"]["ANTHROPIC_BASE_URL"] = _cfg_base_url
             d["env"]["ANTHROPIC_API_KEY"] = self.agent.api_key or "local-gateway"
             if self.agent.model:
                 d["env"]["ANTHROPIC_CUSTOM_MODEL_OPTION"] = self.agent.model
@@ -177,11 +211,19 @@ class AgentRuntime:
             d["enableAllProjectMcpServers"] = True
             sfile.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
         else:
-            # 旧生成的隔离配置：补齐 enableAllProjectMcpServers（若缺）
+            # 旧生成的隔离配置：补齐 enableAllProjectMcpServers（若缺），并同步当前（会话级）
+            # base_url——否则沿用旧文件里写死的地址，会话路径 /gw/<pid>/<sid> 丢失。
             try:
                 d = json.loads(sfile.read_text(encoding="utf-8"))
+                changed = False
                 if not d.get("enableAllProjectMcpServers"):
                     d["enableAllProjectMcpServers"] = True
+                    changed = True
+                d.setdefault("env", {})
+                if d["env"].get("ANTHROPIC_BASE_URL") != _cfg_base_url:
+                    d["env"]["ANTHROPIC_BASE_URL"] = _cfg_base_url
+                    changed = True
+                if changed:
                     sfile.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass

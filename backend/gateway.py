@@ -517,8 +517,30 @@ def _non_stream_response_ollama(body: dict, resp: dict) -> dict:
     }
 
 
-async def handle_messages(req: Request, settings: dict):
-    """FastAPI 路由处理函数：POST /v1/messages。"""
+def _resolve_ollama_think(settings: dict, project_path: str | None, sid: str | None) -> bool:
+    """解析本次请求是否保留模型思考（thinking）块。
+
+    默认取全局设置 ollama_think；若请求归属某个 app 会话（网关路由带 /gw/<pid>/<sid>），
+    且该会话显式设置过 ollama_think，则按会话级值覆盖——实现「思考」的会话级开关，
+    而非只能全局统一开关。会话未显式设置时回退全局默认。
+    """
+    think = bool(settings.get("ollama_think", True))
+    if project_path and sid:
+        try:
+            from . import store as _store
+            s = _store.read_session(project_path, sid)
+            if s and s.get("ollama_think") is not None:
+                think = bool(s["ollama_think"])
+        except Exception:
+            pass
+    return think
+
+
+async def handle_messages(req: Request, settings: dict, project_path: str | None = None, sid: str | None = None):
+    """FastAPI 路由处理函数：POST /v1/messages 或 /gw/<pid>/<sid>/v1/messages。
+
+    project_path / sid 由带会话路径的路由传入，用于按会话解析思考开关（会话级覆盖全局）。
+    """
     body = await req.json()
     oa = anthropic_to_openai(body)
     url = _ollama_base_url(settings) + "/api/chat"
@@ -544,7 +566,9 @@ async def handle_messages(req: Request, settings: dict):
     # 思考开关：ollama_think=False 时请求带 think:false（gemma 等推理模型支持的参数，
     # 实测生效：不再产出 thinking 块，输出从单轮数万 token 降到个位数）。默认 True 不传，
     # 保持对不支持 think 参数的模型（deepseek 等）无影响。
-    if not bool(settings.get("ollama_think", True)):
+    # 优先取会话级开关（带 /gw/<pid>/<sid> 路径的路由会传入 project_path/sid），
+    # 未设置则回退全局默认。
+    if not _resolve_ollama_think(settings, project_path, sid):
         ollama_body["think"] = False
     if oa.get("tools"):
         # 真工具调用路径：把 anthropic_to_openai 过滤后的 end_discussion 工具定义透传给

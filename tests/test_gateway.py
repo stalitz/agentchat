@@ -710,5 +710,70 @@ class TestOllamaNativeGateway(unittest.TestCase):
         self.assertIn('"stop_reason": "tool_use"', out, "有 tool_use 块时 stop_reason 必须为 tool_use（gemma4 实测 done_reason=stop）")
 
 
+class TestSessionThinkOverride(unittest.TestCase):
+    """会话级「思考」开关：网关按会话读取 ollama_think 覆盖全局默认。"""
+
+    def _setup_session(self, think_value):
+        """建临时会话并（可选地）写入会话级 ollama_think；返回 (project_path, sid)。"""
+        import tempfile
+        import pathlib
+        import backend.store as store
+        tmpdir = pathlib.Path(tempfile.mkdtemp(prefix="agentchat_think_"))
+        # 隔离存储，避免污染真实 data/config.json
+        prev = store.CONFIG_FILE
+        cfg = tmpdir / "config.json"
+        store.CONFIG_FILE = cfg
+        try:
+            proj_path = str(tmpdir / "myproj")
+            pathlib.Path(proj_path).mkdir(parents=True, exist_ok=True)
+            s = store.create_session(proj_path, "测试会话")
+            sid = s["id"]
+            if think_value is not None:
+                store.set_session_think(proj_path, sid, think_value)
+            return proj_path, sid, prev
+        finally:
+            # CONFIG_FILE 还原交给调用方（下面用 addCleanup 思路，简单起见这里返回 prev）
+            pass
+
+    def _restore(self, prev):
+        import backend.store as store
+        if prev is not None:
+            store.CONFIG_FILE = prev
+
+    def test_global_default_when_no_session_value(self):
+        import backend.store as store
+        proj_path, sid, prev = self._setup_session(None)
+        try:
+            # 全局 True、会话未设置 → 回退 True
+            self.assertTrue(gateway._resolve_ollama_think({"ollama_think": True}, proj_path, sid))
+            # 全局 False、会话未设置 → 回退 False
+            self.assertFalse(gateway._resolve_ollama_think({"ollama_think": False}, proj_path, sid))
+        finally:
+            self._restore(prev)
+
+    def test_session_false_overrides_global_true(self):
+        # 会话显式关思考 → 即使全局开，也应为 False
+        proj_path, sid, prev = self._setup_session(False)
+        try:
+            self.assertFalse(gateway._resolve_ollama_think({"ollama_think": True}, proj_path, sid))
+            self.assertFalse(gateway._resolve_ollama_think({"ollama_think": False}, proj_path, sid))
+        finally:
+            self._restore(prev)
+
+    def test_session_true_overrides_global_false(self):
+        # 会话显式开思考 → 即使全局关，也应为 True（会话级覆盖全局）
+        proj_path, sid, prev = self._setup_session(True)
+        try:
+            self.assertTrue(gateway._resolve_ollama_think({"ollama_think": False}, proj_path, sid))
+            self.assertTrue(gateway._resolve_ollama_think({"ollama_think": True}, proj_path, sid))
+        finally:
+            self._restore(prev)
+
+    def test_no_sid_falls_back_to_global(self):
+        # 不带 sid（无会话路径的 /v1/messages 路由）→ 只看全局默认
+        self.assertTrue(gateway._resolve_ollama_think({"ollama_think": True}, None, None))
+        self.assertFalse(gateway._resolve_ollama_think({"ollama_think": False}, None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -877,5 +877,37 @@ class TestOrchestrator(unittest.TestCase):
         p2 = s2._build_prompt(a1, "任务", round_i=0)
         self.assertNotIn("其他 agent 的发言", p2, "全新会话首轮无他人发言，不应回传 delta")
 
+
+class TestGwUrl(unittest.TestCase):
+    """会话级网关地址：_gw_url 仅对指向本服务（localhost:8777）的 base_url 注入
+    /gw/<pid>/<sid> 路径，外部网关/无 base_url 原样返回。"""
+
+    def _session(self, project_id, base_url):
+        a = models.AgentConfig(id="", name="A", type="claude-code", role="r", base_url=base_url)
+        s = orch.Session("/tmp/p", "s_x", [a], 6, Recorder(), timeout=300, project_id=project_id)
+        return s, a
+
+    def test_local_gateway_gets_session_path(self):
+        s, a = self._session("pr_1", "http://127.0.0.1:8777")
+        self.assertEqual(s._gw_url(a), "http://127.0.0.1:8777/gw/pr_1/s_x")
+
+    def test_localhost_variant(self):
+        s, a = self._session("pr_1", "http://localhost:8777")
+        self.assertEqual(s._gw_url(a), "http://localhost:8777/gw/pr_1/s_x")
+
+    def test_no_project_id_returns_plain(self):
+        # 缺 project_id 时无法编码会话路径 → 回落原始 base_url（全局默认生效）
+        s, a = self._session("", "http://127.0.0.1:8777")
+        self.assertEqual(s._gw_url(a), "http://127.0.0.1:8777")
+
+    def test_external_gateway_untouched(self):
+        s, a = self._session("pr_1", "http://other:4000")
+        self.assertEqual(s._gw_url(a), "http://other:4000", "外部网关不加 /gw 路径，避免 404")
+
+    def test_no_base_url_returns_none(self):
+        s, a = self._session("pr_1", None)
+        self.assertIsNone(s._gw_url(a), "无 base_url（真实 claude / codex 直连）返回 None")
+
+
 if __name__ == "__main__":
     unittest.main()

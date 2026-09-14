@@ -23,16 +23,21 @@ async def _rewrite_claude_tool_roundtrip_url(request: Request, call_next):
     （把 tool_result 回传）会把 ANTHROPIC_BASE_URL 整体编码进 path——实测形如
     `POST /http%3A//127.0.0.1%3A8777/v1/messages?beta=true` → 本服务 404，导致工具调用
     永远拿不到结果（claude 报「There's an issue with the selected model」退出）。
-    识别该模式并改写为 /v1/messages，保证工具往返走通（网关对 tool_result 处理本就正常）。
+    识别该模式并改写回真实的 path，保证工具往返走通（网关对 tool_result 处理本就正常）。
+
+    会话级思考开关把 sid 编进了 base_url 路径（如 `/gw/<pid>/<sid>/v1/messages`），
+    工具往返的编码 URL 形如 `/http%3A//127.0.0.1%3A8777/gw/<pid>/<sid>/v1/messages?beta=true`，
+    这里用 urlparse 提取其中的 path 部分（保留 /gw/... 前缀）再改写，确保会话路径不丢。
     """
-    from urllib.parse import unquote
+    from urllib.parse import unquote, urlparse
 
     path = request.url.path
     if path.startswith("/http%3A") or path.startswith("/http:"):
         decoded = unquote(path)
-        if "/v1/messages" in decoded:
-            request.scope["path"] = "/v1/messages"
-            request.scope["raw_path"] = b"/v1/messages"
+        parsed = urlparse(decoded)
+        if parsed.path and "/v1/messages" in parsed.path:
+            request.scope["path"] = parsed.path
+            request.scope["raw_path"] = parsed.path.encode()
     return await call_next(request)
 
 clients: set[WebSocket] = set()
@@ -170,7 +175,8 @@ async def handle_start(msg: dict):
     # 非默认 Team）必须落库，否则 stored team_id 停留在创建默认 teams[0]，重开会话会被静默降级成
     # 2 agent（实测五子棋会话：首跑 3g 但 stored=2g，续跑无裁判）。每次发起都按当前选择写回。
     store.update_session_team(proj["path"], sid, msg.get("team_id"))
-    sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout, tone=tone)
+    sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout, tone=tone,
+                   project_id=proj["id"])
     sessions[sid] = sess  # 注册；结束后保留（running=False，可继续/复用）
     asyncio.create_task(sess.start(msg.get("task", "")))
 
@@ -253,11 +259,17 @@ async def get_session(pid: str, sid: str):
     # 找不到 transcript（agent 不可连 / 全新会话）则保持本地不动，作为离线回退。
     _reconcile_with_cli(proj["path"], sid, s.get("agent_sessions", {}))
     s = store.read_session(proj["path"], sid)  # 重新读回对账后的最新消息
+    # 会话级「思考」开关的当前生效值：会话显式设置过用会话值，否则回退全局默认
+    # （前端据此初始化开关状态；切换时写入显式值）。
+    think = s.get("ollama_think")
+    if think is None:
+        think = bool((store.get_settings()).get("ollama_think", True))
     return {
         "id": s["id"], "title": s.get("title", "会话"),
         "team_id": s.get("team_id", ""),
         "messages": s.get("messages", []),
         "agent_sessions": s.get("agent_sessions", {}),
+        "think": think,
         "exists": True,
     }
 
@@ -320,6 +332,18 @@ async def rename_session(pid: str, sid: str, body: dict | None = None):
     return {"ok": False, "error": "会话不存在"}
 
 
+@app.post("/api/session/{pid}/{sid}/think")
+async def set_session_think(pid: str, sid: str, body: dict | None = None):
+    """会话级「思考」开关：写入会话 ollama_think，覆盖全局默认。"""
+    proj = store.get_project(pid)
+    if not proj:
+        return {"ok": False, "error": "项目不存在"}
+    think = bool((body or {}).get("think", True))
+    if store.set_session_think(proj["path"], sid, think):
+        return {"ok": True, "think": think}
+    return {"ok": False, "error": "会话不存在"}
+
+
 # 全局会话列表（跨项目扁平化），供前端左侧「会话」主导航使用；
 # 每条附带 project_id / project_name / team_id / team_name，按 updated_at 倒序。
 @app.get("/api/sessions")
@@ -361,3 +385,13 @@ async def index():
 @app.post("/v1/messages")
 async def anthropic_messages(req: Request):
     return await gateway.handle_messages(req, store.get_settings())
+
+
+# 会话级思考开关：把 sid 编进 base_url 路径（/gw/<pid>/<sid>/v1/messages），
+# 网关据此按会话读取 ollama_think 覆盖全局默认。claude-code 的 ANTHROPIC_BASE_URL
+# 由编排层按会话拼成此路径（见 orchestrator.Session._gw_url）。
+@app.post("/gw/{pid}/{sid}/v1/messages")
+async def anthropic_messages_session(req: Request, pid: str, sid: str):
+    proj = store.get_project(pid)
+    project_path = proj["path"] if proj else pid
+    return await gateway.handle_messages(req, store.get_settings(), project_path=project_path, sid=sid)

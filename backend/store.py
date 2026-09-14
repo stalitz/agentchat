@@ -542,6 +542,24 @@ def set_session_tone(project_path: str, sid: str, tone: str) -> None:
     _save_sessions(project_path, sessions)
 
 
+def set_session_think(project_path: str, sid: str, think: bool) -> bool:
+    """记录会话级「思考」开关（覆盖全局默认 ollama_think）；返回是否找到该会话。
+
+    仅 claude-code 类、base_url 指向本网关的 agent 真正生效（网关据此给 Ollama 带 think:false）。
+    会话未显式设置时网关回退到全局默认，故本函数只在用户切换时写入显式值。"""
+    sessions = _load_sessions(project_path)
+    found = False
+    for s in sessions:
+        if s["id"] == sid:
+            s["ollama_think"] = bool(think)
+            s["updated_at"] = _now()
+            found = True
+            break
+    if found:
+        _save_sessions(project_path, sessions)
+    return found
+
+
 def set_session_title(project_path: str, sid: str, title: str) -> bool:
     """修改会话标题；返回是否找到该会话。"""
     title = (title or "").strip()
