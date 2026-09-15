@@ -245,5 +245,82 @@ class TestCodexFallback(unittest.IsolatedAsyncioTestCase):
         rt.aclose()
 
 
+class TestMcpToolCallNaming(unittest.IsolatedAsyncioTestCase):
+    """codex 的 MCP 工具调用条目在两条输出通路上命名不同，必须都认。
+
+    2026-09-15 实测：app-server（本 app 默认走的通路）发 `mcpToolCall`（驼峰），
+    exec / rollout 发 `mcp_tool_call`（下划线）。原实现只判下划线 ⇒ app-server 下
+    codex 的 end_discussion 投票**实时全丢**（s_f85043cf 实测 2 票都没进状态机，
+    阈值 ⌊2/2⌋+1=2 永不满足，辩论只能靠轮次耗尽收尾）。
+    """
+
+    def _item(self, itype):
+        return {"type": itype, "id": "call_1", "server": "terminate-signal",
+                "tool": "end_discussion", "status": "completed",
+                "arguments": {"reason": "双方一致"}}
+
+    async def _collect(self, notifications):
+        """驱动 app-server 主循环：跳过握手与残留清理，直接喂通知。"""
+        rt = _rt()
+
+        async def _noop_ensure(cwd):
+            return None
+
+        async def _noop_drain():
+            return None
+
+        rt._ensure_appserver = _noop_ensure
+        rt._as_drain_stale = _noop_drain
+        rt._appserver_thread_id = "th_1"
+        rt._as_queue = asyncio.Queue()   # 真实实现里由 _ensure_appserver 建立，这里跳过握手故自建
+        for o in notifications:
+            await rt._as_queue.put(o)
+        return [ev async for ev in rt._run_codex_appserver("hi", "/tmp", 5)]
+
+    def test_item_type_predicate_accepts_both_namings(self):
+        self.assertTrue(executor._is_mcp_tool_item({"type": "mcpToolCall"}))
+        self.assertTrue(executor._is_mcp_tool_item({"type": "mcp_tool_call"}))
+        self.assertFalse(executor._is_mcp_tool_item({"type": "reasoning"}))
+        self.assertFalse(executor._is_mcp_tool_item(None))
+
+    async def test_appserver_camelcase_emits_tool_use(self):
+        # item/started + item/completed 都带同一个 mcpToolCall：只应产一次 tool_use（不重复投票）
+        evs = await self._collect([
+            {"method": "item/started", "params": {"item": self._item("mcpToolCall")}},
+            {"method": "item/completed", "params": {"item": self._item("mcpToolCall")}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual(len(tools), 1, "完成通知只应产一次 tool_use")
+        self.assertEqual(tools[0][1]["name"], "end_discussion")
+        self.assertEqual(tools[0][1]["input"], {"reason": "双方一致"})
+
+    async def test_appserver_snakecase_still_works(self):
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": self._item("mcp_tool_call")}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0][1]["name"], "end_discussion")
+
+    async def test_appserver_other_mcp_tool_ignored(self):
+        # 非 end_discussion 的 MCP 调用（如内置工具）不产 tool_use，也不打断流式
+        evs = await self._collect([
+            {"method": "item/completed",
+             "params": {"item": {"type": "mcpToolCall", "server": "x", "tool": "read_file",
+                                 "arguments": {}}}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        self.assertEqual([e for e in evs if e[0] == "tool_use"], [])
+
+    def test_exec_path_parses_both_namings(self):
+        """exec（`codex exec --json`）/ rollout 回放走 _parse_codex_line，同样兼容两种命名。"""
+        want = [("tool_use", {"name": "end_discussion", "input": {"reason": "双方一致"}})]
+        for itype in ("mcpToolCall", "mcp_tool_call"):
+            ev = {"type": "item.completed", "item": self._item(itype)}
+            self.assertEqual(executor._parse_codex_line(json.dumps(ev), None), want, itype)
+
+
 if __name__ == "__main__":
     unittest.main()

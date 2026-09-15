@@ -381,6 +381,58 @@ def _is_claude_error_text(text: str) -> bool:
     return any(t.startswith(p) for p in _CLAUDE_ERROR_PREFIXES)
 
 
+_TOOL_BLOCK_TYPES = ("tool_use", "tool_result")
+
+
+def _merge_tool_blocks(new_blocks: list, old_blocks: list) -> list:
+    """CLI transcript 缺工具块时，把本地已记录的工具块按相对位置并回新 blocks。
+
+    仅在「本地有工具块、CLI 侧一个都没有」时触发；CLI 侧带工具块则以 CLI 为准（避免重复）。
+    插入点取本地「首个工具块之前的非工具块数量」在新序列中的同位——覆盖 claude 的常见形态
+    （思考 → 正文 → 文本兜底调用）。
+    """
+    if not new_blocks or not old_blocks:
+        return new_blocks
+    if any(b.get("type") in _TOOL_BLOCK_TYPES for b in new_blocks):
+        return new_blocks
+    tools = [b for b in old_blocks if b.get("type") in _TOOL_BLOCK_TYPES]
+    if not tools:
+        return new_blocks
+    lead = 0
+    for b in old_blocks:
+        if b.get("type") in _TOOL_BLOCK_TYPES:
+            break
+        lead += 1
+    pos = min(lead, len(new_blocks))
+    return list(new_blocks[:pos]) + tools + list(new_blocks[pos:])
+
+
+def _merge_tool_info(msg: dict, turn: dict) -> bool:
+    """把 CLI 回合的工具信息并入本地消息，返回是否发生变更。
+
+    **空值 ≠「该轮确实没调用工具」，故不做空值覆盖**：
+    - CLI 回合带 tool_calls / tool_results → 以 CLI 为准（覆盖）；
+    - CLI 回合为空 → 保留本地已有值。claude 走「prompt 文本 json」兜底解析出的 tool_use
+      本就不在它自己的 transcript 里（模型把调用写进了正文），覆盖会把这条留痕抹掉
+      （实测 s_f85043cf：claude 的终止提议在气泡里查不到工具块）。
+    - blocks：CLI 侧无工具块时按相对位置并回本地工具块，保证气泡内可见。
+    """
+    changed = False
+    new_tc = turn.get("tool_calls") or []
+    new_tr = turn.get("tool_results") or []
+    if new_tc and (msg.get("tool_calls") or []) != new_tc:
+        msg["tool_calls"] = new_tc
+        changed = True
+    if new_tr and (msg.get("tool_results") or []) != new_tr:
+        msg["tool_results"] = new_tr
+        changed = True
+    merged = _merge_tool_blocks(turn.get("blocks") or [], msg.get("blocks") or [])
+    if (msg.get("blocks") or []) != merged:
+        msg["blocks"] = merged
+        changed = True
+    return changed
+
+
 def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_turns: list) -> dict:
     """用 CLI transcript 的 agent 回合（cli_turns: 有序 [{content, thinking}]）覆盖本地该 agent 的消息。
 
@@ -428,19 +480,10 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
                     changed += 1
-                new_tc = turn.get("tool_calls", []) or []
-                new_tr = turn.get("tool_results", []) or []
-                if (m.get("tool_calls") or []) != new_tc:
-                    m["tool_calls"] = new_tc
-                    changed += 1
-                if (m.get("tool_results") or []) != new_tr:
-                    m["tool_results"] = new_tr
-                    changed += 1
-                # 时间线 blocks 直接复用解析出的原生 content 顺序；旧消息无 blocks 时
-                # 通过刷新 reconcile 重建（re-read 原始 transcript），避免走前端固定顺序回退。
-                new_blocks = turn.get("blocks") or []
-                if (m.get("blocks") or []) != new_blocks:
-                    m["blocks"] = new_blocks
+                # 工具信息**不做空值覆盖**（见 _merge_tool_info 说明）：claude 走「prompt 文本
+                # json」兜底解析出的 tool_use 不在它自己的 transcript 里，用空值覆盖会把这条
+                # 留痕连同气泡内的工具块一起抹掉（实测 s_f85043cf：claude 的终止提议气泡里查不到）。
+                if _merge_tool_info(m, turn):
                     changed += 1
                 # 回填 claude 真实时间（仅补缺失，避免每次重开改写已有本地 ts）
                 new_ts = _claude_ts_to_local(turn.get("ts"))
@@ -481,18 +524,8 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
                     changed += 1
-                new_tc = turn.get("tool_calls", []) or []
-                new_tr = turn.get("tool_results", []) or []
-                if (m.get("tool_calls") or []) != new_tc:
-                    m["tool_calls"] = new_tc
-                    changed += 1
-                if (m.get("tool_results") or []) != new_tr:
-                    m["tool_results"] = new_tr
-                    changed += 1
-                # 时间线 blocks 复用解析出的原生 content 顺序（内容匹配分支同理重建旧消息）
-                new_blocks = turn.get("blocks") or []
-                if (m.get("blocks") or []) != new_blocks:
-                    m["blocks"] = new_blocks
+                # 工具信息不做空值覆盖（同上分支，见 _merge_tool_info）
+                if _merge_tool_info(m, turn):
                     changed += 1
                 # 回填 claude 真实时间（仅补缺失）
                 new_ts = _claude_ts_to_local(turn.get("ts"))

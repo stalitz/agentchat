@@ -602,7 +602,8 @@ class AgentRuntime:
                         yield ("thinking", d)
                 elif m == "item/completed":
                     it = (o.get("params") or {}).get("item") or {}
-                    if it.get("type") == "mcp_tool_call" and "end_discussion" in str(it.get("tool") or ""):
+                    # app-server 的 MCP 调用条目名为 mcpToolCall（驼峰），见 _is_mcp_tool_item
+                    if _is_mcp_tool_item(it) and "end_discussion" in str(it.get("tool") or ""):
                         yield ("tool_use", {"name": "end_discussion",
                                              "input": _codex_parse_args(it.get("arguments"))})
                 elif m == "error":
@@ -1246,14 +1247,15 @@ def _parse_codex_line(text: str, runtime: "AgentRuntime | None"):
                or ev.get("thread_id"))
         if sid:
             runtime.cli_session_id = sid
-    # MCP 工具调用（codex 0.146.1）：`item.completed` 里 item.type == "mcp_tool_call"，
-    # 形如 {"server":"terminate-signal","tool":"end_discussion","arguments":{"reason":...}}。
+    # MCP 工具调用：`item.completed` 里 item.type == "mcp_tool_call"（exec / rollout）或
+    # "mcpToolCall"（app-server），形如 {"server":"terminate-signal","tool":"end_discussion",
+    # "arguments":{"reason":...}}。命名兼容见 _is_mcp_tool_item。
     # 必须映射成与 claude 侧完全一致的 ("tool_use", {...})，否则编排层的终止状态机
     # 收不到 codex 的投票（表现为「codex 只会说话、不会投终止票」）。
-    # 只认 item.completed：mcp_tool_call 会发 started + completed 两条，取 completed
+    # 只认 item.completed：MCP 调用会发 started + completed 两条，取 completed
     # 既保证「必有」、又不会重复产事件（agent_message 也只发 completed）。
     item = ev.get("item")
-    if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
+    if _is_mcp_tool_item(item):
         if ev.get("type") == "item.completed" and "end_discussion" in str(item.get("tool") or ""):
             args = item.get("arguments") or {}
             return [("tool_use", {
@@ -1622,6 +1624,20 @@ def _codex_reasoning_texts(path: str) -> list[str]:
     except OSError:
         pass
     return out
+
+
+# codex 的 MCP 工具调用 item 名：**同一份 codex、两条输出通路的命名不同**——
+#   - app-server（JSON-RPC 通知，本 app 默认走这条）：`item.type == "mcpToolCall"`（驼峰）
+#   - exec（`codex exec --json`）与 rollout 文件：`item.type == "mcp_tool_call"`（下划线）
+# 只判一种写法会导致另一条通路彻底漏掉 end_discussion 投票（实测 2026-09-15：app-server
+# 发 camelCase，判的是 snake_case → codex 的终止票实时全丢，辩论只能靠轮次耗尽收尾）。
+# 判定集中在此处，两条通路共用，避免再次分叉。
+_MCP_TOOL_ITEM_TYPES = ("mcpToolCall", "mcp_tool_call")
+
+
+def _is_mcp_tool_item(item) -> bool:
+    """item 是否为 codex 的 MCP 工具调用条目（兼容驼峰/下划线两种命名）。"""
+    return isinstance(item, dict) and item.get("type") in _MCP_TOOL_ITEM_TYPES
 
 
 def _codex_parse_args(raw) -> dict:

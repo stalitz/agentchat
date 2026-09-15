@@ -162,6 +162,56 @@ class TestStore(unittest.TestCase):
         self.assertEqual(a_msgs[0]["blocks"], cli_turns[0]["blocks"])
         self.assertEqual(a_msgs[1]["blocks"], cli_turns[1]["blocks"])
 
+    def test_reconcile_keeps_fallback_tool_info(self):
+        """claude 走「prompt 文本 json」兜底时的 tool_use 不在它自己的 transcript 里，
+        对账不得用空值把它抹掉（实测 s_f85043cf：claude 的终止提议在气泡里查不到工具块）。"""
+        p = TMP / "rec_tool"
+        s = store.create_session(str(p), "工具留痕")
+        tool_use = {"type": "tool_use", "name": "end_discussion", "input": {"reason": "双方一致"}}
+        store.append_message(str(p), s["id"], {
+            "round": 1, "speaker": "A", "role": "甲",
+            "content": '结论如上。\n```json\n{"tool": "end_discussion", "reason": "双方一致"}\n```',
+            "tool_calls": [{"name": "end_discussion", "input": {"reason": "双方一致"}}],
+            "tool_results": [],
+            "blocks": [{"type": "thinking", "thinking": "想"}, {"type": "text", "text": "结论如上。"},
+                       tool_use],
+        })
+        # CLI transcript：同一轮，但**没有任何工具块**（模型把调用写进了正文）
+        cli_turns = [{
+            "content": '结论如上。\n```json\n{"tool": "end_discussion", "reason": "双方一致"}\n```',
+            "thinking": "想",
+            "tool_calls": [], "tool_results": [],
+            "blocks": [{"type": "thinking", "thinking": "想"}, {"type": "text", "text": "结论如上。"}],
+        }]
+        store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        m = [x for x in store.read_session(str(p), s["id"])["messages"] if x["speaker"] == "A"][0]
+        self.assertEqual(m["tool_calls"], [{"name": "end_discussion", "input": {"reason": "双方一致"}}],
+                         "兜底解析出的 tool_calls 应保留")
+        self.assertEqual([b["type"] for b in m["blocks"]], ["thinking", "text", "tool_use"],
+                         "工具块应按相对位置并回时间线（否则气泡里看不到这次调用）")
+
+    def test_reconcile_cli_tool_info_wins_when_present(self):
+        # CLI 侧带工具信息时以 CLI 为准（不做空值覆盖 ≠ 不覆盖真实数据）
+        p = TMP / "rec_tool2"
+        s = store.create_session(str(p), "工具以 CLI 为准")
+        store.append_message(str(p), s["id"], {
+            "round": 1, "speaker": "A", "role": "甲", "content": "答案",
+            "tool_calls": [{"name": "end_discussion", "input": {"reason": "旧"}}],
+            "tool_results": [], "blocks": [{"type": "text", "text": "答案"}],
+        })
+        cli_turns = [{
+            "content": "答案", "thinking": "",
+            "tool_calls": [{"name": "end_discussion", "input": {"reason": "新"}}],
+            "tool_results": [{"content": "回执"}],
+            "blocks": [{"type": "text", "text": "答案"},
+                       {"type": "tool_use", "name": "end_discussion", "input": {"reason": "新"}}],
+        }]
+        store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        m = [x for x in store.read_session(str(p), s["id"])["messages"] if x["speaker"] == "A"][0]
+        self.assertEqual(m["tool_calls"], [{"name": "end_discussion", "input": {"reason": "新"}}])
+        self.assertEqual(m["tool_results"], [{"content": "回执"}])
+        self.assertEqual([b["type"] for b in m["blocks"]], ["text", "tool_use"])
+
     def test_reconcile_appends_cli_only_when_no_match(self):
         # 数量不一致且本地无内容匹配：CLI 多出的回合追加（崩写/掉轮恢复）；本地旧内容保留
         p = TMP / "rec5"
