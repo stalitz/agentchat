@@ -28,6 +28,13 @@ TONE_STYLES: dict[str, str] = {
     "幽默": "轻松诙谐，善用类比与玩笑化解对立，但不失深度",
 }
 
+# 「对抗互动型」风格：其描述里含「对方 / 对立面 / 反方」语义，必须有对方发言才有对象。
+# 首个发言者（场上还没有任何他人观点）若照此注入，唯一能反驳的对象就是自己的立场
+# （2026-09-15 实测：tone=唱反调 时，role=有神论者的第一个发言者开场即自我拆台——
+# 「我必须立刻对自己持有的这一信仰进行最严苛的审视」，议题方向从一开始就跑偏）。
+# 故这类风格在「无交锋对象的立论轮」不注入，改为要求先立住己方立场（见 _tone_block）。
+_TONE_ADVERSARIAL: set[str] = {"唱反调", "批判", "尖锐", "激进", "怀疑"}
+
 
 def _is_end_discussion(name) -> bool:
     """判定是否为 end_discussion 调用——兼容干净名（end_discussion）与
@@ -266,6 +273,54 @@ class Session:
             t = t.replace("<" + k + ">", "" if v is None else str(v))
         return t
 
+    def _others_since_last(self, agent: AgentConfig, round_i: int) -> list:
+        """回传「该 agent 上次发言之后的全部他人有效发言」（按发生顺序）。
+
+        辩论信息对称用：每个 agent 都看得到全体其他参与者，而非只看到紧邻上一个。
+        全新会话首轮（本方从未发言且 round_i == 0）不回传——此时 history 里若混着旧议题的
+        他人发言，回传会让 agent 把旧议题内容误当本轮的对方观点。
+        """
+        my_idx = -1
+        for i, m in enumerate(self.history):
+            if m.get("speaker") == agent.name:
+                my_idx = i
+        if not (round_i > 0 or my_idx >= 0):
+            return []
+        return [
+            m for m in self.history[my_idx + 1:]
+            if m.get("speaker") not in (agent.name, "system", "human")
+            # 被中止的发言已作废：不喂给其他 agent（用户口径：作废但仍落盘可见）
+            and not m.get("interrupted")
+        ]
+
+    def _is_opening_turn(self, agent: AgentConfig, round_i: int) -> bool:
+        """本轮是否为「没有交锋对象的立论轮」：本方本场尚未有效发言，或本轮无可回应的他人发言。
+
+        只有对抗互动型风格（_TONE_ADVERSARIAL）需要区分；chat 模式恒为 False——风格是针对
+        用户刚说的那句话生效的，不存在「没有对象」的问题。
+        """
+        if self.mode != "debate" or self.tone not in _TONE_ADVERSARIAL:
+            return False
+        spoke = any(m.get("speaker") == agent.name and not m.get("interrupted")
+                    for m in self.history)
+        if not spoke:
+            return True  # 本场首轮：全体各自先陈述立场，避免首个发言者自拆
+        return not self._others_since_last(agent, round_i)
+
+    def _tone_block(self, opening: bool) -> str:
+        """讨论调性注入文本；opening=True 且风格为对抗互动型时，改为「先立论」指令。
+
+        不能只是删掉风格描述：首轮仍要保证 agent 完整陈述己方立场（辩论的意义是立论后交锋，
+        而非一上来就替对方拆自己），故用 opening_statement 模板替代；其第 2 次发言起照常注入
+        原风格描述，CLI 会话有状态续接，届时自然进入交锋。
+        """
+        if not (self.tone and self.tone in TONE_STYLES):
+            return ""
+        if opening and self.tone in _TONE_ADVERSARIAL:
+            return self._render_slot("opening_statement")
+        return (f"本场讨论风格：{TONE_STYLES[self.tone]}——"
+                "请始终保持此风格发言，不要中途改变。")
+
     def _build_prompt(self, agent: AgentConfig, inject: str | None, round_i: int = 0) -> str:
         # 状态式 agent：每个 agent 在自己的 CLI 会话里持有完整历史（含历次议题与结论）。
         # 编排器每轮只发「增量 delta」——对手最近一句 + 本轮任务 / 介入，token 极省，
@@ -274,12 +329,11 @@ class Session:
         if agent.role:
             # 极便宜的身份锚定：避免 resume 后续接时角色设定漂移（一行，远小于重搬历史）
             parts.append(f"你是：{agent.role}。")
-        # 讨论调性：整场统一、每轮都注入，保证风格一致（chat / debate 均生效）
-        if self.tone and self.tone in TONE_STYLES:
-            parts.append(
-                f"本场讨论风格：{TONE_STYLES[self.tone]}——"
-                "请始终保持此风格发言，不要中途改变。"
-            )
+        # 讨论调性：整场统一、每轮都注入，保证风格一致（chat / debate 均生效）。
+        # 对抗互动型风格在「立论轮」降级为「先陈述己方立场」——原因见 _tone_block。
+        _tone = self._tone_block(opening=self._is_opening_turn(agent, round_i))
+        if _tone:
+            parts.append(_tone)
 
         if self.mode == "chat":
             # 人机对话：只把用户本轮新消息作为 delta 发给 agent（其 CLI 会话已含完整历史）
@@ -292,28 +346,18 @@ class Session:
 
         # 多 agent 辩论（FR5.3b 子项2）：回传「本方上次发言之后的全部他人发言」（按发生顺序），
         # 保证每个 agent 都看得到全体其他参与者的观点，而非只看到紧邻上一个（信息对称）。
-        # 2 agent 时本方法结果与旧「只取紧邻上家」等价（对方上一句 = 全部增量），无需特判。
+        # 2 agent 时与旧「只取紧邻上家」等价（对方上一句 = 全部增量），无需特判。
         # agent 的持续会话已记住自身历史与历次议题，故只回传「他人增量」，不回传本方旧发言。
-        # 全新会话首轮（history 只有 human 任务、本方从未发言）others 为空 → 自然不回传；
         # 续接场景（同会话内再次 start）round_i 重新从 0 开始，但本方已发过言（my_idx>=0），
-        # 必须回传「本方上次发言之后的他人增量」——否则续接首轮收不到对方在上一场末尾的
-        # 发言（象棋g+ 实测：g1 续接时缺 g2 的红3 马3进4，误当新一轮重新开局）。
-        my_idx = -1
-        for i, m in enumerate(self.history):
-            if m.get("speaker") == agent.name:
-                my_idx = i
-        if round_i > 0 or my_idx >= 0:
-            others = [
-                m for m in self.history[my_idx + 1:]
-                if m.get("speaker") not in (agent.name, "system", "human")
-                # 被中止的发言已作废：不喂给其他 agent（用户口径：作废但仍落盘可见）
-                and not m.get("interrupted")
-            ]
-            if others:
-                delta = "\n\n".join(
-                    f"{m['speaker']}（{m.get('role', '')}）说：\n{m['content']}" for m in others
-                )
-                parts.append("其他 agent 的发言（自你上次发言之后）：\n" + delta)
+        # 必须回传——否则续接首轮收不到对方在上一场末尾的发言
+        # （象棋g+ 实测：g1 续接时缺 g2 的红3 马3进4，误当新一轮重新开局）。
+        # 取数逻辑与「立论轮」判定共用同一实现（_others_since_last），避免两处分叉。
+        others = self._others_since_last(agent, round_i)
+        if others:
+            delta = "\n\n".join(
+                f"{m['speaker']}（{m.get('role', '')}）说：\n{m['content']}" for m in others
+            )
+            parts.append("其他 agent 的发言（自你上次发言之后）：\n" + delta)
         # 任务 / 人工介入（本轮新议题通常经此传入）
         if inject:
             parts.append(f"人工介入 / 任务：\n{inject}")

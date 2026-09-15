@@ -494,21 +494,76 @@ class TestOrchestrator(unittest.TestCase):
         # 未选 → 不注入
         p = s._build_prompt(a1, "任务", round_i=1)
         self.assertNotIn("本场讨论风格", p)
-        # 选定「批判」→ 注入风格描述
-        s.tone = "批判"
+        # 自我约束型风格（严谨）与「有无对方观点」无关 → 立论轮照常注入
+        s.tone = "严谨"
         p = s._build_prompt(a1, "任务", round_i=1)
         self.assertIn("本场讨论风格", p)
-        self.assertIn("挑战前提", p, "批判风格描述应注入")
+        self.assertIn("推理链", p, "严谨风格描述应注入")
         self.assertIn("不要中途改变", p)
         # 未知调名 → 不注入
         s.tone = "不存在的风格"
         p = s._build_prompt(a1, "任务", round_i=1)
         self.assertNotIn("本场讨论风格", p)
-        # chat 模式同样生效
+        # chat 模式同样生效（对抗型也一样：风格针对用户那句话，不存在「没有对象」问题）
         s.mode = "chat"; s.tone = "温和"
         p = s._build_prompt(a1, "你好", round_i=0)
         self.assertIn("本场讨论风格", p)
         self.assertIn("礼貌克制", p)
+        s.tone = "唱反调"
+        p = s._build_prompt(a1, "你好", round_i=0)
+        self.assertIn("本场讨论风格", p)
+        self.assertIn("寻找反例", p)
+
+    def test_adversarial_tone_defers_on_opening_turn(self):
+        # 对抗互动型风格（唱反调/批判/尖锐/激进/怀疑）在「无交锋对象的立论轮」不注入其风格描述：
+        # 首个发言者若照此风格发言，唯一能反驳的对象就是自己的立场——实测 tone=唱反调 时，
+        # role=有神论者的第一个发言者开场即自我拆台（「我必须立刻对自己持有的这一信仰进行最严苛的
+        # 审视」），议题方向从第一句就跑偏。改为先立论、第 2 次发言起进入交锋。
+        a1 = models.AgentConfig(name="A", type="fake", role="你坚信世界是神创造的")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid)
+        s.tone = "唱反调"
+
+        # 1) 首个发言者（history 只有 human 任务）→ 立论优先，不给对抗风格
+        p = s._build_prompt(a1, "你们说说世界是不是有神", round_i=0)
+        self.assertNotIn("本场讨论风格", p)
+        self.assertIn("立论优先", p)
+        self.assertIn("不要主动否定或削弱己方立场", p)
+        self.assertIn("你坚信世界是神创造的", p, "立场锚定不能因风格延后而丢失")
+
+        # 2) 第二个 agent 的首轮也属「本场首轮」→ 同样先立论（首轮全体各自陈述，不先交锋）
+        s.history.append({"round": 1, "speaker": "A", "role": "", "content": "甲的观点"})
+        p = s._build_prompt(a2, None, round_i=1)
+        self.assertNotIn("本场讨论风格", p)
+        self.assertIn("立论优先", p)
+
+        # 3) A 第 2 次发言：已有对方发言可交锋 → 恢复对抗风格，且对方发言仍照常回传
+        s.history.append({"round": 2, "speaker": "B", "role": "", "content": "乙的观点"})
+        p = s._build_prompt(a1, None, round_i=2)
+        self.assertIn("本场讨论风格", p)
+        self.assertIn("寻找反例", p)
+        self.assertNotIn("立论优先", p)
+        self.assertIn("乙的观点", p, "对方发言必须回传给本方")
+
+        # 4) 对方发言被中止（作废）→ 又无交锋对象，回到立论态
+        s.history[-1]["interrupted"] = True
+        p = s._build_prompt(a1, None, round_i=3)
+        self.assertNotIn("本场讨论风格", p)
+        self.assertIn("立论优先", p)
+
+    def test_adversarial_set_untouched_for_self_constraint_tones(self):
+        # 边界：非对抗型风格不受立论轮影响；无 tone 时不产生任何风格/立论文本
+        a1 = models.AgentConfig(name="A", type="fake")
+        s, _ = make_session([a1, models.AgentConfig(name="B", type="fake")], self.proj, self.sid)
+        self.assertEqual(s._tone_block(opening=True), "")
+        for t in ("温和", "中立", "简洁", "学术", "务实", "数据驱动", "详尽", "幽默",
+                  "友好", "审慎", "严谨"):
+            s.tone = t
+            self.assertIn("本场讨论风格", s._tone_block(opening=True), f"{t} 立论轮也应注入")
+        for t in ("唱反调", "批判", "尖锐", "激进", "怀疑"):
+            s.tone = t
+            self.assertIn("立论优先", s._tone_block(opening=True), f"{t} 立论轮应改为先立论")
+            self.assertIn("本场讨论风格", s._tone_block(opening=False), f"{t} 交锋轮应给风格")
 
     def test_round0_terminate_is_ignored_before_floor(self):
         # 共识终止有最小轮数保护：至少两轮完整往返（2*N-1）后 TERMINATE 才生效。
