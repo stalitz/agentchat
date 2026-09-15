@@ -162,6 +162,9 @@ class Session:
         self._current_runtime = None   # 当前在途 turn 的 runtime（中止时定位中断目标）
         self._turn_in_flight = False   # 当前是否有 turn 在执行（看门狗据此决定是否硬停）
         self.last_abort_channel = ""   # 实际使用的中断通道（诊断用）
+        # 本次 run 是否为「中止后的继续」（resume）：续接进来的发言已有前文交锋，不算立论轮
+        # （立论轮只在会话真正第一次开口时出现，见 _is_opening_turn）。
+        self._resumed = False
         self.inject_queue: asyncio.Queue = asyncio.Queue()
         self.running = False
         # end_discussion 终止状态机（FR5.3b 多数同意）：
@@ -282,7 +285,9 @@ class Session:
         """
         my_idx = -1
         for i, m in enumerate(self.history):
-            if m.get("speaker") == agent.name:
+            # 只认**有效**发言：被中止那条已作废（不是「本方上次发言」）。若把它算作锚点，
+            # 续接重说时增量会从被中止那一刻起算 → 对方在本方上次有效发言之后的发言全丢。
+            if m.get("speaker") == agent.name and not m.get("interrupted"):
                 my_idx = i
         if not (round_i > 0 or my_idx >= 0):
             return []
@@ -296,10 +301,17 @@ class Session:
     def _is_opening_turn(self, agent: AgentConfig, round_i: int) -> bool:
         """本轮是否为「没有交锋对象的立论轮」：本方本场尚未有效发言，或本轮无可回应的他人发言。
 
+        立论轮只属于**会话真正第一次开口**：续接（中止后「继续」）与同会话续开新议题都已有前文，
+        不算（前者由 `_resumed` 标记排除，后者因本方已有效发言而自然不成立）。
         只有对抗互动型风格（_TONE_ADVERSARIAL）需要区分；chat 模式恒为 False——风格是针对
         用户刚说的那句话生效的，不存在「没有对象」的问题。
         """
         if self.mode != "debate" or self.tone not in _TONE_ADVERSARIAL:
+            return False
+        # 续接（中止后「继续」）不算立论轮：本场已有前文交锋，只是被中止者重说这一轮。
+        # 不排除的话，「本场首个发言者被中止 → 继续」会因它那条已作废（spoke 为假）而被判成
+        # 立论轮，重说时又拿到「先陈述立场」而非该有的对抗风格。
+        if self._resumed:
             return False
         spoke = any(m.get("speaker") == agent.name and not m.get("interrupted")
                     for m in self.history)
@@ -755,6 +767,9 @@ class Session:
         # 中止标记只管「这一次在途发言」，不是整场的持久状态 → 每次 run 复位
         self._abort_requested = False
         self.last_abort_channel = ""
+        # 续接（resume=True）时被中止的 agent 是「接着已有交锋重说这一轮」，不是立论轮；
+        # 常规发起/续跑（新议题）同样不算——立论轮只属于本场第一次有效发言（见 _is_opening_turn）。
+        self._resumed = bool(resume)
         # 同一个 Session 实例可被多次 run 复用（点「继续」/「继续讨论」续跑）：
         # 上一场的 stop_event（「停止」留下的）与暂停态必须复位，否则新 run 一进循环就退出。
         self.stop_event.clear()
@@ -795,6 +810,7 @@ class Session:
         pending = store.get_pending_turn(self.project_path, self.session_id) if resume else None
         if resume and not pending:
             resume = False  # 待续接已被兑现/清除 → 退回常规行为，避免空跑
+            self._resumed = False  # 退回常规行为时「续接」语义同步撤销
         if resume:
             # 续接沿用语会已存的议题（不追加 human「任务」，否则会被当成新议题）
             self._initial_task = ""

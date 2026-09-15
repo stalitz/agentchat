@@ -565,6 +565,58 @@ class TestOrchestrator(unittest.TestCase):
             self.assertIn("立论优先", s._tone_block(opening=True), f"{t} 立论轮应改为先立论")
             self.assertIn("本场讨论风格", s._tone_block(opening=False), f"{t} 交锋轮应给风格")
 
+    def test_resume_is_not_opening_turn(self):
+        # 立论轮只属于「会话真正第一次开口」：中止后「继续」（resume）已有前文交锋，被中止者
+        # 只是重说这一轮 → 仍按对抗风格，不给「先陈述立场」。尤其本场首个发言者被中止时，它那条
+        # 已作废（spoke 为假），不靠 _resumed 排除就会被误判成立论轮。
+        a1 = models.AgentConfig(name="A", type="fake", role="你坚信世界是神创造的")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid)
+        s.tone = "唱反调"
+        s.history.append({"round": 0, "speaker": "human", "role": "任务", "content": "你们说说世界是不是有神"})
+
+        # 本场首个发言者、尚无有效发言：常规发起 → 立论
+        p = s._build_prompt(a1, "你们说说世界是不是有神", round_i=0)
+        self.assertIn("立论优先", p)
+        self.assertNotIn("本场讨论风格", p)
+
+        # 同一位 agent 被中止后「继续」：已有前文，按对抗风格（不给立论优先）
+        s._resumed = True
+        p = s._build_prompt(a1, "(你上一次的发言被用户中止了…)", round_i=0)
+        self.assertIn("本场讨论风格", p)
+        self.assertNotIn("立论优先", p)
+
+        # 下一次常规 run（新议题）→ 标记复位，且本方已有效发言 → 不再算立论轮
+        s._resumed = False
+        s.history.append({"round": 0, "speaker": "A", "role": "", "content": "甲的第一轮发言"})
+        s.history.append({"round": 0, "speaker": "B", "role": "", "content": "乙的第一轮发言"})
+        p = s._build_prompt(a1, "换个话题", round_i=2)
+        self.assertIn("本场讨论风格", p)
+        self.assertNotIn("立论优先", p)
+
+    def test_others_delta_uses_last_valid_turn(self):
+        # 被中止的那条已作废，不能当「本方上次发言」的锚点：否则续接重说时，对方在本方上次
+        # 有效发言之后的发言会整段丢失（对方发言增量从被中止那一刻起算 → 空）。
+        a1 = models.AgentConfig(name="A", type="fake")
+        a2 = models.AgentConfig(name="B", type="fake")
+        s, _ = make_session([a1, a2], self.proj, self.sid)
+        s.tone = "唱反调"
+        s.history = [
+            {"round": 0, "speaker": "human", "role": "任务", "content": "议题"},
+            {"round": 0, "speaker": "A", "role": "", "content": "甲的第一轮发言"},
+            {"round": 0, "speaker": "B", "role": "", "content": "乙的第一轮发言"},
+            {"round": 1, "speaker": "A", "role": "", "content": "甲被中止的半截", "interrupted": True},
+        ]
+        others = s._others_since_last(a1, round_i=1)
+        self.assertEqual([m["content"] for m in others], ["乙的第一轮发言"],
+                         "锚点应为本方上次**有效**发言，被中止那条不算")
+
+        s._resumed = True
+        p = s._build_prompt(a1, "(你上一次的发言被用户中止了…)", round_i=1)
+        self.assertIn("乙的第一轮发言", p, "续接重说时必须收到对方最新发言")
+        self.assertIn("本场讨论风格", p, "续接不算立论轮")
+        self.assertNotIn("甲被中止的半截", p, "作废的半截不进上下文（本方内容本就不回传）")
+
     def test_round0_terminate_is_ignored_before_floor(self):
         # 共识终止有最小轮数保护：至少两轮完整往返（2*N-1）后 TERMINATE 才生效。
         # 首轮（round 0）agent 吐 TERMINATE 不再直接终止，辩论应继续、第二个 agent 也会发言。
