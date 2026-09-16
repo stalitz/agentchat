@@ -50,6 +50,10 @@
   .node.selectable { cursor:pointer; }
   .node.selectable:hover { background:#eef2f8; }
   .node.selected { background:#eaf1ff; }
+  /* 左栏 Team 节点：被中栏过滤选中时与「Team」徽章的绿呼应，区别于项目选中蓝 */
+  .node.team.selected { background:#e3f5ea; }
+  /* composer 的 Team 锁定标记（会话已有对话 ⇒ 不可换 Team） */
+  .lock-tag { color:#8a5a00; background:#fff7e6; border:1px solid #ffe0a3; border-radius:6px; padding:1px 6px; }
   .chev { width:16px; text-align:center; color:var(--muted); cursor:pointer; user-select:none; flex:0 0 auto; font-size:11px; }
   .chev:hover { color:var(--txt); }
   .nm { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -323,6 +327,8 @@
       <div class="ctl">
         <span class="ctx-meta" id="composerProj">项目：—</span>
         <label>Team <select id="selTeam" onchange="updateRoundControl()"></select></label>
+        <span class="ctx-meta lock-tag" id="teamLockTag" style="display:none"
+              title="本会话已有对话，Team 不可更改；要换 Team 请点中栏「＋ 新」新建会话">Team 已锁定（已有对话）</span>
         <span class="ctx-meta" id="modeTag"></span>
         <button class="primary" id="btnStart" onclick="mainAction()" title="对话模式：发送；生成中：中止">开始讨论</button>
         <span id="ctrlBtns" class="debate-only" style="display:inline-flex; gap:8px;">
@@ -401,6 +407,9 @@ var curProjSessions = [];   // 当前项目的会话列表
 // 中栏会话列表的 team 过滤：'' = 全部；'__none__' = 未指定 team 的会话。
 // 只影响「渲染哪几条」，不动 curProjSessions 本身 ⇒ 被过滤掉的会话仍可被 openSession 命中。
 var teamFilter = '';
+// 当前会话的 Team 是否锁定（会话已有对话 ⇒ 不可换 Team，见 FR18）。
+// 前端据此把 composer 的 Team 下拉置灰；权威判定在后端 handle_start（防绕过）。
+var curTeamLocked = false;
 var curMsgCount = 0;        // 当前会话已有消息条数（决定主按钮文案）
 var runningBySid = {};   // sid -> bool：各会话是否正在跑（多会话并行，只禁用正在跑的会话）
 // sid -> {agent} | null：该会话是否有「被中止、等待重新发言」的发言（主按钮据此显示「继续」）。
@@ -855,7 +864,7 @@ function projNode(p) {
   return row;
 }
 function teamNode(tm) {
-  var row = el('div', 'node team selectable', '');
+  var row = el('div', 'node team selectable' + (teamFilter && tm.id === teamFilter ? ' selected' : ''), '');
   var chev = el('span', 'chev', expanded.teams[tm.id] ? '▾' : '▸');
   chev.onclick = function (e) { e.stopPropagation(); expanded.teams[tm.id] = !expanded.teams[tm.id]; renderTree(); };
   var bEl = badge('b-team', 'Team');
@@ -927,6 +936,7 @@ function selectProject(pid) {
   var p = projectById(pid);
   document.getElementById('composerProj').textContent = '项目：' + (p ? p.name : '—');
   fillTeamSelect(p);
+  curTeamLocked = false; applyTeamLock();   // 换了项目、还没打开会话 ⇒ 无锁定
   updateRoundControl();
   loadProjectSessions(pid);
   composeClear();
@@ -939,14 +949,39 @@ function fillTeamSelect(p) {
   curTid = teams[0].id;
 }
 function selectTeam(tid) {
-  document.getElementById('selTeam').value = tid; curTid = tid; updateRoundControl();
+  // 左侧点 Team 名 = 「看这个 Team 的会话」：中栏按该 Team 过滤（与中栏过滤下拉同一状态），
+  // 并在会话未锁 Team 时把它预选进 composer（保留原有「点 Team 名预选」语义）。
+  var has = curProjSessions.some(function (s) { return teamFilterKey(s) === tid; });
+  if (has) { teamFilter = tid; renderSessions(); }
+  var sel = document.getElementById('selTeam');
+  if (sel && !sel.disabled) { sel.value = tid; curTid = tid; updateRoundControl(); }
+  renderTree();   // 左栏高亮跟随过滤状态
+  if (!has) setStatus('当前项目下没有属于该 Team 的会话', false);
+  else if (sel && sel.disabled) setStatus('已筛选该 Team 的会话；当前会话的 Team 已锁定（已有对话）', true);
 }
 function selectAgent(aid) {
   var a = cfg.agents[aid]; if (!a) return;
   var tm = (cfg.teams || []).filter(function (t) { return (t.agent_ids || []).indexOf(aid) >= 0; })[0];
   if (!tm) { setStatus('该 agent 未加入任何 Team', false); return; }
-  document.getElementById('selTeam').value = tm.id; curTid = tm.id; updateRoundControl();
+  var sel = document.getElementById('selTeam');
+  if (sel && sel.disabled) {
+    setStatus('当前会话的 Team 已锁定（已有对话）；要单跑该 agent 请点中栏「＋ 新」新建会话', false);
+    return;
+  }
+  sel.value = tm.id; curTid = tm.id; updateRoundControl();
   setStatus('已选单 agent：' + a.name + '（Team：' + tm.name + '）', true);
+}
+
+// 已有对话的会话「Team 锁定」（FR18）：历史属于哪个 Team 就只能是哪个 Team ——
+// 半路改 Team 会把两个 Team 的 agent 混进同一条会话（还可能是单 agent 直跑 vs 多 agent 讨论错配）。
+function applyTeamLock() {
+  var sel = document.getElementById('selTeam');
+  var tag = document.getElementById('teamLockTag');
+  if (!sel) return;
+  sel.disabled = !!curTeamLocked;
+  sel.title = curTeamLocked ? '本会话已有对话，Team 不可更改；要换 Team 请点中栏「＋ 新」新建会话' : '';
+  if (tag) tag.style.display = curTeamLocked ? 'inline' : 'none';
+  updateRoundControl();
 }
 
 function teamAgentCount(tid) {
@@ -1095,17 +1130,23 @@ function refreshSessionList(pid) {
       renderSessions();
       var hit = curProjSessions.filter(function (x) { return x.id === curSid; })[0];
       if (hit) { curMsgCount = hit.message_count != null ? hit.message_count : curMsgCount; updateCtxHead(hit); }
+      // 该会话可能刚跑出第一轮（0 条 → 有内容）⇒ 重新评估 Team 锁定，别让下拉还开着
+      if (hit) { curTeamLocked = (hit.message_count || 0) > 0; applyTeamLock(); }
       refreshSendBtn();
     })
     .catch(function () {});
 }
 
 function loadProjectSessions(pid) {
-  if (!pid) { curProjSessions = []; renderSessions(); chat.innerHTML = ''; curMsgCount = 0; refreshSendBtn(); return Promise.resolve(); }
+  if (!pid) { curProjSessions = []; renderSessions(); chat.innerHTML = ''; curMsgCount = 0; curTeamLocked = false; applyTeamLock(); refreshSendBtn(); return Promise.resolve(); }
   return refreshSessionList(pid).then(function () {
     var first = filteredSessions()[0];
     if (first) openSession(first.id);
-    else { chat.innerHTML = ''; addRow('sys', '系统', '（该项目暂无会话，点中栏「＋ 新」创建）'); curMsgCount = 0; refreshSendBtn(); }
+    else {
+      chat.innerHTML = ''; addRow('sys', '系统', '（该项目暂无会话，点中栏「＋ 新」创建）');
+      curMsgCount = 0; curTeamLocked = false; applyTeamLock();   // 无会话打开 ⇒ 无锁定
+      refreshSendBtn();
+    }
   });
 }
 
@@ -1150,7 +1191,7 @@ function renderTeamFilter() {
     sel.dataset.keys = keys;
   }
   sel.value = teamFilter;
-  sel.onchange = function () { teamFilter = sel.value; renderSessions(); };
+  sel.onchange = function () { teamFilter = sel.value; renderSessions(); renderTree(); };   // 左栏高亮跟随
   wrap.style.display = 'flex';
   cnt.textContent = teamFilter
     ? filteredSessions().length + ' / ' + curProjSessions.length
@@ -1250,7 +1291,8 @@ function openSession(sid) {
   curSid = sid; curPid = s.project_id || curPid; curTid = s.team_id || '';
   renderSessions();
   var sel = document.getElementById('selTeam'); if (sel && curTid) sel.value = curTid;
-  updateRoundControl();
+  curTeamLocked = (s.message_count || 0) > 0;   // 先用列表计数粗判，fetch 回来后按真实发言精确判定
+  applyTeamLock();
   updateCtxHead(s);
   // 并行取「会话消息」与「工具调用日志」：工具日志用于把 end_discussion 的工具结果
   // 翻译成可读状态（被拒/提议/确认），避免气泡里只显示原始回执文本
@@ -1271,6 +1313,12 @@ function openSession(sid) {
     var msgs = d.messages || [];
     // 系统消息（终止原因 / 会话结束）不计入「已有 N 条」计数
     curMsgCount = msgs.filter(function (m) { return m.speaker !== 'system'; }).length;
+    // Team 锁定按「已有非 system 发言」精确判定（列表的 message_count 含 system 留痕，会偏严）；
+    // 只落过系统留痕（终止原因 / CLI 报错）的会话仍可换 Team 重试
+    curTeamLocked = msgs.some(function (m) {
+      return m.speaker !== 'system' && ((m.content || '').trim() || (m.blocks && m.blocks.length) || (m.tool_calls && m.tool_calls.length));
+    });
+    applyTeamLock();
     if (!msgs.length) {
       addRow('sys', '系统', d.exists === false ? '（会话不存在）'
         : (isChatMode() ? '（新会话：在下方输入消息，Enter 发送）' : '（该会话暂无记录，输入任务点「开始讨论」）'));

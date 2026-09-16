@@ -245,6 +245,54 @@ setTimeout(async () => {
   dom.window.curProjSessions = [demoSession];   // 还原，避免影响后续断言
   dom.window.renderSessions();
 
+  // ---- 已有对话的会话「Team 不可改」（FR18）+ 左栏点 Team 过滤中栏 ----
+  dom.window.curProjSessions = [
+    { id: 's_1', title: '双核甲', team_id: 'tm_dual', team_name: '双核Team', message_count: 2 },
+    { id: 's_2', title: '双核乙', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+    { id: 's_3', title: '假甲', team_id: 'tm_fake', team_name: '调试Team', message_count: 1 },
+    { id: 's_4', title: '无team', team_id: '', team_name: '', message_count: 1 },
+  ];
+  dom.window.teamFilter = ''; dom.window.renderSessions();
+  const selTeam = doc.getElementById('selTeam');
+  const lockTag = doc.getElementById('teamLockTag');
+  dom.window.openSession('s_1');     // fetch 桩对该会话返回 2 条记录
+  await tick();
+  check(selTeam.disabled === true, '已有对话的会话应把 composer 的 Team 下拉置灰（Team 不可改）');
+  check(lockTag.style.display !== 'none', '应显示「Team 已锁定（已有对话）」标记');
+  check(lockTag.textContent.indexOf('已锁定') >= 0, '锁定标记文案应说明已锁定');
+  check(selTeam.value === 'tm_dual', '锁定时下拉仍显示本会话的 Team（不因锁定而清空）');
+  // 点左栏 Team 名 ⇒ 中栏过滤该 Team 的会话（而不是只改 composer）
+  dom.window.selectTeam('tm_fake');
+  check(doc.getElementById('sessionList').querySelectorAll('.sess-card').length === 1,
+    '点左栏 Team 应把中栏过滤到该 Team 的会话，实际 ' + doc.getElementById('sessionList').querySelectorAll('.sess-card').length);
+  check(doc.querySelectorAll('.node.team.selected').length === 1
+    && doc.querySelector('.node.team.selected').textContent.indexOf('调试Team') >= 0,
+    '被过滤的 Team 节点应在左栏高亮');
+  check(selTeam.value === 'tm_dual', '会话已锁 Team 时，点左栏其他 Team 不应改写 composer 的选择');
+  check(doc.getElementById('status').textContent.indexOf('锁定') >= 0, '锁定状态下点其他 Team 应给出可读提示');
+  // 中栏过滤下拉反向联动左栏高亮
+  fSel.value = 'tm_dual'; fSel.dispatchEvent(new dom.window.Event('change'));
+  check(doc.querySelector('.node.team.selected') != null
+    && doc.querySelector('.node.team.selected').textContent.indexOf('双核Team') >= 0,
+    '中栏切过滤时左栏 Team 高亮应同步');
+  // 没有发言的新会话：Team 可自由选择（首轮写回），点左栏 Team 照旧预选
+  const realFetch = dom.window.fetch;
+  dom.window.fetch = function () {
+    return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(
+      { id: 's_new', title: '空会话', team_id: 'tm_dual', messages: [], agent_sessions: {}, exists: true, think: true }); } });
+  };
+  dom.window.openSession('s_new');
+  await tick();
+  check(selTeam.disabled === false, '还没有任何发言的会话应可自由选 Team（Team 只在首轮写回）');
+  check(lockTag.style.display === 'none', '未锁定的会话不应显示锁定标记');
+  dom.window.selectTeam('tm_fake');
+  check(selTeam.value === 'tm_fake', '未锁定会话点左栏 Team 仍应预选进 composer（保留原语义）');
+  dom.window.fetch = realFetch;
+  dom.window.curProjSessions = [demoSession]; dom.window.teamFilter = ''; dom.window.renderSessions();
+  // 还原 composer 的 Team：上面点过单 agent 的「调试Team」会把轮次置灰成 1，影响后续断言
+  dom.window.curSid = null; dom.window.curTeamLocked = false;
+  dom.window.selectTeam('tm_dual');
+
   // ---- 点 agent 行内编辑图标 -> 预填 + 删除按钮 ----
   const agentEdit = doc.querySelector('.node.agent .edit-btn');
   agentEdit.click();
