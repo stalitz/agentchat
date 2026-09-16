@@ -1444,6 +1444,10 @@ def _normalize_claude_blocks(seq: list) -> list:
         if not isinstance(b, dict):
             continue
         bt = b.get("type")
+        # 丢弃「空思考块」：claude transcript 里存在 thinking:"" 的回合（模型没吐推理），
+        # 原样收进时间线会让界面出现「💭 xx 的思考过程 0 字」的空折叠块（无信息量）。
+        if bt == "thinking" and not (b.get("thinking") or b.get("text") or "").strip():
+            continue
         if out and out[-1].get("type") == bt and bt in ("thinking", "text"):
             if bt == "thinking":
                 out[-1]["thinking"] = (out[-1].get("thinking") or "") + (b.get("thinking") or "")
@@ -1569,16 +1573,19 @@ def _parse_claude_transcript(path: str) -> list:
                 bt = b.get("type")
                 if bt == "thinking":
                     txt = b.get("thinking") or b.get("text", "")
-                    pending["think"].append(txt)
-                    # 按原生 type 进入时间线（thinking 块字段即原生 thinking）
-                    pending["seq"].append({"type": "thinking", "thinking": txt})
+                    # 空思考块（thinking:""）既不入 think 也不入时间线：界面不显示 0 字折叠块
+                    if txt.strip():
+                        pending["think"].append(txt)
+                        # 按原生 type 进入时间线（thinking 块字段即原生 thinking）
+                        pending["seq"].append({"type": "thinking", "thinking": txt})
                 elif bt == "text":
                     t2 = b.get("text", "")
                     if THINK_SENT in t2 or ANSW_SENT in t2:
                         for kind, txt in _classify_text(None, t2):
                             if kind == "thinking":
-                                pending["think"].append(txt)
-                                pending["seq"].append({"type": "thinking", "thinking": txt})
+                                if txt.strip():
+                                    pending["think"].append(txt)
+                                    pending["seq"].append({"type": "thinking", "thinking": txt})
                             else:
                                 pending["ans"].append(txt)
                                 pending["seq"].append({"type": "text", "text": txt})

@@ -1341,7 +1341,10 @@ function renderHistoryEntry(h) {
     var firstResult = true;
     blocks.forEach(function (b) {
       if (b.type === 'thinking') {
-        body.appendChild(makeThinkingBlock(h.speaker, b.thinking || b.text || '', type, false));
+        // 空思考块跳过：CLI 原文存在 thinking:"" 的回合（旧数据仍在盘上），不渲染「0 字」空折叠块
+        if ((b.thinking || b.text || '').trim()) {
+          body.appendChild(makeThinkingBlock(h.speaker, b.thinking || b.text || '', type, false));
+        }
       } else if (b.type === 'text') {
         var ans = document.createElement('div'); ans.className = 'turn-answer';
         ans.innerHTML = mdToHtml(cleanSep(b.text || ''));
@@ -1356,7 +1359,7 @@ function renderHistoryEntry(h) {
     });
     return;
   }
-  if (h.thinking) body.appendChild(makeThinkingBlock(h.speaker, h.thinking, type, false));
+  if ((h.thinking || '').trim()) body.appendChild(makeThinkingBlock(h.speaker, h.thinking, type, false));
   var hasEndTool = (h.tool_calls || []).some(function (tc) { return (tc.name || '').endsWith('end_discussion'); });
   var endStatusOld = hasEndTool ? toolStatusCnFor(h.speaker, h.round) : null;
   (h.tool_calls || []).forEach(function (tc) { body.appendChild(makeToolCallBlock(tc)); });

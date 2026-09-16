@@ -394,6 +394,25 @@ setTimeout(async () => {
     check(doc.getElementById('chat').textContent.indexOf('会话收敛') >= 0,
       '系统消息（终止原因）应渲染进聊天区（落库后 run_end 重载 / 刷新仍可见）');
 
+    // ---- 空思考块跳过（CLI 原生 thinking:"" 的回合不该显示「💭 … 0 字」空折叠块）----
+    dom.window.chat.innerHTML = '';
+    dom.window.renderHistoryEntry({ speaker: 'g1', round: 0, content: '带空思考块的一轮', thinking: '',
+      blocks: [{ type: 'thinking', thinking: '' }, { type: 'text', text: '带空思考块的一轮' }] });
+    check(doc.querySelectorAll('#chat .turn-block.thinking').length === 0,
+      'blocks 里的空思考块（thinking:""）不应渲染出折叠块');
+    check(doc.getElementById('chat').textContent.indexOf('0 字') < 0, '不应出现「0 字」的思考块标题');
+    check(doc.getElementById('chat').textContent.indexOf('带空思考块的一轮') >= 0, '正文仍应正常渲染');
+    // 非空思考块照旧渲染（避免修成「一律不显示思考」）
+    dom.window.chat.innerHTML = '';
+    dom.window.renderHistoryEntry({ speaker: 'g1', round: 0, content: '正常一轮', thinking: '真的思考了',
+      blocks: [{ type: 'thinking', thinking: '真的思考了' }, { type: 'text', text: '正常一轮' }] });
+    check(doc.querySelectorAll('#chat .turn-block.thinking').length === 1, '非空思考块仍应正常渲染');
+    // 回退路径（无 blocks，只有顶层 thinking 字段）同样跳过空白
+    dom.window.chat.innerHTML = '';
+    dom.window.renderHistoryEntry({ speaker: 'g1', round: 0, content: '仅空白思考', thinking: '   ' });
+    check(doc.querySelectorAll('#chat .turn-block.thinking').length === 0,
+      '无 blocks 的回退路径下，空白 thinking 也不应渲染折叠块');
+
     if (!ok) { console.error('前端渲染回归测试失败'); process.exit(1); }
     console.log('前端渲染回归测试通过 ✓');
     process.exit(0);
