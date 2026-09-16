@@ -322,5 +322,77 @@ class TestMcpToolCallNaming(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(executor._parse_codex_line(json.dumps(ev), None), want, itype)
 
 
+class TestCodexNativeToolItems(unittest.IsolatedAsyncioTestCase):
+    """codex **原生**工具（自带 shell / 打补丁）在 app-server 通路也必须被捕获。
+
+    2026-09-16 实测（codex-cli 0.146.1）：`codex exec --json` 放开沙箱后
+    `item.type="command_execution"`、`command="/bin/bash -lc 'echo codex-tool-test'"`、
+    `aggregated_output="codex-tool-test\\n"`、`exit_code=0`；app-server 通路同一工具用驼峰
+    `commandExecution`。原先两者都被整条忽略 ⇒ codex 调了自带工具也界面空白
+    （test5 实测：claude 调 Bash 有痕、codex 侧空白，即此因）。
+    """
+
+    async def _collect(self, notifications):
+        rt = _rt()
+
+        async def _noop_ensure(cwd):
+            return None
+
+        async def _noop_drain():
+            return None
+
+        rt._ensure_appserver = _noop_ensure
+        rt._as_drain_stale = _noop_drain
+        rt._appserver_thread_id = "th_1"
+        rt._as_queue = asyncio.Queue()
+        for o in notifications:
+            await rt._as_queue.put(o)
+        return [ev async for ev in rt._run_codex_appserver("hi", "/tmp", 5)]
+
+    def _cmd_item(self, itype):
+        return {"id": "item_1", "type": itype,
+                "command": "/bin/bash -lc 'echo codex-tool-test'",
+                "aggregated_output": "codex-tool-test\n", "exit_code": 0}
+
+    async def test_camelcase_command_emits_tool_use_once(self):
+        evs = await self._collect([
+            {"method": "item/started", "params": {"item": self._cmd_item("commandExecution")}},
+            {"method": "item/completed", "params": {"item": self._cmd_item("commandExecution")}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual(len(tools), 1, "started/completed 成对上报，只能显示一次")
+        self.assertEqual(tools[0][1]["name"], "exec_command")
+        self.assertEqual(tools[0][1]["input"]["command"], "/bin/bash -lc 'echo codex-tool-test'")
+        self.assertEqual(tools[0][1]["input"]["exit_code"], 0)
+
+    async def test_snakecase_command_emits_tool_use(self):
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": self._cmd_item("command_execution")}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0][1]["name"], "exec_command")
+
+    async def test_file_change_emits_tool_use(self):
+        evs = await self._collect([
+            {"method": "item/completed",
+             "params": {"item": {"type": "fileChange", "patch": "*** Begin Patch\n*** End Patch"}}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0][1]["name"], "apply_patch")
+
+    async def test_unknown_item_type_still_ignored(self):
+        """未识别的 item 类型不能被当成工具（否则界面会冒出一堆假调用）。"""
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": {"type": "web_search_call"}}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        self.assertEqual([e for e in evs if e[0] == "tool_use"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

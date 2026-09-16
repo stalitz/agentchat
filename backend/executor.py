@@ -459,6 +459,32 @@ class AgentRuntime:
             else:
                 yield kind, payload
 
+    def _codex_provider_overrides(self) -> list[str]:
+        """codex agent 接「指定模型服务」的 `-c` 覆盖（一律命令行注入，不动用户 ~/.codex/config.toml）。
+
+        codex 的默认 provider 来自用户全局配置（本机 config.toml 是 deepseek = 远程**付费**）。
+        agent 配了 `base_url` 即表示「本 agent 走我指定的模型服务」，据此选 provider：
+        - 指向本机 Ollama（11434）→ 用 codex **内置** provider `ollama`。codex-cli 0.146.1
+          只支持 wire_api="responses"，而 Ollama 0.33.3 已支持 /v1/responses，故可直连（免费）。
+        - 其它地址 → 注册自定义 provider `agentchat`，按 responses 协议接。内置 provider 名
+          不可覆盖（实测 `model_providers.ollama.name` 被拒：reserved），故必须换名。
+        未配 base_url → 不注入，沿用 codex 全局配置（既有行为不变）。
+        """
+        bu = (self.agent.base_url or "").strip()
+        if not bu:
+            return []
+        if "11434" in bu and ("localhost" in bu or "127.0.0.1" in bu):
+            return ["-c", 'model_provider="ollama"']
+        base = bu.rstrip("/")
+        if not base.endswith("/v1"):
+            base += "/v1"
+        return [
+            "-c", 'model_provider="agentchat"',
+            "-c", 'model_providers.agentchat.name="agentchat"',
+            "-c", f'model_providers.agentchat.base_url="{base}"',
+            "-c", 'model_providers.agentchat.wire_api="responses"',
+        ]
+
     def _codex_cmd(self, prompt: str) -> list[str]:
         # --skip-git-repo-check（2026-09-11）：codex 默认拒绝在「非 git 仓库、且不在
         # ~/.codex/config.toml 受信项目列表（[projects."..."] trust_level = "trusted"）」的
@@ -487,6 +513,7 @@ class AgentRuntime:
             cmd += ["-c", 'model_reasoning_effort="low"']
         if self.agent.model:
             cmd += ["-m", self.agent.model]
+        cmd += self._codex_provider_overrides()   # agent 配了 base_url → 指定 provider（见该方法）
         if self.agent.cli_args:
             cmd += self.agent.cli_args.split()
         if self.cli_session_id is not None:
@@ -606,6 +633,13 @@ class AgentRuntime:
                     if _is_mcp_tool_item(it) and "end_discussion" in str(it.get("tool") or ""):
                         yield ("tool_use", {"name": "end_discussion",
                                              "input": _codex_parse_args(it.get("arguments"))})
+                    else:
+                        # codex 原生工具（命令执行 / 文件改动）：原先一律忽略 ⇒ codex 调了自带
+                        # 工具也不落盘、界面空白（2026-09-16 修）。只认 completed，避免
+                        # started/completed 成对上报时重复产一次。
+                        _tu = _codex_native_tool_use(it)
+                        if _tu:
+                            yield ("tool_use", _tu)
                 elif m == "error":
                     params = o.get("params") or {}
                     yield ("error", str(params.get("message") or params.get("data") or params))
@@ -650,6 +684,7 @@ class AgentRuntime:
             # 注意：app-server 不接受 `-m` 参数（实测 "unexpected argument '-m'" 直接退出）；
             # 模型经 `-c` 配置覆盖设置，并在 thread/start 的 model 参数再确认（与已验证探针一致）。
             cmd += ["-c", f"model='{self.agent.model}'"]
+        cmd += self._codex_provider_overrides()   # agent 配了 base_url → 指定 provider（见该方法）
         if self.agent.cli_args:
             cmd += self.agent.cli_args.split()
         try:
@@ -1263,6 +1298,12 @@ def _parse_codex_line(text: str, runtime: "AgentRuntime | None"):
                 "input": {"reason": str(args.get("reason", "") or "")},
             })]
         return []   # 其余 mcp 事件既不产文本、也不重复产 tool_use
+    if ev.get("type") == "item.completed":
+        # codex 原生工具（shell / 打补丁）：此前整条忽略 ⇒ 调了也不显示。只认 completed，
+        # 因为 started/completed 成对上报，取 completed 既保证「必有」又不重复产事件。
+        tu = _codex_native_tool_use(item)
+        if tu:
+            return [("tool_use", tu)]
     t = _codex_text(ev)
     if t:
         return [("text", t)]
@@ -1653,6 +1694,45 @@ def _codex_parse_args(raw) -> dict:
     return {}
 
 
+# codex **原生**（非 MCP）工具条目 → 统一显示名。与 _MCP_TOOL_ITEM_TYPES 同源问题：同一份
+# codex，两条通路的命名不一样，故键一律按小写归一比较、只在此处列全，两条通路共用本表。
+# 2026-09-16 实测（codex-cli 0.146.1）：
+#   - `codex exec --json`：`item.type="command_execution"`，带 command / aggregated_output / exit_code；
+#   - rollout 文件：`response_item.payload.type="function_call"`、`name="exec_command"`、
+#     `arguments='{"cmd":"echo codex-tool-test"}'`，紧随一条 `function_call_output`；
+#   - app-server：审批通知走 `method="item/commandExecution/requestApproval"`（驼峰）。
+_CODEX_NATIVE_TOOLS = {
+    "command_execution": "exec_command",   # exec / rollout 命名
+    "commandexecution": "exec_command",    # app-server 命名（驼峰）
+    "file_change": "apply_patch",
+    "filechange": "apply_patch",           # app-server 命名（驼峰）
+}
+
+
+def _codex_native_tool_use(item) -> dict | None:
+    """codex 原生工具条目 → 与 claude 同构的 tool_use（{name, input}）；非工具条目返回 None。
+
+    这些条目此前被整条忽略 ⇒ codex 明明调了自带工具（shell / 打补丁），界面里却什么都不显示
+    （2026-09-16 test5 实测：claude 调 Bash 有痕、codex 侧一律空白）。此处只产出 name/input
+    两个字段，前端是通用渲染（不认工具名）⇒ 无需第二套 schema，前端零改动即可显示。
+    """
+    if not isinstance(item, dict):
+        return None
+    name = _CODEX_NATIVE_TOOLS.get(str(item.get("type") or "").lower())
+    if not name:
+        return None
+    if name == "exec_command":
+        cmd = item.get("command") or item.get("cmd")
+        if not cmd:
+            # rollout 的入参在 arguments（JSON 字符串）里，形如 {"cmd": "..."}
+            cmd = _codex_parse_args(item.get("arguments")).get("cmd")
+        inp: dict = {"command": cmd or ""}
+        if item.get("exit_code") is not None:
+            inp["exit_code"] = item.get("exit_code")
+        return {"name": name, "input": inp}
+    return {"name": name, "input": {"patch": item.get("patch") or item.get("changes") or ""}}
+
+
 def _parse_codex_transcript(path: str) -> list:
     """解析 codex rollout 为一个 agent 的回合序列（供对账覆盖本地历史）。
 
@@ -1715,11 +1795,16 @@ def _parse_codex_transcript(path: str) -> list:
             continue
         if pt == "function_call":
             name = pl.get("name") or ""
-            if "end_discussion" in name:
-                _open(ts)
-                tc = {"name": "end_discussion", "input": _codex_parse_args(pl.get("arguments"))}
-                pending["tc"].append(tc)
-                pending["seq"].append({"type": "tool_use", "name": tc["name"], "input": tc["input"]})
+            if not name:
+                continue
+            _open(ts)
+            # end_discussion（MCP 终止票）与 codex 原生工具（exec_command / apply_patch 等）
+            # 共用同一套 tool_use 结构。原生工具也必须在此认下来，否则重开历史会话时，
+            # 实时落盘的工具块会被 CLI 侧覆盖抹掉（store._merge_tool_blocks：CLI 侧一旦
+            # 有工具块就整体采信，不再并回本地）。
+            tc = {"name": name, "input": _codex_parse_args(pl.get("arguments"))}
+            pending["tc"].append(tc)
+            pending["seq"].append({"type": "tool_use", "name": tc["name"], "input": tc["input"]})
             continue
     flush()
     return turns

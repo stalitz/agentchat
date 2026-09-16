@@ -154,10 +154,78 @@ def test_parse_control_events_emit_no_text():
     assert _parse_codex_line(EV_THREAD_STARTED, rt2) == []
 
 
-def test_parse_command_execution_item_emits_nothing():
-    """command_execution 类型的 item 没有 text 字段，不应被当发言输出。"""
+def test_parse_command_execution_item_emits_tool_use_not_text():
+    """command_execution 是 codex 的**原生工具调用**：应映射成 tool_use，且绝不当发言文本。
+
+    2026-09-16 改：原先这里整条忽略（只断言"不产文本"），代价是 codex 调了自带 shell
+    也完全不落盘、界面一片空白（test5 实测：claude 调 Bash 有痕、codex 侧空白）。
+    样例 EV_ITEM_COMMAND 是真实 `codex exec --json` 抓下来的原文。
+    """
     rt = _runtime()
-    assert _parse_codex_line(EV_ITEM_COMMAND, rt) == []
+    evs = _parse_codex_line(EV_ITEM_COMMAND, rt)
+    assert len(evs) == 1, evs
+    kind, payload = evs[0]
+    assert kind == "tool_use", "原生工具必须映射为 tool_use（前端通用渲染才显示得出来）"
+    assert payload["name"] == "exec_command"
+    assert payload["input"]["command"] == "ls"
+
+
+def test_parse_command_execution_started_not_duplicated():
+    """item.started / item.completed 成对上报：只认 completed，避免同一次调用显示两遍。"""
+    rt = _runtime()
+    started = EV_ITEM_COMMAND.replace("item.completed", "item.started")
+    assert _parse_codex_line(started, rt) == []
+
+
+def test_native_tool_use_predicate_and_naming():
+    """驼峰/下划线两种命名都要认，非工具条目一律返回 None（见 _CODEX_NATIVE_TOOLS）。"""
+    from backend.executor import _codex_native_tool_use
+    # exec/rollout 命名（下划线）
+    assert _codex_native_tool_use({"type": "command_execution", "command": "ls"}) == {
+        "name": "exec_command", "input": {"command": "ls"}}
+    # app-server 命名（驼峰）——同一工具的另一条通路
+    assert _codex_native_tool_use({"type": "commandExecution", "command": "pwd"}) == {
+        "name": "exec_command", "input": {"command": "pwd"}}
+    # 带退出码时一并带出（排查失败调用用）
+    assert _codex_native_tool_use(
+        {"type": "command_execution", "command": "ls", "exit_code": 0})["input"]["exit_code"] == 0
+    # 文件改动类
+    assert _codex_native_tool_use({"type": "file_change", "patch": "*** Begin Patch"})["name"] == "apply_patch"
+    assert _codex_native_tool_use({"type": "fileChange", "changes": "x"})["name"] == "apply_patch"
+    # 非工具条目
+    for it in ({"type": "reasoning"}, {"type": "agent_message", "text": "hi"}, None, "x", {}):
+        assert _codex_native_tool_use(it) is None, it
+
+
+def test_codex_cmd_injects_ollama_provider_for_local_base_url():
+    """codex agent 配了本机 Ollama 地址 → 必须注入内置 provider ollama。
+
+    codex 的默认 provider 来自用户全局 config.toml（本机是 deepseek = 远程付费）；不注入的话
+    这个 agent 每轮都花真钱。注入一律走命令行 `-c`，**不动用户的 ~/.codex/config.toml**。
+    """
+    rt = _runtime()
+    rt.agent.base_url = "http://localhost:11434"
+    cmd = rt._codex_cmd("hi")
+    assert 'model_provider="ollama"' in cmd, cmd
+    assert not [t for t in cmd if t.startswith("model_providers.ollama")], (
+        "内置 provider 名不可覆盖（实测 reserved），只应设 model_provider")
+
+
+def test_codex_cmd_custom_provider_for_other_base_url():
+    """非本机 Ollama 的地址 → 注册自定义 provider（内置名不可覆盖），按 responses 协议接。"""
+    rt = _runtime()
+    rt.agent.base_url = "http://192.168.1.9:8000"
+    cmd = rt._codex_cmd("hi")
+    assert 'model_provider="agentchat"' in cmd
+    assert 'model_providers.agentchat.base_url="http://192.168.1.9:8000/v1"' in cmd
+    assert 'model_providers.agentchat.wire_api="responses"' in cmd
+
+
+def test_codex_cmd_no_base_url_keeps_global_default():
+    """未配 base_url → 不注入任何 provider，沿用 codex 全局配置（既有行为不变）。"""
+    rt = _runtime()
+    cmd = rt._codex_cmd("hi")
+    assert not [t for t in cmd if "model_provider" in t], cmd
 
 
 def test_parse_non_json_line_falls_back_to_text():
@@ -324,6 +392,44 @@ def test_codex_transcript_thinking_block_precedes_text():
     turns = _parse_codex_transcript(_rollout(ROLLOUT_LINES))
     types = [b["type"] for b in turns[0]["blocks"]]
     assert types == ["thinking", "text"], types
+
+
+# 原生工具（非 end_discussion）的 function_call —— 2026-09-16 从真实 rollout 抓的原文形态：
+# codex 调自带 shell 时 name=exec_command、arguments 是 JSON 字符串，紧随一条 function_call_output。
+ROLLOUT_NATIVE_TOOL = [
+    {"type": "session_meta", "payload": {"session_id": "tid-2", "cli_version": "0.146.1"}},
+    _ri({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "跑个命令"}]}),
+    _ri({"type": "function_call", "id": "fc_1", "name": "exec_command",
+         "arguments": '{"cmd":"echo codex-tool-test"}', "call_id": "call_1"}),
+    _ri({"type": "function_call_output", "call_id": "call_1",
+         "output": "Chunk ID: 47e47e\nWall time: 0.0000 seconds\nProcess exited with code 0\n"
+                   "Output:\ncodex-tool-test\n"}),
+    _ri({"type": "message", "role": "assistant",
+         "content": [{"type": "output_text", "text": "输出是 codex-tool-test"}]}),
+]
+
+
+def test_codex_transcript_keeps_native_tool_use():
+    """rollout 里的原生工具（exec_command）也必须对账成 tool_use。
+
+    否则重开历史会话时，实时落盘的工具块会被 CLI 侧整体覆盖抹掉
+    （store._merge_tool_blocks：CLI 侧一旦有工具块就整体采信）——表现就是「刚看过的工具调用，
+    重开一次就没了」。
+    """
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_NATIVE_TOOL))
+    assert len(turns) == 1, turns
+    t = turns[0]
+    assert t["content"] == "输出是 codex-tool-test"
+    assert t["tool_calls"] == [{"name": "exec_command", "input": {"cmd": "echo codex-tool-test"}}]
+    blocks = [b for b in t["blocks"] if b["type"] == "tool_use"]
+    assert blocks and blocks[0]["name"] == "exec_command"
+
+
+def test_codex_transcript_ignores_tool_output_as_text():
+    """function_call_output 是工具回执，绝不能被当成 assistant 正文混进气泡。"""
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_NATIVE_TOOL))
+    for t in turns:
+        assert "Chunk ID" not in t["content"], t["content"][:80]
 
 
 def test_codex_transcript_extracts_tool_use_from_function_call():

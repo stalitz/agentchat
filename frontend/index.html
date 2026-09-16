@@ -1506,6 +1506,8 @@ var editingId = null, editingKind = null;
 function modelSrcOf(a) {
   if (!a || !a.base_url) return 'default';
   var b = a.base_url;
+  // codex 直连本机 Ollama（走它自己的 /v1/responses），与 claude 走本 app 网关是两条路
+  if (b.indexOf('11434') >= 0) return 'ollama';
   if (b.indexOf('127.0.0.1:8777') >= 0 || b.indexOf('localhost:8777') >= 0) return 'gemma';
   return 'custom';
 }
@@ -1553,9 +1555,28 @@ function openAgentForm(a) {
       '选「自定义网关」可改指向 litellm 等其它翻译网关。<br>这些值会作为 Claude Code 子进程的环境变量（<code>ANTHROPIC_BASE_URL</code> 等）注入，' +
       '<b>不动 Claude Code 配置、不串默认后端</b>。</div>' +
       '</div>';
-  } else if (a && a.type === 'codex') {
-    html += f('model', '模型(可选)', a ? (a.model || '') : '') +
-      '<div class="hint">codex 类型填模型 tag（如 deepseek-v4-flash），留空走 Codex 全局默认。</div>';
+  } else if (curType === 'codex') {
+    // codex 也有「模型来源」：不配 base_url 就沿用 codex 全局配置（本机是 deepseek = 付费），
+    // 故这里显式给出「本地 Ollama」选项，避免 agent 不知不觉烧远程 token。
+    var srcC = modelSrcOf(a);
+    var showDefC = (srcC === 'default');
+    html += sel('modelSrc', '模型来源', [
+      ['default', '默认（' + effectiveModelName({ type: 'codex' }) + '）'],
+      ['ollama', '本地 Ollama · gemma（免费）'],
+      ['custom', '自定义网关（需 responses 协议）'],
+    ], srcC);
+    html += '<div id="defBox" class="model-box" style="display:' + (showDefC ? 'block' : 'none') + '">' +
+      '当前生效模型：<b>' + effectiveModelName({ type: 'codex' }) + '</b>' +
+      '<div class="hint">codex 的「默认」= 它自己的全局配置（<code>~/.codex/config.toml</code> 的 <code>model</code> / <code>model_provider</code>）。' +
+      '那里若指向远程付费模型（本机当前是 <code>deepseek-v4-flash</code>），本 agent 每轮都会真花钱——<b>要免费请选「本地 Ollama · gemma」</b>。</div></div>';
+    html += '<div id="locBox" style="display:' + (showDefC ? 'none' : 'block') + '">' +
+      f('base_url', '模型服务地址', a ? (a.base_url || '') : '') +
+      f('model', '模型', a ? (a.model || '') : '') +
+      f('api_key', '服务 Key(可选)', a ? (a.api_key || '') : '') +
+      '<div class="hint">codex 与 claude 不同：<b>不能</b>走本 app 的内置网关（那个只翻译 Anthropic 协议），' +
+      '而是直连模型服务自身的 <code>/v1/responses</code>。选「本地 Ollama · gemma」会自动填好 <code>http://localhost:11434</code> + <code>gemma4:26b</code>；' +
+      '后端据此给 codex 注入 <code>-c model_provider="ollama"</code>，' +
+      '<b>不动你的 ~/.codex/config.toml</b>。</div></div>';
   }
   // agent 级「思考」开关（三级：会话 > agent > 全局）。三态：继承 / 开 / 关。
   html += sel('think', '思考（本 agent）', [
@@ -1573,14 +1594,19 @@ function openAgentForm(a) {
     // 注意比较基准必须是本表单渲染时的 curType，不能是原始实体 a.type——
     // 否则新建时（a 为空、基准恒为 claude-code）选 codex/fake 会被判成"没变"而弹回 claude-code。
     if (t !== curType) { openAgentForm(agentDraft(a, t)); return; }
-    if (t !== 'claude-code') return;
     var s = v('modelSrc');
+    if (!s) return;                       // fake 类型没有「模型来源」选择器
     var loc = document.getElementById('locBox'), def = document.getElementById('defBox');
     if (loc) loc.style.display = (s === 'default') ? 'none' : 'block';
     if (def) def.style.display = (s === 'default') ? 'block' : 'none';
-    if (s === 'gemma') {
-      var bu = document.getElementById('base_url'), md = document.getElementById('model');
+    var bu = document.getElementById('base_url'), md = document.getElementById('model');
+    if (t === 'claude-code' && s === 'gemma') {
+      // claude 走本 app 内置网关（把 Anthropic 协议翻译成 Ollama）
       if (bu && !bu.value) bu.value = 'http://127.0.0.1:8777';
+      if (md && !md.value) md.value = 'gemma4:26b';
+    } else if (t === 'codex' && s === 'ollama') {
+      // codex 直连 Ollama 自身的 responses 端点（不经本 app 网关）
+      if (bu && !bu.value) bu.value = 'http://localhost:11434';
       if (md && !md.value) md.value = 'gemma4:26b';
     }
   };
@@ -1887,7 +1913,10 @@ function fsChoose(p) { var inp = document.getElementById('path'); if (inp) inp.v
 function submitAgent() {
   var type = v('type');
   var body = { name: v('name'), type: type, role: v('role') };
-  if (type === 'claude-code') {
+  if (type === 'claude-code' || type === 'codex') {
+    // 两者都有「模型来源」：默认 → 清空三者（走各自全局配置）；否则提交 base_url/model/key。
+    // codex 的 base_url 语义不同（直连模型服务的 /v1/responses，而非本 app 网关），
+    // 由后端 AgentRuntime._codex_provider_overrides 转成 `-c model_provider=…` 注入。
     if (v('modelSrc') === 'default') {
       body.model = null; body.base_url = null; body.api_key = null;
     } else {
