@@ -299,7 +299,16 @@ async def list_sessions(pid: str):
     proj = store.get_project(pid)
     if not proj:
         return {"sessions": []}
-    return {"sessions": store.list_sessions(proj["path"])}
+    # 每条附带 team_name（与全局 /api/sessions 同口径）：前端中栏会话卡片的 team 徽章
+    # 读 s.team_name，缺了这个字段徽章永不显示（会话「属于哪个 team」看不出来）。
+    out = []
+    for s in store.list_sessions(proj["path"]):
+        item = dict(s)
+        tid = s.get("team_id", "")
+        tm = store.get_team(tid) if tid else None
+        item["team_name"] = (tm or {}).get("name", "")
+        out.append(item)
+    return {"sessions": out}
 
 
 @app.post("/api/sessions/{pid}")
@@ -320,7 +329,8 @@ async def get_session(pid: str, sid: str):
         return {"messages": [], "agent_sessions": {}}
     s = store.read_session(proj["path"], sid)
     if not s:
-        return {"messages": [], "agent_sessions": {}, "title": "", "exists": False}
+        return {"messages": [], "agent_sessions": {}, "title": "", "team_id": "",
+                "team_name": "", "exists": False}
     # 打开会话时：若 agent CLI 会话 transcript 可达，用 agent 历史覆盖本地（冲突以 agent 为准）；
     # 找不到 transcript（agent 不可连 / 全新会话）则保持本地不动，作为离线回退。
     _reconcile_with_cli(proj["path"], sid, s.get("agent_sessions", {}))
@@ -335,6 +345,7 @@ async def get_session(pid: str, sid: str):
     return {
         "id": s["id"], "title": s.get("title", "会话"),
         "team_id": s.get("team_id", ""),
+        "team_name": (store.get_team(s.get("team_id") or "") or {}).get("name", ""),
         "messages": s.get("messages", []),
         "agent_sessions": s.get("agent_sessions", {}),
         "think": think,

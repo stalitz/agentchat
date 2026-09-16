@@ -102,6 +102,27 @@ class TestAPI(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/session/{self.pr_id}/{sid}").status_code, 200)
         self.assertEqual(self.client.get(f"/api/sessions/{self.pr_id}").json()["sessions"], [])
 
+    def test_project_sessions_expose_team_name(self):
+        """项目会话列表必须与全局同口径带 team_name（中栏卡片的 team 徽章数据来源）。"""
+        # 未挂 team：字段存在且为空串（前端 if (s.team_name) 自然不画徽章）
+        c = self.client.post(f"/api/sessions/{self.pr_id}", json={"title": "无 team"})
+        sid0 = c.json()["session"]["id"]
+        # 挂了 team：team_name 为真实名称
+        c = self.client.post(f"/api/sessions/{self.pr_id}",
+                             json={"title": "有 team", "team_id": self.tm_id})
+        sid1 = c.json()["session"]["id"]
+        # 无论断言是否通过都清理，避免污染共享项目目录里的其他用例
+        for sid in (sid0, sid1):
+            self.addCleanup(self.client.delete, f"/api/session/{self.pr_id}/{sid}")
+        by_id = {s["id"]: s for s in self.client.get(f"/api/sessions/{self.pr_id}").json()["sessions"]}
+        self.assertIn("team_name", by_id[sid0])
+        self.assertEqual(by_id[sid0]["team_name"], "")
+        self.assertEqual(by_id[sid1]["team_id"], self.tm_id)
+        self.assertEqual(by_id[sid1]["team_name"], self.tm_name)
+        # 会话详情接口同口径返回 team_name（会话头 ctxMeta 也读它）
+        d = self.client.get(f"/api/session/{self.pr_id}/{sid1}").json()
+        self.assertEqual(d["team_name"], self.tm_name)
+
     def test_rename_session(self):
         c = self.client.post(f"/api/sessions/{self.pr_id}", json={"title": "旧标题"})
         sid = c.json()["session"]["id"]
