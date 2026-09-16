@@ -132,6 +132,23 @@ async def del_project(pid: str):
 
 
 # ---------------- 会话控制（走 WS） ----------------
+def _resolve_start_team(project_path: str, sid, requested_team_id: str):
+    """本次发起实际使用的 Team：返回 (team_id, 是否因「续轮锁定」而改写)。
+
+    首轮（会话还不存在 / 还没有任何发言）⇒ 采信前端选择（composer 下拉或「新建会话」弹窗）；
+    续轮（会话已有对话）⇒ 一律沿用会话存储的 team_id，忽略前端传入值。存储里没有 team_id 的
+    老会话（导入数据）仍按前端选择走，避免「锁了但无从发起」。
+    """
+    if not sid:
+        return requested_team_id, False
+    if not store.is_session_team_locked(project_path, sid):
+        return requested_team_id, False
+    stored = (store.read_session(project_path, sid) or {}).get("team_id") or ""
+    if stored and stored != requested_team_id:
+        return stored, True
+    return stored or requested_team_id, False
+
+
 async def handle_start(msg: dict):
     sid = msg.get("session_id")
     # 只锁本会话：同一会话正在运行时拒绝重复发起；其他会话不受影响（可并行）
@@ -139,8 +156,14 @@ async def handle_start(msg: dict):
         await broadcast({"type": "error", "text": "该会话正在运行，请等待本轮结束或点「停止」后再发。"})
         return
     proj = store.get_project(msg["project_id"])
-    team = store.get_team(msg["team_id"])
-    if not proj or not team:
+    if not proj:
+        await broadcast({"type": "error", "text": "项目或 Team 不存在"})
+        return
+    # 已有对话的会话锁 Team（FR18）：只有「还没有任何发言」的会话才把 composer 选的 Team 写回；
+    # 其余以会话存储的 team_id 为准。前端会把 Team 下拉置灰，这里是权威一层（防绕过 / 防竞态）。
+    team_id, team_locked = _resolve_start_team(proj["path"], sid, msg.get("team_id") or "")
+    team = store.get_team(team_id)
+    if not team:
         await broadcast({"type": "error", "text": "项目或 Team 不存在"})
         return
     agents = []
@@ -172,10 +195,15 @@ async def handle_start(msg: dict):
         sid = store.create_session(proj["path"], title, msg.get("team_id"))["id"]
     if tone:
         store.set_session_tone(proj["path"], sid, tone)
-    # 持久化发起/续跑实际选用的 Team：首轮若用户在 composer 切了 Team（或「新建会话」弹窗选了
-    # 非默认 Team）必须落库，否则 stored team_id 停留在创建默认 teams[0]，重开会话会被静默降级成
-    # 2 agent（实测五子棋会话：首跑 3g 但 stored=2g，续跑无裁判）。每次发起都按当前选择写回。
-    store.update_session_team(proj["path"], sid, msg.get("team_id"))
+    # 持久化发起实际选用的 Team：首轮若用户在 composer 切了 Team（或「新建会话」弹窗选了非默认
+    # Team）必须落库，否则 stored team_id 停留在创建默认 teams[0]，重开会话会被静默降级成 2 agent
+    # （实测五子棋会话：首跑 3g 但 stored=2g，续跑无裁判）。**续轮锁定**（会话已有对话）时不写回：
+    # 那正是「历史属于原 Team、stored 被改写」的串台来源（见 FR18）。
+    if team_locked:
+        await broadcast({"type": "system", "msg": "本会话已有对话，Team 已锁定：本次仍按会话的 Team「"
+                         + team.get("name", team_id) + "」发起。要换 Team 请在中栏点「＋ 新」新建会话。"})
+    else:
+        store.update_session_team(proj["path"], sid, team_id)
     sess = Session(proj["path"], sid, agents, max_rounds, broadcast, timeout=timeout, tone=tone,
                    project_id=proj["id"])
     sessions[sid] = sess  # 注册；结束后保留（running=False，可继续/复用）

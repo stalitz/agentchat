@@ -296,6 +296,26 @@ def read_session(project_path: str, sid: str) -> Optional[dict]:
     return None
 
 
+def is_session_team_locked(project_path: str, sid: str) -> bool:
+    """会话的 Team 是否已锁定（FR18）：会话里已有「非 system」的发言（含 human 提问）⇒ 锁定。
+
+    锁定后 handle_start 不再按前端传入的 team_id 改写会话，一律沿用存储的 team_id —— 否则
+    「打开有内容的会话 → 换下拉 → 继续讨论」会把原 Team 的历史与另一个 Team 的 agent 混进
+    同一条会话（单 agent 直跑 vs 多 agent 讨论一旦错配，后续每一轮都是错的）。只有「还没有
+    任何发言」的新会话才允许把 composer 选的 Team 写回（首轮可写回，续轮锁定）。
+    system 消息（终止原因 / CLI 报错留痕 / agent 持久会话提示）不算发言。
+    """
+    s = read_session(project_path, sid)
+    if not s:
+        return False
+    for m in (s.get("messages") or []):
+        if m.get("speaker") == "system":
+            continue
+        if (m.get("content") or "").strip() or m.get("blocks") or m.get("tool_calls"):
+            return True
+    return False
+
+
 def create_session(project_path: str, title: str = "新会话", team_id: str | None = None) -> dict:
     sessions = _load_sessions(project_path)
     sid = _new_id("s")
