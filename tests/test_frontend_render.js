@@ -207,6 +207,44 @@ setTimeout(async () => {
   check(chat0.textContent.indexOf('先定义接口') >= 0, '会话记录应包含首轮 agent 发言内容');
   check(doc.getElementById('btnStart').textContent.indexOf('继续讨论') >= 0, '多 agent 且已有记录时按钮应为「继续讨论（已有 N 条）」');
 
+  // ---- 中栏按 team 过滤会话 ----
+  // 造 3 组（tm_dual×2 / tm_fake×1 / 无 team×1）⇒ 出现过滤条；选中某组只渲染该组卡片
+  dom.window.curProjSessions = [
+    { id: 's_1', title: '双核甲', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+    { id: 's_2', title: '双核乙', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+    { id: 's_3', title: '假甲', team_id: 'tm_fake', team_name: '调试Team', message_count: 1 },
+    { id: 's_4', title: '无team', team_id: '', team_name: '', message_count: 1 },
+  ];
+  dom.window.teamFilter = '';
+  dom.window.renderSessions();
+  const fWrap = doc.getElementById('sessFilter'), fSel = doc.getElementById('selTeamFilter');
+  const cards = () => doc.getElementById('sessionList').querySelectorAll('.sess-card');
+  const pick = (v) => { fSel.value = v; fSel.dispatchEvent(new dom.window.Event('change')); };
+  check(cs(fWrap).display !== 'none', '多个 team 的项目应显示中栏 team 过滤条');
+  check(fSel.querySelectorAll('option').length === 4, '过滤下拉应为「全部 + 3 组」（含未指定 team），实际 ' + fSel.querySelectorAll('option').length);
+  check(cards().length === 4, '默认「全部 team」应渲染全部会话，实际 ' + cards().length);
+  check(doc.getElementById('sessCount').textContent.indexOf('4') >= 0, '未过滤时计数应显示会话总数');
+  pick('tm_dual');
+  check(cards().length === 2, '选中 tm_dual 应只渲染该 team 的 2 条会话，实际 ' + cards().length);
+  check(doc.getElementById('sessCount').textContent.indexOf('2 / 4') >= 0,
+    '过滤时计数应显示「命中 / 总数」，实际 ' + doc.getElementById('sessCount').textContent);
+  check(fSel.value === 'tm_dual', '过滤后下拉应保持选中值');
+  check(dom.window.curProjSessions.length === 4, '过滤只影响渲染，不应改动 curProjSessions（被筛掉的会话仍可被打开/续接）');
+  pick('__none__');
+  check(cards().length === 1 && cards()[0].textContent.indexOf('无team') >= 0, '未指定 team 的历史会话应能单独筛出');
+  pick('');
+  check(cards().length === 4, '切回「全部 team」应恢复全部会话');
+  // 选中的 team 已无会话（会话被删 / 换项目）→ 回落「全部」，不留空白列表
+  dom.window.teamFilter = 'tm_gone'; dom.window.renderSessions();
+  check(dom.window.teamFilter === '' && cards().length === 4, '选中的 team 不存在时应回落「全部 team」');
+  // 只有一个 team → 过滤是空操作，整条隐藏（不占中栏高度）
+  dom.window.curProjSessions = [{ id: 's_1', title: '独苗', team_id: 'tm_dual', team_name: '双核Team' }];
+  dom.window.renderSessions();
+  check(cs(fWrap).display === 'none', '只有一个 team 时应隐藏过滤条（无可过滤维度）');
+  check(cards().length === 1, '隐藏过滤条时仍应正常渲染全部会话');
+  dom.window.curProjSessions = [demoSession];   // 还原，避免影响后续断言
+  dom.window.renderSessions();
+
   // ---- 点 agent 行内编辑图标 -> 预填 + 删除按钮 ----
   const agentEdit = doc.querySelector('.node.agent .edit-btn');
   agentEdit.click();

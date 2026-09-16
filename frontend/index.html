@@ -82,6 +82,10 @@
   .sessions-head span { font-weight:600; font-size:14px; }
   .sessions-head .right { display:flex; gap:6px; align-items:center; }
   #sessionList { flex:1; overflow:auto; padding:8px; }
+  /* 中栏 team 过滤条：只有一个 team 时整条隐藏（无可过滤维度，不占高度） */
+  .sess-filter { display:none; align-items:center; gap:8px; padding:8px 14px; border-bottom:1px solid var(--line); background:var(--panel); }
+  .sess-filter select { flex:1; min-width:0; font-size:12px; padding:3px 6px; border:1px solid var(--line); border-radius:6px; background:#fff; color:inherit; }
+  .sess-count { font-size:11px; color:var(--muted); white-space:nowrap; }
   .sess-card { position:relative; padding:8px 10px; border-radius:8px; margin-bottom:6px; border:1px solid var(--line); cursor:pointer; background:#fff; }
   .sess-card:hover { background:#eef2f8; }
   .sess-card.active { border-color:var(--claude); background:#eaf1ff; }
@@ -286,6 +290,10 @@
         <button class="ghost" id="btnNew" onclick="openNewSession()">＋ 新</button>
       </div>
     </div>
+    <div class="sess-filter" id="sessFilter">
+      <select id="selTeamFilter" title="按 team 过滤会话"></select>
+      <span class="sess-count" id="sessCount"></span>
+    </div>
     <div id="sessionList"></div>
   </section>
 
@@ -390,6 +398,9 @@ var curPid = null;          // 当前选中的项目 id
 var curToolLog = [];        // 当前会话的 end_discussion 工具日志（用于气泡内状态标注）
 var curTid = null;          // 当前会话所用 Team id（composer 下拉 / 单 agent 判定）
 var curProjSessions = [];   // 当前项目的会话列表
+// 中栏会话列表的 team 过滤：'' = 全部；'__none__' = 未指定 team 的会话。
+// 只影响「渲染哪几条」，不动 curProjSessions 本身 ⇒ 被过滤掉的会话仍可被 openSession 命中。
+var teamFilter = '';
 var curMsgCount = 0;        // 当前会话已有消息条数（决定主按钮文案）
 var runningBySid = {};   // sid -> bool：各会话是否正在跑（多会话并行，只禁用正在跑的会话）
 // sid -> {agent} | null：该会话是否有「被中止、等待重新发言」的发言（主按钮据此显示「继续」）。
@@ -911,6 +922,7 @@ function teamById(id) { return (cfg.teams || []).filter(function (x) { return x.
 // 选中项目：高亮 + composer 显示项目名 + 填充 Team 下拉 + 中栏加载会话
 function selectProject(pid) {
   curPid = pid; curSid = null; curTid = null;
+  teamFilter = '';   // 换项目时中栏过滤回到「全部」（各项目的 team 集合不同，沿用旧值只会筛出空列表）
   renderTree(); renderRail();
   var p = projectById(pid);
   document.getElementById('composerProj').textContent = '项目：' + (p ? p.name : '—');
@@ -1091,19 +1103,74 @@ function refreshSessionList(pid) {
 function loadProjectSessions(pid) {
   if (!pid) { curProjSessions = []; renderSessions(); chat.innerHTML = ''; curMsgCount = 0; refreshSendBtn(); return Promise.resolve(); }
   return refreshSessionList(pid).then(function () {
-    if (curProjSessions.length) openSession(curProjSessions[0].id);
+    var first = filteredSessions()[0];
+    if (first) openSession(first.id);
     else { chat.innerHTML = ''; addRow('sys', '系统', '（该项目暂无会话，点中栏「＋ 新」创建）'); curMsgCount = 0; refreshSendBtn(); }
   });
+}
+
+// ---- 中栏 team 过滤 ----
+// 过滤键：team_id 原值；没有 team 的老会话（导入/手工造）归到 '__none__'，也算一组
+function teamFilterKey(s) { return (s.team_id || '') || '__none__'; }
+
+function filteredSessions() {
+  if (!teamFilter) return curProjSessions;
+  return curProjSessions.filter(function (s) { return teamFilterKey(s) === teamFilter; });
+}
+
+// 按 team 汇总当前项目的会话（保留列表原有顺序），渲染过滤下拉 + 计数。
+// 只有一组时整条隐藏：过滤是个空操作，不占中栏高度。
+function renderTeamFilter() {
+  var wrap = document.getElementById('sessFilter');
+  var sel = document.getElementById('selTeamFilter');
+  var cnt = document.getElementById('sessCount');
+  if (!wrap || !sel) return;
+  var groups = [], seen = {};
+  curProjSessions.forEach(function (s) {
+    var k = teamFilterKey(s);
+    if (!(k in seen)) {
+      seen[k] = groups.length;
+      groups.push({ key: k, name: s.team_name || (s.team_id ? s.team_id : '未指定 team'), n: 0 });
+    }
+    groups[seen[k]].n++;
+  });
+  if (groups.length <= 1) { teamFilter = ''; wrap.style.display = 'none'; return; }
+  if (!(teamFilter in seen)) teamFilter = '';   // 选中的 team 已无会话 → 回落「全部」
+  var keys = groups.map(function (g) { return g.key; }).join('|');
+  if (sel.dataset.keys !== keys) {              // options 变了才重建，日常刷新不拆 DOM
+    sel.innerHTML = '';
+    var oAll = document.createElement('option');
+    oAll.value = ''; oAll.textContent = '全部 team';
+    sel.appendChild(oAll);
+    groups.forEach(function (g) {
+      var o = document.createElement('option');
+      o.value = g.key; o.textContent = g.name + '（' + g.n + '）';
+      sel.appendChild(o);
+    });
+    sel.dataset.keys = keys;
+  }
+  sel.value = teamFilter;
+  sel.onchange = function () { teamFilter = sel.value; renderSessions(); };
+  wrap.style.display = 'flex';
+  cnt.textContent = teamFilter
+    ? filteredSessions().length + ' / ' + curProjSessions.length
+    : curProjSessions.length + ' 个会话';
 }
 
 function renderSessions() {
   var box = document.getElementById('sessionList');
   box.innerHTML = '';
+  renderTeamFilter();
   if (!curProjSessions.length) {
     box.innerHTML = '<div class="sess-empty">该项目暂无会话。<br>点中栏「＋ 新」开始，或在右侧输入任务后点「开始会话」自动建会话。</div>';
     return;
   }
-  curProjSessions.forEach(function (s) {
+  var list = filteredSessions();
+  if (!list.length) {
+    box.innerHTML = '<div class="sess-empty">该 team 下暂无会话（本项目共 ' + curProjSessions.length + ' 个）。<br>在过滤条切回「全部 team」即可看到全部会话。</div>';
+    return;
+  }
+  list.forEach(function (s) {
     var card = document.createElement('div');
     card.className = 'sess-card' + (s.id === curSid ? ' active' : '');
     card.onclick = function () { openSession(s.id); };
