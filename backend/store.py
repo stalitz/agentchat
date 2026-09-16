@@ -451,9 +451,10 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
     # 剔除「错误文本」回合（API Error / No response requested. / Request Failed:）——
     # 它们是 claude 外壳渲染的失败输出，不是有效发言，不得被对账回本地当发言
     # （s_54d1232e 曾因 transcript 含错误文本而被带回）。
+    # 但**不静默丢弃**：整条丢掉后会话会变成「只有提问、没有任何回应」的空白，看不出是运行失败
+    # 还是漏落。改为转成可见的系统留痕（err_turns → 下方落盘段写 speaker="system"）。
+    err_turns = [t for t in cli_turns if _is_claude_error_text(t.get("content", ""))]
     cli_turns = [t for t in cli_turns if not _is_claude_error_text(t.get("content", ""))]
-    if not cli_turns:
-        return {"changed": 0, "appended": 0, "skipped": True}
     sessions = _load_sessions(project_path)
     changed = 0
     appended = 0
@@ -468,7 +469,11 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
         # 但**禁止在存在中止记录时追加**：中止的那一轮在 CLI transcript 里可能是半截内容
         # （与我们留的半截不完全一致 → 内容匹配不上），照常追加会凭空多出一个重复气泡。
         has_interrupted = any(m.get("interrupted") for m in msgs if m.get("speaker") == agent_name)
-        if len(cli_turns) == len(idxs):
+        if not cli_turns:
+            # 该 agent 的 CLI 记录里**全是报错回合**（无有效发言）：只落系统留痕，
+            # 不动本地已记录的发言（原语义：CLI 侧为空则保持本地不动）。
+            pass
+        elif len(cli_turns) == len(idxs):
             # 数量一致：按顺序覆盖（原语义，以 agent 为准修正内容/思考）
             for k, turn in enumerate(cli_turns):
                 new_content = turn.get("content", "") or ""
@@ -546,6 +551,23 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                     if (m.get("thinking") or "") and not (m.get("content") or ""):
                         msgs.pop(i)
                         changed += 1
+        # CLI 报错回合 → 可见的系统留痕（**幂等**：每次都按当前 CLI 记录重建，先清掉上次派生的）。
+        # 会话因此显示「xx 本次运行失败（CLI 报错…）」而不是留白；错误原文保留，便于定位
+        # 是 API 限额 / 网络 / 代理问题（如 "API returned an empty or malformed response"）。
+        old_err = [(m.get("content"), m.get("ts")) for m in msgs if m.get("sys_error_of")]
+        msgs[:] = [m for m in msgs if not m.get("sys_error_of")]
+        new_err = [{
+            "round": len(msgs),
+            "speaker": "system",
+            "role": "系统",
+            "content": (f"{agent_name} 本次运行失败（CLI 报错，无有效输出）：\n\n"
+                        f"{(t.get('content') or '').strip()}"),
+            "ts": _claude_ts_to_local(t.get("ts")),
+            "sys_error_of": agent_name,   # 派生标记：重跑对账时据此清理重建，避免重复堆叠
+        } for t in err_turns]
+        if [(m["content"], m["ts"]) for m in new_err] != old_err:
+            changed += 1
+        msgs.extend(new_err)
         # 治本：按 ts 稳定排序兜底，归位 API-error 缺失轮（reconcile 曾 append 到「会话结束」之后）
         if _reorder_by_ts(msgs):
             changed += 1
