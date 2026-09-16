@@ -640,6 +640,11 @@ class AgentRuntime:
                         _tu = _codex_native_tool_use(it)
                         if _tu:
                             yield ("tool_use", _tu)
+                            # 同一 item 带输出（aggregatedOutput / exitCode）⇒ 紧跟一条 tool_result，
+                            # 否则 app-server 通路下工具「只有调用、没有结果」。
+                            _tr = _codex_native_tool_result(it)
+                            if _tr:
+                                yield ("tool_result", _tr)
                 elif m == "error":
                     params = o.get("params") or {}
                     yield ("error", str(params.get("message") or params.get("data") or params))
@@ -1301,9 +1306,15 @@ def _parse_codex_line(text: str, runtime: "AgentRuntime | None"):
     if ev.get("type") == "item.completed":
         # codex 原生工具（shell / 打补丁）：此前整条忽略 ⇒ 调了也不显示。只认 completed，
         # 因为 started/completed 成对上报，取 completed 既保证「必有」又不重复产事件。
+        # completed 条目本身已带输出（aggregated_output / exit_code）⇒ 同一处补发 tool_result，
+        # 否则界面只有「调用了什么」、看不到「执行结果」。
         tu = _codex_native_tool_use(item)
         if tu:
-            return [("tool_use", tu)]
+            out = [("tool_use", tu)]
+            tr = _codex_native_tool_result(item)
+            if tr:
+                out.append(("tool_result", tr))
+            return out
     t = _codex_text(ev)
     if t:
         return [("text", t)]
@@ -1733,6 +1744,66 @@ def _codex_native_tool_use(item) -> dict | None:
     return {"name": name, "input": {"patch": item.get("patch") or item.get("changes") or ""}}
 
 
+# codex 原生工具**输出**的字段名（三条通路各异，统一在此兜底）：
+#   - exec --json：item.aggregated_output / exit_code（snake）
+#   - rollout：`function_call_output` 的 output（字符串，内含 exit code 文本）
+#   - app-server：item.aggregatedOutput / exitCode（camel）
+_CODEX_TOOL_OUTPUT_FIELDS = ("aggregated_output", "aggregatedOutput", "formatted_output",
+                             "formattedOutput", "output", "stdout")
+
+
+def _codex_tool_output(item) -> tuple:
+    """codex 原生工具条目 → (输出文本, 是否失败)。无输出返回 ("", False)。
+
+    与 claude 侧 `_extract_tool_results` 对位：claude 的 tool_result 由 CLI 直接给出
+    content/is_error，codex 没有统一字段，故这里按通路兜字段名 + 从输出文本里抠 exit code。
+    """
+    if not isinstance(item, dict):
+        return "", False
+    raw = None
+    for k in _CODEX_TOOL_OUTPUT_FIELDS:
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            raw = v
+            break
+        if isinstance(v, list) and v:
+            raw = v
+            break
+    if isinstance(raw, list):
+        raw = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in raw)
+    full = _clean_sentinels(str(raw or "")).strip()
+    text = full
+    # rollout 的 output 头带执行元信息（Chunk ID / Wall time / Process exited with code N /
+    # Original token count），界面上是噪声：剥到 `Output:` 之后只留真正的命令输出。
+    if "\nOutput:\n" in text:
+        text = text.split("\nOutput:\n", 1)[1].strip()
+    code = item.get("exit_code")
+    if code is None:
+        code = item.get("exitCode")
+    if code is None:
+        # 退出码只在回执头里（`Process exited with code N`）⇒ 必须从**剥离前**的全文里抠
+        m = re.search(r"(?:exited with code|exit code)\s*(-?\d+)", full)
+        code = int(m.group(1)) if m else None
+    return text, (isinstance(code, int) and code != 0)
+
+
+def _codex_native_tool_result(item) -> dict | None:
+    """codex 原生工具条目 → 与 claude 同构的 tool_result；无输出且未失败时返回 None。
+
+    此前三条通路**都只产 tool_use、不产 tool_result** ⇒ codex 界面里工具「有调用、没结果」，
+    而 claude 侧正常（2026-09-16 用户实测：codex 执行 shell 后看不到输出）。编排层与前端
+    本就支持 tool_result（orchestrator._run_turn / index.html makeToolResultBlock），无需改动。
+    """
+    if not _codex_native_tool_use(item):
+        return None
+    text, is_err = _codex_tool_output(item)
+    if not text:
+        if not is_err:
+            return None
+        text = "（退出码非 0，且无输出）"
+    return {"is_error": is_err, "content": text}
+
+
 def _parse_codex_transcript(path: str) -> list:
     """解析 codex rollout 为一个 agent 的回合序列（供对账覆盖本地历史）。
 
@@ -1756,8 +1827,8 @@ def _parse_codex_transcript(path: str) -> list:
         content = _clean_sentinels("\n\n".join(pending["ans"]).strip()).strip()
         thinking = _clean_sentinels("\n\n".join(pending["think"])).strip()
         tc = pending["tc"]
-        if content or thinking or tc:
-            t = _normalize_turn(content, thinking, tc)
+        if content or thinking or tc or pending["trs"]:
+            t = _normalize_turn(content, thinking, tc, pending["trs"])
             t["blocks"] = _normalize_claude_blocks(pending["seq"])
             if pending.get("ts"):
                 t["ts"] = pending["ts"]
@@ -1767,7 +1838,8 @@ def _parse_codex_transcript(path: str) -> list:
     def _open(ts):
         nonlocal pending
         if pending is None:
-            pending = {"think": [], "ans": [], "tc": [], "seq": [], "seen": set(), "ts": ts}
+            pending = {"think": [], "ans": [], "tc": [], "seq": [], "seen": set(), "ts": ts,
+                       "trs": [], "calls": {}}
 
     for pl, raw in _codex_iter_payloads(path):
         pt = pl.get("type")
@@ -1805,6 +1877,32 @@ def _parse_codex_transcript(path: str) -> list:
             tc = {"name": name, "input": _codex_parse_args(pl.get("arguments"))}
             pending["tc"].append(tc)
             pending["seq"].append({"type": "tool_use", "name": tc["name"], "input": tc["input"]})
+            # 记下 call_id → 该 tool_use 在 seq 中的下标，供紧随的 function_call_output 归位
+            if pl.get("call_id"):
+                pending["calls"][pl["call_id"]] = len(pending["seq"]) - 1
+            continue
+        if pt == "function_call_output":
+            # 工具回执（rollout 通路）：此前**整条被忽略** ⇒ codex 工具在界面里只有调用、
+            # 没有结果（claude 侧有 tool_result，两边不一致）。按 call_id 贴到对应 tool_use
+            # 之后；缺 call_id 时退回顺序追加（时间线本就紧邻）。
+            _open(ts)
+            text, is_err = _codex_tool_output(pl)
+            if not text and not is_err:
+                continue
+            if not text:
+                text = "（退出码非 0，且无输出）"
+            tr = {"is_error": is_err, "content": text}
+            pending["trs"].append(tr)
+            blk = {"type": "tool_result", "is_error": is_err, "content": text}
+            at = pending["calls"].get(pl.get("call_id")) if pl.get("call_id") else None
+            if isinstance(at, int) and 0 <= at < len(pending["seq"]):
+                pending["seq"].insert(at + 1, blk)
+                # 插入后其后所有下标右移，同步修正已记录的 call_id → 下标映射
+                for k, v in list(pending["calls"].items()):
+                    if v > at:
+                        pending["calls"][k] = v + 1
+            else:
+                pending["seq"].append(blk)
             continue
     flush()
     return turns

@@ -365,6 +365,35 @@ class TestCodexNativeToolItems(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools[0][1]["name"], "exec_command")
         self.assertEqual(tools[0][1]["input"]["command"], "/bin/bash -lc 'echo codex-tool-test'")
         self.assertEqual(tools[0][1]["input"]["exit_code"], 0)
+        # 同一 item 的输出也要补发 tool_result（否则「只有调用、没有结果」）
+        trs = [e for e in evs if e[0] == "tool_result"]
+        self.assertEqual(len(trs), 1, evs)
+        self.assertEqual(trs[0][1], {"is_error": False, "content": "codex-tool-test"})
+
+    async def test_camelcase_output_fields_emit_tool_result(self):
+        """app-server 通路的输出字段是驼峰（aggregatedOutput / exitCode），也要认。"""
+        item = {"id": "item_9", "type": "commandExecution", "command": "echo hi",
+                "aggregatedOutput": "hi\n", "exitCode": 0}
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": item}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        trs = [e for e in evs if e[0] == "tool_result"]
+        self.assertEqual(len(trs), 1, evs)
+        self.assertEqual(trs[0][1]["content"], "hi")
+
+    async def test_failed_command_marks_tool_result_error(self):
+        """exitCode 非 0 ⇒ is_error=True（前端按失败样式渲染 + 编排层标 exec_ok=false）。"""
+        item = {"id": "item_10", "type": "commandExecution", "command": "false",
+                "aggregatedOutput": "boom", "exitCode": 1}
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": item}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        trs = [e for e in evs if e[0] == "tool_result"]
+        self.assertEqual(len(trs), 1)
+        self.assertTrue(trs[0][1]["is_error"])
+        self.assertEqual(trs[0][1]["content"], "boom")
 
     async def test_snakecase_command_emits_tool_use(self):
         evs = await self._collect([
@@ -384,6 +413,8 @@ class TestCodexNativeToolItems(unittest.IsolatedAsyncioTestCase):
         tools = [e for e in evs if e[0] == "tool_use"]
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0][1]["name"], "apply_patch")
+        # 打补丁条目这条样例没有输出 ⇒ 不产空 tool_result 块
+        self.assertEqual([e for e in evs if e[0] == "tool_result"], [])
 
     async def test_unknown_item_type_still_ignored(self):
         """未识别的 item 类型不能被当成工具（否则界面会冒出一堆假调用）。"""
@@ -392,6 +423,7 @@ class TestCodexNativeToolItems(unittest.IsolatedAsyncioTestCase):
             {"method": "turn/completed", "params": {}},
         ])
         self.assertEqual([e for e in evs if e[0] == "tool_use"], [])
+        self.assertEqual([e for e in evs if e[0] == "tool_result"], [])
 
 
 if __name__ == "__main__":

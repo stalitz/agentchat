@@ -163,11 +163,47 @@ def test_parse_command_execution_item_emits_tool_use_not_text():
     """
     rt = _runtime()
     evs = _parse_codex_line(EV_ITEM_COMMAND, rt)
-    assert len(evs) == 1, evs
+    assert len(evs) == 2, evs
     kind, payload = evs[0]
     assert kind == "tool_use", "原生工具必须映射为 tool_use（前端通用渲染才显示得出来）"
     assert payload["name"] == "exec_command"
     assert payload["input"]["command"] == "ls"
+
+
+def test_parse_command_execution_emits_tool_result():
+    """同一条 completed 里的 aggregated_output 必须补发 tool_result。
+
+    2026-09-16 用户实测：codex 执行了 shell，界面只有「调用了什么」、看不到「执行结果」，
+    而 claude 侧（原生 tool_result 事件）正常 —— 根因就是 codex 三通路都只产 tool_use。
+    """
+    rt = _runtime()
+    evs = _parse_codex_line(EV_ITEM_COMMAND, rt)
+    kinds = [e[0] for e in evs]
+    assert kinds == ["tool_use", "tool_result"], evs
+    tr = evs[1][1]
+    assert tr["content"] == "total 0"
+    assert tr["is_error"] is False
+
+
+def test_parse_command_execution_nonzero_exit_marks_error():
+    """退出码非 0 ⇒ is_error=True（前端按失败样式渲染，编排层也据此标 exec_ok=false）。"""
+    rt = _runtime()
+    ev = ('{"type":"item.completed","item":{"id":"item_2","type":"command_execution",'
+          '"command":"ls /nope","aggregated_output":"ls: /nope: No such file or directory",'
+          '"exit_code":1}}')
+    evs = _parse_codex_line(ev, rt)
+    tr = [e for e in evs if e[0] == "tool_result"]
+    assert len(tr) == 1
+    assert tr[0][1]["is_error"] is True
+    assert "No such file" in tr[0][1]["content"]
+
+
+def test_parse_command_execution_without_output_emits_no_tool_result():
+    """没有输出、也没失败的工具调用：不产空 tool_result 块（避免界面冒空框）。"""
+    rt = _runtime()
+    ev = '{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"true"}}'
+    evs = _parse_codex_line(ev, rt)
+    assert [e[0] for e in evs] == ["tool_use"]
 
 
 def test_parse_command_execution_started_not_duplicated():
@@ -430,6 +466,34 @@ def test_codex_transcript_ignores_tool_output_as_text():
     turns = _parse_codex_transcript(_rollout(ROLLOUT_NATIVE_TOOL))
     for t in turns:
         assert "Chunk ID" not in t["content"], t["content"][:80]
+
+
+def test_codex_transcript_attaches_tool_result_after_tool_use():
+    """rollout 的 function_call_output 必须落成 tool_result，并按 call_id 贴在 tool_use 之后。
+
+    2026-09-16 用户实测：codex 工具「有调用、没结果」（`tool_results` 恒为 []），
+    而 claude 侧正常。根因是 `_parse_codex_transcript` 里**没有 function_call_output 分支**。
+    回执文本带执行元信息头（Chunk ID / Wall time / Process exited with code N），
+    解析期剥到 `Output:` 之后，与界面看到的「命令输出」一致。
+    """
+    turns = _parse_codex_transcript(_rollout(ROLLOUT_NATIVE_TOOL))
+    t = turns[0]
+    assert len(t["tool_results"]) == 1, t["tool_results"]
+    tr = t["tool_results"][0]
+    assert tr["is_error"] is False
+    assert tr["content"] == "codex-tool-test", tr["content"]
+    assert [b["type"] for b in t["blocks"]] == ["tool_use", "tool_result", "text"], t["blocks"]
+
+
+def test_codex_transcript_marks_failed_tool_output():
+    """回执文本里的 `Process exited with code N`（N≠0）⇒ is_error=True。"""
+    lines = list(ROLLOUT_NATIVE_TOOL)
+    lines[3] = _ri({"type": "function_call_output", "call_id": "call_1",
+                    "output": "Chunk ID: aa11\nWall time: 0.0510 seconds\n"
+                              "Process exited with code 1\nOutput:\nboom\n"})
+    t = _parse_codex_transcript(_rollout(lines))[0]
+    assert t["tool_results"][0]["is_error"] is True
+    assert t["tool_results"][0]["content"] == "boom"
 
 
 def test_codex_transcript_extracts_tool_use_from_function_call():
