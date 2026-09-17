@@ -544,6 +544,78 @@ setTimeout(async () => {
     check(doc.querySelectorAll('#chat .turn-block.thinking').length === 0,
       '无 blocks 的回退路径下，空白 thinking 也不应渲染折叠块');
 
+    // ---- 同一 Team 被多项目共用：点哪个项目的 Team 只高亮那个，并切到所属项目（用户反馈）----
+    const realCfg = dom.window.cfg;
+    const realFetch2 = dom.window.fetch;
+    const cfgMulti = {
+      projects: [
+        { id: 'pr_A', name: '项目A', path: '/tmp/a', team_ids: ['tm_shared', 'tm_a_only'] },
+        { id: 'pr_B', name: '项目B', path: '/tmp/b', team_ids: ['tm_shared', 'tm_b_only'] },
+      ],
+      teams: [
+        { id: 'tm_shared', name: '共享Team', agent_ids: ['ag_arch'] },
+        { id: 'tm_a_only', name: 'A独享Team', agent_ids: ['ag_impl'] },
+        { id: 'tm_b_only', name: 'B独享Team', agent_ids: ['ag_fake'] },
+      ],
+      agents: fakeConfig.agents,
+      settings: fakeConfig.settings,
+    };
+    dom.window.cfg = cfgMulti;
+    dom.window.expanded.projects = { pr_A: true, pr_B: true };
+    dom.window.renderTree();
+    const sharedNodes = Array.from(doc.querySelectorAll('.node.team')).filter((n) => n.textContent.indexOf('共享Team') >= 0);
+    check(sharedNodes.length === 2, '共享 Team 应在 A、B 两个项目下各渲染一次，实际 ' + sharedNodes.length);
+
+    // 手动置「点了 A 下的共享 Team」状态：只 A 的实例高亮
+    dom.window.curPid = 'pr_A';
+    dom.window.teamFilter = 'tm_shared';
+    dom.window.curFilterPid = 'pr_A';
+    dom.window.renderTree();
+    let hl = Array.from(doc.querySelectorAll('.node.team.selected')).filter((n) => n.textContent.indexOf('共享Team') >= 0);
+    check(hl.length === 1, '共用 Team 只应高亮「点中的项目」下那一个实例，实际 ' + hl.length);
+
+    // 切到「点 B 下的共享 Team」：高亮应移到 B 的实例，A 的不亮
+    dom.window.teamFilter = 'tm_shared';
+    dom.window.curFilterPid = 'pr_B';
+    dom.window.renderTree();
+    const hlB = Array.from(doc.querySelectorAll('.node.team.selected'));
+    check(hlB.length === 1 && hlB[0].textContent.indexOf('共享Team') >= 0, '高亮切到 B 后应只剩 B 下的共享 Team 实例');
+    check(Array.from(doc.querySelectorAll('.node.team.selected')).filter((n) => n.textContent.indexOf('A独享Team') >= 0).length === 0,
+      '切到 B 后 A 下的 Team 不应再高亮（跨项目误高亮 bug 修复）');
+
+    // 点 B 项目下的共享 Team：应切到项目 B + 按该 Team 过滤中栏 + composer 落在该 Team
+    dom.window.curPid = 'pr_A';
+    dom.window.curSid = null; dom.window.curTid = null;
+    dom.window.curProjSessions = [];
+    dom.window.teamFilter = ''; dom.window.curFilterPid = null;
+    dom.window.selectTeam('tm_shared', 'pr_B');   // selectProject 同步设置 curPid/curFilterPid/teamFilter 后才异步拉取会话
+    check(dom.window.curPid === 'pr_B', '点 B 项目下的共享 Team 应切到项目 B（同步），实际 ' + dom.window.curPid);
+    check(dom.window.curFilterPid === 'pr_B', 'curFilterPid 应记为 pr_B（点中的项目，而非 owningProjectOf 的第一个），实际 ' + dom.window.curFilterPid);
+    check(dom.window.teamFilter === 'tm_shared', 'teamFilter 应设为被点的 Team，实际 ' + dom.window.teamFilter);
+    const hlAfter = Array.from(doc.querySelectorAll('.node.team.selected')).filter((n) => n.textContent.indexOf('共享Team') >= 0);
+    check(hlAfter.length === 1, '切到 B 后只应高亮 B 下的共享 Team 实例，实际 ' + hlAfter.length);
+    // 中栏按 B 项目加载会话是 selectProject→loadProjectSessions 的异步分支（单项目场景已由上方测试覆盖），
+    // 此处只验证同步层面的「切项目 + 高亮归属精确到项目 + composer 落到该 Team」已正确（核心修复点）。
+    check(doc.getElementById('selTeam').value === 'tm_shared', 'composer 下拉应落到被点的共享 Team，实际 ' + doc.getElementById('selTeam').value);
+    dom.window.fetch = realFetch2;
+    dom.window.cfg = realCfg;
+
+    // ---- 回归：点「空 team」时 composer 必须立即落到该 team，而非残留上一个 team（曾因 disabled 守卫跳过赋值，需点两次）----
+    // selectProject 同步填充 composer 下拉（含 tm_fake 空 team 选项），不依赖异步拉取。
+    dom.window.selectProject('pr_demo');
+    // 模拟「已打开一个锁定 Team 的会话」：手动锁定 composer（applyTeamFilter 在 disabled 时也曾被守卫跳过赋值）
+    dom.window.curSid = 's_1';
+    dom.window.curTid = 'tm_dual';
+    dom.window.curTeamLocked = true;
+    dom.window.applyTeamLock();
+    check(doc.getElementById('selTeam').disabled === true, '锁定态下 composer Team 下拉应禁用');
+    var prevVal = doc.getElementById('selTeam').value;
+    dom.window.selectTeam('tm_fake', 'pr_demo');   // tm_fake 在本项目下无会话（空 team）
+    check(doc.getElementById('selTeam').value === 'tm_fake',
+      '点空 team 后 composer 应直接落到该空 team（不残留 ' + prevVal + '），实际 ' + doc.getElementById('selTeam').value);
+    check(doc.getElementById('selTeam').disabled === false,
+      '点空 team 清空会话后锁定应解除，实际 disabled=' + doc.getElementById('selTeam').disabled);
+
     if (!ok) { console.error('前端渲染回归测试失败'); process.exit(1); }
     console.log('前端渲染回归测试通过 ✓');
     process.exit(0);

@@ -407,6 +407,9 @@ var curProjSessions = [];   // 当前项目的会话列表
 // 中栏会话列表的 team 过滤：'' = 全部；'__none__' = 未指定 team 的会话。
 // 只影响「渲染哪几条」，不动 curProjSessions 本身 ⇒ 被过滤掉的会话仍可被 openSession 命中。
 var teamFilter = '';
+// 过滤/高亮归属的项目：同一个 team 可能被多个项目共用，点哪个项目的 team 就在哪个项目高亮，
+// 不跨项目误高亮。'' / null = 未选中任何 team（中栏显示「全部」时不该有高亮）。
+var curFilterPid = null;
 // 当前会话的 Team 是否锁定（会话已有对话 ⇒ 不可换 Team，见 FR18）。
 // 前端据此把 composer 的 Team 下拉置灰；权威判定在后端 handle_start（防绕过）。
 var curTeamLocked = false;
@@ -823,7 +826,7 @@ function renderTree() {
     t.appendChild(projNode(p));
     if (expanded.projects[p.id]) {
       cfg.teams.filter(function (tm) { return p.team_ids.indexOf(tm.id) >= 0; }).forEach(function (tm) {
-        t.appendChild(teamNode(tm));
+        t.appendChild(teamNode(tm, p.id));
         if (expanded.teams[tm.id]) {
           tm.agent_ids.forEach(function (aid) {
             if (!cfg.agents[aid]) return;
@@ -837,7 +840,7 @@ function renderTree() {
   if (orphanTeams.length) {
     t.appendChild(el('div', 'node proj', '未分组的 Team'));
     orphanTeams.forEach(function (tm) {
-      t.appendChild(teamNode(tm));
+      t.appendChild(teamNode(tm, '__orphan__'));
       if (expanded.teams[tm.id]) {
         tm.agent_ids.forEach(function (aid) {
           if (!cfg.agents[aid]) return;
@@ -863,13 +866,16 @@ function projNode(p) {
   row.appendChild(chev); row.appendChild(bEl); row.appendChild(nm); row.appendChild(edit);
   return row;
 }
-function teamNode(tm) {
-  var row = el('div', 'node team selectable' + (teamFilter && tm.id === teamFilter ? ' selected' : ''), '');
+function teamNode(tm, pid) {
+  // 高亮精确到 (项目, Team)：同一 team 出现在多个项目时，只高亮「我点的那个项目」下的实例，
+  // 避免另一个项目里的同名 team 跟着亮（curFilterPid 记录点的是哪个项目）。
+  var active = teamFilter && tm.id === teamFilter && curFilterPid === pid;
+  var row = el('div', 'node team selectable' + (active ? ' selected' : ''), '');
   var chev = el('span', 'chev', expanded.teams[tm.id] ? '▾' : '▸');
   chev.onclick = function (e) { e.stopPropagation(); expanded.teams[tm.id] = !expanded.teams[tm.id]; renderTree(); };
   var bEl = badge('b-team', 'Team');
   var nm = el('span', 'nm', tm.name);
-  nm.onclick = function (e) { e.stopPropagation(); selectTeam(tm.id); };
+  nm.onclick = function (e) { e.stopPropagation(); selectTeam(tm.id, pid); };
   var edit = editBtn(function (e) { e.stopPropagation(); editTeam(tm.id); });
   row.appendChild(chev); row.appendChild(bEl); row.appendChild(nm); row.appendChild(edit);
   return row;
@@ -928,18 +934,33 @@ function badge(cls, txt) { var b = document.createElement('span'); b.className =
 function projectById(id) { return (cfg.projects || []).filter(function (x) { return x.id === id; })[0]; }
 function teamById(id) { return (cfg.teams || []).filter(function (x) { return x.id === id; })[0]; }
 
-// 选中项目：高亮 + composer 显示项目名 + 填充 Team 下拉 + 中栏加载会话
-function selectProject(pid) {
+// 选中项目：高亮 + composer 显示项目名 + 填充 Team 下拉 + 中栏加载会话。
+// keepTeam：点某 Team 跳转到其所属项目时，加载完直接按该 Team 过滤（不回落「全部」）。
+function selectProject(pid, keepTeam) {
   curPid = pid; curSid = null; curTid = null;
-  teamFilter = '';   // 换项目时中栏过滤回到「全部」（各项目的 team 集合不同，沿用旧值只会筛出空列表）
+  teamFilter = keepTeam || '';   // 换项目时中栏过滤回到「全部」（各项目的 team 集合不同，沿用旧值只会筛出空列表）；带 keepTeam 则按该 Team 过滤
+  curFilterPid = teamFilter ? pid : null;   // 高亮归属 = 当前切到的项目（点哪个项目的 Team 就归哪个，不取 owningProjectOf 的「第一个」）
   renderTree(); renderRail();
   var p = projectById(pid);
   document.getElementById('composerProj').textContent = '项目：' + (p ? p.name : '—');
   fillTeamSelect(p);
+  if (keepTeam) {                  // 跳转到某 Team 所属项目：composer 下拉直接落在那个 Team
+    curTid = keepTeam;
+    var ksel = document.getElementById('selTeam');
+    if (ksel) ksel.value = keepTeam;
+    updateRoundControl();
+  }
   curTeamLocked = false; applyTeamLock();   // 换了项目、还没打开会话 ⇒ 无锁定
   updateRoundControl();
   loadProjectSessions(pid);
   composeClear();
+}
+
+// 返回包含该 team 的所属项目 id（team 可能属多项目，取第一个）。点击 Team 时已带入点中位置的项目 pid，
+// 此函数仅用于 keepTeam 回落 / 兜底。
+function owningProjectOf(tid) {
+  var ps = (cfg.projects || []).filter(function (p) { return (p.team_ids || []).indexOf(tid) >= 0; });
+  return ps.length ? ps[0].id : null;
 }
 function fillTeamSelect(p) {
   var sel = document.getElementById('selTeam'); sel.innerHTML = '';
@@ -948,16 +969,35 @@ function fillTeamSelect(p) {
   teams.forEach(function (t) { var o = document.createElement('option'); o.value = t.id; o.textContent = t.name; sel.appendChild(o); });
   curTid = teams[0].id;
 }
-function selectTeam(tid) {
-  // 左侧点 Team 名 = 「看这个 Team 的会话」：始终进入该 Team 过滤（中栏与左栏高亮联动）。
-  // 即使本项目下该 Team 没有会话，也显示空列表 + 提示，而不是保留上次过滤结果（否则像「点了没反应」）。
-  var has = curProjSessions.some(function (s) { return teamFilterKey(s) === tid; });
+function selectTeam(tid, pid) {
+  // 左侧点 Team 名 = 「看这个 Team 的会话」。
+  // 关键点：
+  // 1) team 可能同时挂在多个项目。点哪个项目下的 team，就切到「那个项目」并只在该项目高亮，绝不跨项目误高亮；
+  // 2) 直接选中该 team 所属项目 + 按该 team 过滤中栏；composer 下拉也落到该 team，
+  //    这样「点空 team」也立即选中它（不再显示上一个 team、也不需点两次），新讨论归属清晰；
+  // 3) 未分组的 Team（不属于任何项目）走 '__orphan__' 分支，仅在本项目内过滤、不切换项目。
+  if (pid === '__orphan__') { curFilterPid = '__orphan__'; applyTeamFilter(tid); return; }
+  var targetPid = pid || owningProjectOf(tid) || curPid;
+  if (targetPid !== curPid) { curFilterPid = targetPid; selectProject(targetPid, tid); return; }
+  curFilterPid = targetPid;
+  applyTeamFilter(tid);
+}
+
+// 在当前项目内按 team 过滤（中栏 + 左栏高亮 + 右栏跟随），是 selectTeam / 过滤下拉 onchange 共用逻辑。
+function applyTeamFilter(tid) {
   teamFilter = tid;
   renderSessions();
+  // 始终把 composer 落到「被点的 team」：哪怕当前会话的 Team 锁定使下拉暂时 disabled，
+  // 这里也先记好意图值（curTid / sel.value）。syncChatToFilter 在空过滤时会清掉会话并解除锁定，
+  // 若此时不提前设值，下拉就会残留上一个 team（即「点空 team 显示上一个 team、需点两次」的成因）。
+  // 若过滤后仍有会话被保留/切换，openSession 会按真实会话的 team 重新校正 composer，不会错位。
+  curTid = tid;
   var sel = document.getElementById('selTeam');
-  if (sel && !sel.disabled) { sel.value = tid; curTid = tid; updateRoundControl(); }
-  renderTree();   // 左栏高亮跟随过滤状态
-  syncChatToFilter();   // 右栏随过滤结果切换（空 → 清空）
+  if (sel) sel.value = tid;
+  updateRoundControl();
+  renderTree();          // 左栏高亮跟随过滤状态（精确到 (项目, Team)）
+  syncChatToFilter();    // 右栏随过滤结果切换（空 → 清空）
+  var has = curProjSessions.some(function (s) { return teamFilterKey(s) === tid; });
   if (!has) setStatus('当前项目下没有属于该 Team 的会话（已显示空列表）', false);
   else if (sel && sel.disabled) setStatus('已筛选该 Team 的会话；当前会话的 Team 已锁定（已有对话）', true);
 }
@@ -1217,7 +1257,11 @@ function renderTeamFilter() {
     sel.dataset.keys = keys;
   }
   sel.value = teamFilter;
-  sel.onchange = function () { teamFilter = sel.value; renderSessions(); renderTree(); syncChatToFilter(); };   // 左栏高亮跟随 + 右栏随过滤切换
+  sel.onchange = function () {
+    teamFilter = sel.value;
+    curFilterPid = teamFilter ? curPid : null;   // 过滤下拉按当前项目过滤；选「全部」则清掉高亮归属
+    renderSessions(); renderTree(); syncChatToFilter();   // 左栏高亮跟随 + 右栏随过滤切换
+  };
   wrap.style.display = 'flex';
   cnt.textContent = teamFilter
     ? filteredSessions().length + ' / ' + curProjSessions.length
