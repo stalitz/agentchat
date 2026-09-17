@@ -1661,25 +1661,52 @@ def _codex_assistant_text(pl: dict) -> str:
     return ""
 
 
+def _codex_reasoning_item_texts(pl: dict) -> list[str]:
+    """从一个 codex `reasoning` payload 里取出思考明文。
+
+    **两条通路（exec 兜底 / rollout 回放解析）共用此函数，勿再各写一份**——本文件
+    已有同类教训（见 `_MCP_TOOL_ITEM_TYPES` 注释：分叉写法导致一条通路整条漏掉）。
+
+    实测 codex 0.146.x 有两种 payload 形态（取决于 provider / 接线方式）：
+    - `content[].type == "reasoning_text"`：`codex exec --json` 与部分 provider；
+    - **`summary[].type == "summary_text"`**：app-server 直连 Ollama 的 rollout 实测
+      —— `content` 是 **null**，明文全在 `summary`。旧实现只读 content，
+      `pl.get("content") or []` 把 null 变成空列表 ⇒ 循环体永不执行、思考解析恒为空
+      （实测 2026-09-17 s_a98be5f2：rollout 里 12 条 reasoning、app 落盘 0 条思考）。
+
+    content 有值时不再读 summary（避免同一段思考被计两遍）。
+    """
+    out: list[str] = []
+    for b in (pl.get("content") or []):
+        if isinstance(b, dict) and b.get("type") == "reasoning_text":
+            t = (b.get("text") or "").strip()
+            if t:
+                out.append(t)
+    if out:
+        return out
+    for b in (pl.get("summary") or []):
+        if isinstance(b, dict):
+            t = (b.get("text") or "").strip()
+            if t:
+                out.append(t)
+    return out
+
+
 def _codex_reasoning_texts(path: str) -> list[str]:
     """按文件顺序取出 rollout 里全部 reasoning 明文（用于展示 codex 的「思考」）。
 
     codex `exec --json` 的事件流**不含 reasoning**（2026-09-11 实测：只有 thread.started /
     turn.started / item.completed / turn.completed，推理只以 `usage.reasoning_output_tokens`
     计数出现；`hide_agent_reasoning=false` + `show_raw_agent_reasoning=true` 也不会输出）。
-    但 rollout 里写明文：`response_item` → payload.type == "reasoning" →
-    content[].text（type == "reasoning_text"；summary 为空、encrypted_content 只是短 id）。
+    但 rollout 里写明文：`response_item` → payload.type == "reasoning"，明文字段见
+    `_codex_reasoning_item_texts`（content / summary 两种形态都取）。
     """
     out: list[str] = []
     try:
         for pl, _raw in _codex_iter_payloads(path):
             if pl.get("type") != "reasoning":
                 continue
-            for b in (pl.get("content") or []):
-                if isinstance(b, dict) and b.get("type") == "reasoning_text":
-                    t = (b.get("text") or "").strip()
-                    if t:
-                        out.append(t)
+            out.extend(_codex_reasoning_item_texts(pl))
     except OSError:
         pass
     return out
@@ -1818,7 +1845,8 @@ def _parse_codex_transcript(path: str) -> list:
     产出时间线 blocks，前后端不需要第二套 schema。
     codex 0.146.1 实测 payload 形态：
     - `message`（role=user）→ 一次新回合的起点（收口上一回合）
-    - `reasoning` → content[].type=reasoning_text：**思考**
+    - `reasoning` → **思考**（明文在 content[].reasoning_text 或 summary[].summary_text，
+      见 `_codex_reasoning_item_texts`）
     - `message`（role=assistant）→ content[].type=output_text：**正文**
     - `function_call` → name / arguments（JSON 字符串）
     - `event_msg/agent_message` 与 assistant message **内容重复**，一律不取（避免双计）；
@@ -1857,10 +1885,10 @@ def _parse_codex_transcript(path: str) -> list:
             continue
         if pt == "reasoning":
             _open(ts)
-            for b in (pl.get("content") or []):
-                if isinstance(b, dict) and b.get("type") == "reasoning_text" and (b.get("text") or "").strip():
-                    pending["think"].append(b["text"])
-                    pending["seq"].append({"type": "thinking", "thinking": b["text"]})
+            # 明文字段两形态（content / summary）共用同一提取函数，避免与 exec 兜底路径分叉
+            for _t in _codex_reasoning_item_texts(pl):
+                pending["think"].append(_t)
+                pending["seq"].append({"type": "thinking", "thinking": _t})
             continue
         # assistant 正文：兼容多种版本形态；event_msg/agent_message 与 response_item 的
         # assistant message **内容重复**，故按文本去重（否则正文会被拼两遍）。

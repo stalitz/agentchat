@@ -427,6 +427,26 @@ def _merge_tool_blocks(new_blocks: list, old_blocks: list) -> list:
     return list(new_blocks[:pos]) + tools + list(new_blocks[pos:])
 
 
+def _merge_thinking_blocks(new_blocks: list, old_blocks: list) -> list:
+    """CLI 侧缺思考块时，把本地已落盘的思考块并回新 blocks（**空值 ≠「该轮没思考」**）。
+
+    与 `_merge_tool_blocks` 同源问题：CLI 侧一旦有工具块就整体采信，思考块会随之被丢掉。
+    思考在原生时间线里恒在首位（思考 → 正文/工具），故补位即前插。两种情况：
+    - CLI blocks 已含思考块 → 保持（CLI 为准，不重复插）；
+    - CLI 侧完全没有思考块 → 保留本地思考块（codex 思考由 app-server 实时增量落盘，
+      rollout 回放解析取不到时不能反过来抹掉它 —— 实测 s_a98be5f2：进行中看得到、
+      重开后全没了）。
+    """
+    if not new_blocks:
+        return new_blocks
+    if any(b.get("type") == "thinking" for b in new_blocks):
+        return new_blocks
+    old_th = [b for b in (old_blocks or []) if b.get("type") == "thinking"]
+    if not old_th:
+        return new_blocks
+    return list(old_th) + list(new_blocks)
+
+
 def _merge_tool_info(msg: dict, turn: dict) -> bool:
     """把 CLI 回合的工具信息并入本地消息，返回是否发生变更。
 
@@ -435,7 +455,9 @@ def _merge_tool_info(msg: dict, turn: dict) -> bool:
     - CLI 回合为空 → 保留本地已有值。claude 走「prompt 文本 json」兜底解析出的 tool_use
       本就不在它自己的 transcript 里（模型把调用写进了正文），覆盖会把这条留痕抹掉
       （实测 s_f85043cf：claude 的终止提议在气泡里查不到工具块）。
-    - blocks：CLI 侧无工具块时按相对位置并回本地工具块，保证气泡内可见。
+    - blocks：CLI 侧无工具块时按相对位置并回本地工具块，保证气泡内可见；
+      **思考块同理**（CLI 侧有工具块即整体采信时，实时落盘的思考块会被一起丢掉），
+      由 `_merge_thinking_blocks` 前插补回。
     """
     changed = False
     new_tc = turn.get("tool_calls") or []
@@ -447,6 +469,8 @@ def _merge_tool_info(msg: dict, turn: dict) -> bool:
         msg["tool_results"] = new_tr
         changed = True
     merged = _merge_tool_blocks(turn.get("blocks") or [], msg.get("blocks") or [])
+    # 思考块同样并回（CLI 侧有工具块即整体采信时，实时落盘的思考块会被一起丢掉）
+    merged = _merge_thinking_blocks(merged, msg.get("blocks") or [])
     if (msg.get("blocks") or []) != merged:
         msg["blocks"] = merged
         changed = True
@@ -502,7 +526,12 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("content") or "") != new_content:
                     m["content"] = new_content
                     changed += 1
-                if (m.get("thinking") or "") != new_think:
+                # 思考与工具同理**不做空值覆盖**（见 _merge_tool_info 说明）：CLI 侧解析不到
+                # 思考 ≠「该轮确实没思考」。codex 的思考由 app-server 实时增量落盘，而 rollout
+                # 回放解析在某些 provider 形态下取不到（content 为 null、明文在 summary，
+                # 见 executor._codex_reasoning_item_texts）；空值覆盖会把实时落盘的思考抹掉
+                # —— 现象正是「进行中看得到思考，重开后全没了」（实测 s_a98be5f2）。
+                if new_think and (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
                     changed += 1
                 # 工具信息**不做空值覆盖**（见 _merge_tool_info 说明）：claude 走「prompt 文本
@@ -546,7 +575,12 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                 if (m.get("content") or "") != new_content:
                     m["content"] = new_content
                     changed += 1
-                if (m.get("thinking") or "") != new_think:
+                # 思考与工具同理**不做空值覆盖**（见 _merge_tool_info 说明）：CLI 侧解析不到
+                # 思考 ≠「该轮确实没思考」。codex 的思考由 app-server 实时增量落盘，而 rollout
+                # 回放解析在某些 provider 形态下取不到（content 为 null、明文在 summary，
+                # 见 executor._codex_reasoning_item_texts）；空值覆盖会把实时落盘的思考抹掉
+                # —— 现象正是「进行中看得到思考，重开后全没了」（实测 s_a98be5f2）。
+                if new_think and (m.get("thinking") or "") != new_think:
                     m["thinking"] = new_think
                     changed += 1
                 # 工具信息不做空值覆盖（同上分支，见 _merge_tool_info）

@@ -510,6 +510,38 @@ def test_codex_reasoning_texts_in_order():
     assert texts == ["思考一：先看工具列表。", "思考二：没有这个工具。"]
 
 
+# ---- reasoning 的第二种形态：content=null、明文在 summary（app-server 直连 Ollama 实测）----
+# 2026-09-17 s_a98be5f2：rollout 里 12 条 reasoning 全在 summary[].summary_text、
+# content 为 null，旧实现只读 content ⇒ 思考解析恒为空（「进行中看得到、重开后全没了」）。
+SUMMARY_ONLY_ROLLOUT = [
+    {"type": "session_meta", "payload": {"session_id": "tid-2", "cli_version": "0.146.1"}},
+    _ri({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "统计目录大小并计时"}]}),
+    _ri({"type": "reasoning", "content": None,
+         "summary": [{"type": "summary_text", "text": "用户想比较两套链路的处理速度。"}]}),
+    _ri({"type": "function_call", "name": "exec_command", "arguments": '{"cmd": "du -sh ."}'}),
+    _ri({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "200K"}]}),
+]
+
+
+def test_codex_reasoning_from_summary_when_content_null():
+    """content 为 null 时必须回退读 summary[].summary_text（否则思考恒为空）。"""
+    turns = _parse_codex_transcript(_rollout(SUMMARY_ONLY_ROLLOUT))
+    assert len(turns) == 1
+    t = turns[0]
+    assert t["thinking"] == "用户想比较两套链路的处理速度。", f"实际 {t['thinking']!r}"
+    assert t["blocks"][0] == {"type": "thinking", "thinking": "用户想比较两套链路的处理速度。"}, \
+        "思考块必须在时间线首位（思考 → 工具 → 正文）"
+    assert _codex_reasoning_texts(_rollout(SUMMARY_ONLY_ROLLOUT)) == ["用户想比较两套链路的处理速度。"]
+
+
+def test_codex_reasoning_content_wins_over_summary():
+    """两形态同时有内容时以 content 为准，同一段思考不得被计两遍。"""
+    lines = [_ri({"type": "reasoning", "content": [{"type": "reasoning_text", "text": "权威思考"}],
+                  "summary": [{"type": "summary_text", "text": "摘要版思考"}]})]
+    assert _codex_reasoning_texts(_rollout(lines)) == ["权威思考"]
+    assert _parse_codex_transcript(_rollout(lines))[0]["thinking"] == "权威思考"
+
+
 def test_codex_new_reasoning_incremental(monkeypatch):
     """_codex_new_reasoning 必须只返回「新增」部分，避免同一段思考被重复吐。"""
     import backend.executor as ex

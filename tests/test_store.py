@@ -212,6 +212,45 @@ class TestStore(unittest.TestCase):
         self.assertEqual(m["tool_results"], [{"content": "回执"}])
         self.assertEqual([b["type"] for b in m["blocks"]], ["text", "tool_use"])
 
+    def test_reconcile_keeps_local_thinking_when_cli_has_none(self):
+        """codex 的思考由 app-server 实时增量落盘；CLI 侧解析不到时（content 为 null 形态）
+        对账不得把它抹掉（实测 s_a98be5f2：进行中看得到思考，重开后全没了）。"""
+        p = TMP / "rec_think"
+        s = store.create_session(str(p), "思考留痕")
+        think = {"type": "thinking", "thinking": "用户想比较两套链路的处理速度。"}
+        store.append_message(str(p), s["id"], {
+            "round": 0, "speaker": "A", "role": "甲", "content": "200K",
+            "thinking": "用户想比较两套链路的处理速度。",
+            "tool_calls": [{"name": "exec_command", "input": {"cmd": "du -sh ."}}],
+            "tool_results": [{"is_error": False, "content": "200K"}],
+            "blocks": [think,
+                       {"type": "tool_use", "name": "exec_command", "input": {"cmd": "du -sh ."}},
+                       {"type": "tool_result", "is_error": False, "content": "200K"},
+                       {"type": "text", "text": "200K"}],
+        })
+        # CLI 侧同一轮：有工具块、但**解析不出思考**（thinking 为空、blocks 无思考块）
+        cli_turns = [{
+            "content": "200K", "thinking": "",
+            "tool_calls": [{"name": "exec_command", "input": {"cmd": "du -sh ."}}],
+            "tool_results": [{"is_error": False, "content": "200K"}],
+            "blocks": [{"type": "tool_use", "name": "exec_command", "input": {"cmd": "du -sh ."}},
+                       {"type": "tool_result", "is_error": False, "content": "200K"},
+                       {"type": "text", "text": "200K"}],
+        }]
+        store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        m = [x for x in store.read_session(str(p), s["id"])["messages"] if x["speaker"] == "A"][0]
+        self.assertEqual(m["thinking"], "用户想比较两套链路的处理速度。",
+                         "CLI 侧无思考 ≠ 该轮没思考，不得用空值覆盖")
+        self.assertEqual(m["blocks"][0], think, "思考块须保留在时间线首位（前端按 blocks 渲染）")
+        # 反面：CLI 侧确实解析出思考时以 CLI 为准（非空即覆盖）
+        cli_turns[0]["thinking"] = "CLI 的思考"
+        cli_turns[0]["blocks"] = [{"type": "thinking", "thinking": "CLI 的思考"}] + cli_turns[0]["blocks"]
+        store.reconcile_agent_messages(str(p), s["id"], "A", cli_turns)
+        m = [x for x in store.read_session(str(p), s["id"])["messages"] if x["speaker"] == "A"][0]
+        self.assertEqual(m["thinking"], "CLI 的思考")
+        self.assertEqual(m["blocks"][0], {"type": "thinking", "thinking": "CLI 的思考"})
+        self.assertEqual([b["type"] for b in m["blocks"]].count("thinking"), 1, "思考块不得重复")
+
     def test_reconcile_appends_cli_only_when_no_match(self):
         # 数量不一致且本地无内容匹配：CLI 多出的回合追加（崩写/掉轮恢复）；本地旧内容保留
         p = TMP / "rec5"
