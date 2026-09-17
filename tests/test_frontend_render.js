@@ -245,6 +245,27 @@ setTimeout(async () => {
   dom.window.curProjSessions = [demoSession];   // 还原，避免影响后续断言
   dom.window.renderSessions();
 
+  // ---- 点「本项目下没有会话的 Team」应显示空列表（而非保留上次过滤结果）----
+  dom.window.curProjSessions = [
+    { id: 's_1', title: '双核甲', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+    { id: 's_2', title: '双核乙', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+  ];
+  dom.window.teamFilter = ''; dom.window.renderSessions();
+  dom.window.selectTeam('tm_fake');   // tm_fake 是合法 Team，但本项目下无会话
+  check(doc.getElementById('sessionList').querySelectorAll('.sess-card').length === 0,
+    '点「本项目无会话的 Team」应显示空列表（而非上次过滤的 2 条），实际 '
+    + doc.getElementById('sessionList').querySelectorAll('.sess-card').length);
+  check(doc.getElementById('sessionList').textContent.indexOf('暂无会话') >= 0, '空列表应给出「暂无会话」提示');
+  check(doc.querySelectorAll('.node.team.selected').length === 1
+    && doc.querySelector('.node.team.selected').textContent.indexOf('调试Team') >= 0,
+    '被点的无会话 Team 应在左栏高亮（确认点击有反应）');
+  check(fSel.value === 'tm_fake', '中栏过滤下拉应选中该空 Team（计数 0）');
+  check(doc.getElementById('sessCount').textContent.indexOf('0 / 2') >= 0,
+    '计数应显示「0 / 2」，实际 ' + doc.getElementById('sessCount').textContent);
+  check(doc.getElementById('status').textContent.indexOf('没有') >= 0, '应给出「当前项目下没有属于该 Team 的会话」提示');
+  dom.window.selectTeam('tm_dual');   // 还原
+  dom.window.curProjSessions = [demoSession]; dom.window.teamFilter = ''; dom.window.renderSessions();
+
   // ---- 已有对话的会话「Team 不可改」（FR18）+ 左栏点 Team 过滤中栏 ----
   dom.window.curProjSessions = [
     { id: 's_1', title: '双核甲', team_id: 'tm_dual', team_name: '双核Team', message_count: 2 },

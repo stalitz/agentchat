@@ -949,14 +949,15 @@ function fillTeamSelect(p) {
   curTid = teams[0].id;
 }
 function selectTeam(tid) {
-  // 左侧点 Team 名 = 「看这个 Team 的会话」：中栏按该 Team 过滤（与中栏过滤下拉同一状态），
-  // 并在会话未锁 Team 时把它预选进 composer（保留原有「点 Team 名预选」语义）。
+  // 左侧点 Team 名 = 「看这个 Team 的会话」：始终进入该 Team 过滤（中栏与左栏高亮联动）。
+  // 即使本项目下该 Team 没有会话，也显示空列表 + 提示，而不是保留上次过滤结果（否则像「点了没反应」）。
   var has = curProjSessions.some(function (s) { return teamFilterKey(s) === tid; });
-  if (has) { teamFilter = tid; renderSessions(); }
+  teamFilter = tid;
+  renderSessions();
   var sel = document.getElementById('selTeam');
   if (sel && !sel.disabled) { sel.value = tid; curTid = tid; updateRoundControl(); }
   renderTree();   // 左栏高亮跟随过滤状态
-  if (!has) setStatus('当前项目下没有属于该 Team 的会话', false);
+  if (!has) setStatus('当前项目下没有属于该 Team 的会话（已显示空列表）', false);
   else if (sel && sel.disabled) setStatus('已筛选该 Team 的会话；当前会话的 Team 已锁定（已有对话）', true);
 }
 function selectAgent(aid) {
@@ -1175,8 +1176,14 @@ function renderTeamFilter() {
     }
     groups[seen[k]].n++;
   });
+  // 选中的 Team 若在本项目下没有会话，仍把它塞进下拉（计数 0）并保留过滤，
+  // 避免回落「全部 team」把空列表又变回全量 —— 点无会话 Team 应看到空列表而非上次过滤结果。
+  if (teamFilter && teamFilter !== '__none__' && !(teamFilter in seen)) {
+    var ft = (cfg.teams || []).filter(function (t) { return t.id === teamFilter; })[0];
+    if (ft) { seen[teamFilter] = groups.length; groups.push({ key: teamFilter, name: ft.name, n: 0 }); }
+  }
   if (groups.length <= 1) { teamFilter = ''; wrap.style.display = 'none'; return; }
-  if (!(teamFilter in seen)) teamFilter = '';   // 选中的 team 已无会话 → 回落「全部」
+  if (!(teamFilter in seen)) teamFilter = '';   // 选中的 team 既不在本项目会话、也不是合法 Team → 回落「全部」
   var keys = groups.map(function (g) { return g.key; }).join('|');
   if (sel.dataset.keys !== keys) {              // options 变了才重建，日常刷新不拆 DOM
     sel.innerHTML = '';
