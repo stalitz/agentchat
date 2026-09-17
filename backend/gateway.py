@@ -544,6 +544,35 @@ def _resolve_think(settings: dict, project_path: str | None, sid: str | None,
     return think
 
 
+_THINK_CAP_CACHE: dict[tuple[str, str], bool] = {}
+
+
+async def _ollama_supports_thinking(settings: dict, model: str | None) -> bool:
+    """该模型是否声明支持 thinking（Ollama `/api/show` 的 capabilities）。
+
+    只用于决定「生效值 True 时要不要显式传 `think: true`」：不支持的模型保持旧行为（不传），
+    免得给不认这个参数的模型添乱。结果按 (base_url, model) 进程内缓存（模型能力不会变）；
+    查询失败一律视为「不支持」（绝不因能力探测失败让网关请求出错）。
+    """
+    if not model:
+        return False
+    base = _ollama_base_url(settings)
+    key = (base, str(model))
+    if key in _THINK_CAP_CACHE:
+        return _THINK_CAP_CACHE[key]
+    ok = False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(base + "/api/show", json={"model": model})
+            if r.status_code < 400:
+                caps = (r.json() or {}).get("capabilities") or []
+                ok = "thinking" in caps
+    except Exception:
+        ok = False
+    _THINK_CAP_CACHE[key] = ok
+    return ok
+
+
 async def handle_messages(req: Request, settings: dict, project_path: str | None = None, sid: str | None = None,
                         think_override: bool | None = None):
     """FastAPI 路由处理函数：POST /v1/messages 或 /gw/<pid>/<sid>/v1/messages。
@@ -573,12 +602,19 @@ async def handle_messages(req: Request, settings: dict, project_path: str | None
         "options": {"num_ctx": num_ctx},
         "stream": want_stream,
     }
-    # 思考开关：生效值 False 时请求带 think:false（gemma 等推理模型支持的参数，
-    # 实测生效：不再产出 thinking 块，输出从单轮数万 token 降到个位数）。默认 True 不传，
-    # 保持对不支持 think 参数的模型（deepseek 等）无影响。
+    # 思考开关：生效值**显式双向透传**——False 带 think:false（不再产出 thinking 块，输出从单轮
+    # 数万 token 降到个位数），True 也带 think:true（2026-09-17 修）。
+    # 原先 True 时**不传**、假设「不传 = 模型默认 = 思考开」——实测不成立：Ollama 0.33.3 的
+    # /api/chat 不带 think 时 gemma4:26b 根本不思考（server.log 三次 /api/chat 耗时
+    # 27.7s/24.9s/24.1s；claude transcript out=447/392/402，无 thinking 块、无思考 token），
+    # 于是用户「明明勾了思考」在 claude→网关 链路静默失效（同一模型走 codex 的 /v1/responses
+    # 则思考数千 token）。True 只在模型声明支持 thinking 时显式传（见 _ollama_supports_thinking），
+    # 对不支持的模型保持旧行为（不传），避免添乱。
     # 生效值优先级：think_override（编排层算好）> 会话级（带 /gw/<pid>/<sid> 路径）> 全局默认。
     if not _resolve_think(settings, project_path, sid, think_override):
         ollama_body["think"] = False
+    elif await _ollama_supports_thinking(settings, oa.get("model")):
+        ollama_body["think"] = True
     if oa.get("tools"):
         # 真工具调用路径：把 anthropic_to_openai 过滤后的 end_discussion 工具定义透传给
         # Ollama 原生端点（其 tools 格式与 OpenAI 一致：{type:function, function:{name,

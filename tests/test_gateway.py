@@ -798,5 +798,112 @@ class TestThinkRouteRegistered(unittest.TestCase):
         self.assertIn("/gw/{pid}/{sid}/v1/messages", paths, "旧路由保留（无 agent 维度的会话/全局解析）")
 
 
+class _FakeShowAndChat:
+    """同时支持 /api/show（thinking 能力查询，走 client.post）与 /api/chat 流式，并捕获请求体。"""
+    caps: list = ["completion", "tools", "thinking"]
+    show_calls: int = 0
+    captured: dict = {}
+    fail_show: bool = False
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, **kw):
+        cls = _FakeShowAndChat
+        cls.show_calls += 1
+        if cls.fail_show:
+            raise RuntimeError("/api/show 不可用")
+        caps = list(cls.caps)
+
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {"capabilities": caps}
+
+        return _R()
+
+    def stream(self, method, url, json=None, headers=None):
+        _FakeShowAndChat.captured = json or {}
+        return _FakeOllamaCtx([
+            '{"message":{"role":"assistant","content":"ok"}}',
+            '{"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}',
+        ])
+
+
+class TestThinkExplicitPassthrough(unittest.IsolatedAsyncioTestCase):
+    """思考开关必须**显式双向透传**（2026-09-17 修）。
+
+    原实现只在生效值 False 时传 think:false，True 时**不传**、假设「不传 = 模型默认 = 思考开」。
+    实测不成立：Ollama 0.33.3 的 /api/chat 不带 think 时 gemma4:26b 根本不思考（server.log
+    三次 /api/chat 27.7s/24.9s/24.1s、claude transcript out=447/392/402 无思考 token），
+    于是用户「明明勾了思考」在 claude→网关 链路静默失效。
+    """
+
+    def setUp(self):
+        gateway._THINK_CAP_CACHE.clear()
+        _FakeShowAndChat.caps = ["completion", "tools", "thinking"]
+        _FakeShowAndChat.show_calls = 0
+        _FakeShowAndChat.captured = {}
+        _FakeShowAndChat.fail_show = False
+        self._orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeShowAndChat
+
+    def tearDown(self):
+        gateway.httpx.AsyncClient = self._orig
+        gateway._THINK_CAP_CACHE.clear()
+
+    async def _run(self, settings, body=None):
+        resp = await gateway.handle_messages(
+            _FakeRequest(body or {"model": "gemma4:26b", "messages": [{"role": "user", "content": "hi"}],
+                                 "stream": True}),
+            settings,
+        )
+        await resp.body_iterator.__anext__()
+        return _FakeShowAndChat.captured
+
+    async def test_think_true_sent_explicitly(self):
+        body = await self._run({"ollama_base_url": "http://x", "think": True})
+        self.assertIs(body.get("think"), True,
+                      "生效值 True 必须显式带 think:true（不传时 Ollama 实测不思考）")
+
+    async def test_think_true_via_override(self):
+        # 编排层算好的 think_override 优先（claude 会话路径 /gw/<pid>/<sid>/think/1）
+        resp = await gateway.handle_messages(
+            _FakeRequest({"model": "gemma4:26b", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+            {"ollama_base_url": "http://x", "think": False}, think_override=True)
+        await resp.body_iterator.__anext__()
+        self.assertIs(_FakeShowAndChat.captured.get("think"), True)
+
+    async def test_think_false_still_sent(self):
+        body = await self._run({"ollama_base_url": "http://x", "think": False})
+        self.assertIs(body.get("think"), False)
+        self.assertEqual(_FakeShowAndChat.show_calls, 0, "关思考无需查能力")
+
+    async def test_think_omitted_when_model_lacks_thinking(self):
+        _FakeShowAndChat.caps = ["completion", "tools"]
+        body = await self._run({"ollama_base_url": "http://x", "think": True})
+        self.assertNotIn("think", body, "模型不声明 thinking 时保持旧行为（不传）")
+
+    async def test_capability_probe_cached(self):
+        await self._run({"ollama_base_url": "http://x", "think": True})
+        await self._run({"ollama_base_url": "http://x", "think": True})
+        self.assertEqual(_FakeShowAndChat.show_calls, 1, "/api/show 结果应按 (base, model) 缓存")
+
+    async def test_probe_failure_keeps_old_behaviour(self):
+        _FakeShowAndChat.fail_show = True
+        body = await self._run({"ollama_base_url": "http://x", "think": True})
+        self.assertNotIn("think", body, "能力探测失败不得让整轮请求出错，回退为不传")
+
+    async def test_unsupported_model_name_returns_false(self):
+        self.assertFalse(await gateway._ollama_supports_thinking({"ollama_base_url": "http://x"}, None))
+
+
 if __name__ == "__main__":
     unittest.main()

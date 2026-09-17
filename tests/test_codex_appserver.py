@@ -10,12 +10,30 @@
 """
 import asyncio
 import json
+import os
+import tempfile
 import unittest
 import unittest.mock
 
 from backend import executor
 from backend.executor import AgentRuntime, _CodexAppServerUnavailable
 from backend.models import AgentConfig
+
+
+def _rollout_file(reasoning_texts):
+    """写一个**真实 schema** 的 rollout（reasoning 明文放 summary，见 codex 0.146.1）。
+
+    建在 /tmp（不用 pytest 的 tmp_path：本机沙箱禁止在 /private/var/folders/... 建目录）。
+    """
+    fd, path = tempfile.mkstemp(suffix=".jsonl", prefix="agentchat_rollout_", dir="/tmp")
+    lines = [{"type": "session_meta", "payload": {"session_id": "tid-1", "cli_version": "0.146.1"}}]
+    for i, t in enumerate(reasoning_texts, 1):
+        lines.append({"type": "response_item",
+                      "payload": {"type": "reasoning", "id": f"rs_{i}", "content": None,
+                                  "summary": [{"type": "summary_text", "text": t}]}})
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(json.dumps(x, ensure_ascii=False) for x in lines))
+    return path
 
 
 class _FakeStdin:
@@ -486,8 +504,10 @@ class TestCodexReasoningLiveItems(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(evs[0][1], "先看看有哪些工具")
         self.assertEqual(evs[3][1], "统计目录大小")
-        # 兜底游标同步推进（否则后续「无思考轮」的兜底会把历史思考按 index 重放一遍）
-        self.assertEqual(rt._as_reasoning_seen, 2)
+        # 兜底游标不在此自增：它已在**回合开始时**按 rollout 现状取快照
+        # （见 _codex_reasoning_cursor / TestCodexReasoningFallbackCursor），
+        # 本测试无 rollout（cli_session_id=None）故快照为 0。
+        self.assertEqual(rt._as_reasoning_seen, 0)
 
     async def test_content_array_form_also_read(self):
         """content 有值时优先取 content（元素同样是纯字符串）。"""
@@ -544,6 +564,96 @@ class TestCodexReasoningLiveItems(unittest.IsolatedAsyncioTestCase):
             ["B"])
         # 纯字符串整体传入（防御性兜底）不得被逐字符拆开
         self.assertEqual(executor._codex_reasoning_item_texts({"summary": "C"}), ["C"])
+
+
+class TestCodexReasoningFallbackCursor(unittest.IsolatedAsyncioTestCase):
+    """回合末「无 reasoning 增量 ⇒ 从 rollout 兜底」的游标，必须以**回合开始时 rollout 现状**为基准。
+
+    真实故障（2026-09-17 实测 agent-probes `s_89d54f21`，双壳本地 gemma）：游标初值 0 且只活在
+    AgentRuntime 实例里 ⇒ runtime 重建后（「继续」/新 run/重开会话），本回合若没收到 reasoning
+    增量（aborted 轮实测常如此），回合末兜底 `texts[0:]` 把**整条 rollout 的历史思考**当本轮思考
+    吐出：落盘 msg8/msg17/msg22 思考 = 17577/19462/19462 字，正好是 rollout 前 16/20/20 条
+    reasoning 明文之和，且 msg22 与 msg17 **逐字节相同**（该 rollout 真实切分是 10887/6718/0/1891）。
+    """
+
+    def setUp(self):
+        self.texts = ["思考一：先看目录。", "思考二：统计大小。", "思考三：写下结论。"]
+        self.rollout = _rollout_file(self.texts)
+
+    def tearDown(self):
+        try:
+            os.unlink(self.rollout)
+        except OSError:
+            pass
+
+    def _rt(self):
+        rt = _rt()
+        rt.cli_session_id = "01a0aef5-c719-7fa1-bff6-2cfdb31e4cd7"
+        return rt
+
+    def test_cursor_counts_existing_reasoning(self):
+        rt = self._rt()
+        with unittest.mock.patch.object(executor, "_codex_transcript_path", return_value=self.rollout):
+            self.assertEqual(rt._codex_reasoning_cursor(), 3)
+            # 快照之后没有新条目 ⇒ 兜底为空（修复前这里会从 0 起、把三条历史思考全部重放）
+            self.assertEqual(rt._codex_new_reasoning(rt._codex_reasoning_cursor()), [])
+            self.assertEqual(rt._codex_new_reasoning(0), self.texts, "旧行为：从 0 起就是整条历史")
+
+    def test_cursor_is_zero_without_cli_session(self):
+        rt = _rt()
+        self.assertEqual(rt._codex_reasoning_cursor(), 0)
+
+    async def _collect(self, rt, notifications):
+        async def _noop_ensure(cwd):
+            return None
+
+        async def _noop_drain():
+            return None
+
+        rt._ensure_appserver = _noop_ensure
+        rt._as_drain_stale = _noop_drain
+        rt._appserver_thread_id = "th_1"
+        rt._as_queue = asyncio.Queue()
+        for o in notifications:
+            await rt._as_queue.put(o)
+        return [ev async for ev in rt._run_codex_appserver("hi", "/tmp", 5)]
+
+    async def test_turn_end_fallback_does_not_replay_history(self):
+        """本回合没有任何思考增量 ⇒ 兜底必须是空的，不能把历史思考当本轮思考吐出来。"""
+        rt = self._rt()
+        with unittest.mock.patch.object(executor, "_codex_transcript_path", return_value=self.rollout):
+            evs = await self._collect(rt, [
+                {"method": "item/agentMessage/delta", "params": {"delta": "本轮正文"}},
+                {"method": "turn/completed", "params": {}},
+            ])
+        self.assertEqual([e for e in evs if e[0] == "thinking"], [],
+                         "历史思考被整条重放（本 bug 的原始现象）：" + repr(evs))
+        self.assertIn(("text", "本轮正文"), evs)
+
+    async def test_turn_end_fallback_emits_only_new_items(self):
+        """回合开始时 rollout 已有 1 条 ⇒ 兜底只补之后新增的那 2 条。"""
+        rt = self._rt()
+        with unittest.mock.patch.object(executor, "_codex_transcript_path", return_value=self.rollout), \
+             unittest.mock.patch.object(executor.AgentRuntime, "_codex_reasoning_cursor", return_value=1):
+            evs = await self._collect(rt, [
+                {"method": "item/agentMessage/delta", "params": {"delta": "本轮正文"}},
+                {"method": "turn/completed", "params": {}},
+            ])
+        self.assertEqual([e[1] for e in evs if e[0] == "thinking"], self.texts[1:])
+
+    async def test_exec_path_fallback_also_seeded(self):
+        """exec 兜底路径（`codex exec --json`）同样不能从 0 起，否则历史思考被重放。"""
+        rt = self._rt()
+
+        async def _fake_stream(cmd, cwd, timeout, parse=None, runtime=None):
+            yield ("text", "exec 正文")
+
+        with unittest.mock.patch.object(executor, "_codex_transcript_path", return_value=self.rollout), \
+             unittest.mock.patch.object(executor, "_stream_subprocess", _fake_stream), \
+             unittest.mock.patch.object(executor.AgentRuntime, "_codex_reasoning_cursor", return_value=2):
+            evs = [ev async for ev in rt._run_codex("hi", "/tmp", 5)]
+        self.assertEqual([e[1] for e in evs if e[0] == "thinking"], self.texts[2:],
+                         "exec 路径也只应补本回合新增的思考：" + repr(evs))
 
 
 if __name__ == "__main__":

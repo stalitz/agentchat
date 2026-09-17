@@ -521,6 +521,30 @@ class AgentRuntime:
         cmd += [prompt]
         return cmd
 
+    def _codex_reasoning_cursor(self) -> int:
+        """本会话 rollout **当前已有**的 reasoning 明文条数 —— 回合末兜底游标的基准值。
+
+        为什么必须按 rollout 现状取快照，而不是从 0 起自增：rollout 是**跨轮累积**的，
+        而游标挂在 AgentRuntime 上、runtime 一旦重建（「继续」/新 run/重开会话）就归零。
+        此时若本回合没收到 reasoning 增量（aborted 轮实测常如此），回合末兜底
+        `texts[0:]` 会把**整条 rollout 的历史思考**当成这一轮的思考吐出去。
+        实测 2026-09-17 s_89d54f21：msg8/msg17/msg22 的思考 = 17577/19462/19462 字，
+        正好等于 rollout 前 16/20/20 条 reasoning 之和，且 msg22 与 msg17 **逐字节相同**；
+        而该 rollout 真实切分（read_cli_transcript）是 10887/6718/0/1891 —— 脏数据来自实时兜底，
+        不是对账。
+
+        读不到文件时返回 0（`_codex_new_reasoning` 同样读不到 ⇒ 兜底为空，不会误重放）。
+        """
+        if not self.cli_session_id:
+            return 0
+        try:
+            p = _codex_transcript_path(self.cli_session_id)
+            if not p:
+                return 0
+            return len(_codex_reasoning_texts(p))
+        except Exception:
+            return 0
+
     def _codex_new_reasoning(self, seen: int) -> list[str]:
         """返回 rollout 里第 seen 条之后新增的 reasoning 文本；读不到就返回空（绝不影响主流程）。"""
         if not self.cli_session_id:
@@ -540,7 +564,9 @@ class AgentRuntime:
         # **正文是整块**（item.completed/agent_message）在回合末才到达、reasoning 早已写进
         # rollout —— 所以在吐「正文 / 工具调用」之前，先把新增的 reasoning 作为 thinking
         # 吐出去，顺序天然对齐原生（思考在前、正文在后），不另造顺序逻辑。
-        seen = 0
+        # 游标基准 = 本回合开始时 rollout 已有的 reasoning 条数（**不能从 0 起**：rollout 跨轮
+        # 累积，从 0 起会把历史思考当本轮重放，见 _codex_reasoning_cursor）。
+        seen = self._codex_reasoning_cursor()
         async for ev in _stream_subprocess(cmd, cwd, timeout, parse="codex", runtime=self):
             if ev[0] in ("text", "tool_use"):
                 fresh = self._codex_new_reasoning(seen)
@@ -578,6 +604,11 @@ class AgentRuntime:
         # 清掉上一轮残留通知（status/tokenUsage 等），避免误判为新一轮事件
         await self._as_drain_stale()
         self._as_turn_id = None  # 上一轮 turn id 作废，避免中止动作打到已结束的 turn
+        # 回合末兜底游标：**每回合开始时按 rollout 现状重取快照**（见 _codex_reasoning_cursor）。
+        # 原先该游标初值 0、只靠 live item/completed 自增 ⇒ runtime 重建后（「继续」/新 run/
+        # 重开会话）若本回合没收到 reasoning 增量，回合末兜底 `texts[0:]` 会把整条 rollout 的
+        # 历史思考当本轮思考重放（实测 s_89d54f21：msg17/msg22 思考 19462 字且两者逐字节相同）。
+        self._as_reasoning_seen = self._codex_reasoning_cursor()
         got_reasoning = False
         # 本回合已由「增量」吐过的 reasoning item id：item/completed 时据此跳过，
         # 否则同一段思考会被吐两遍（先增量流式、再整条完成通知）。
@@ -650,9 +681,9 @@ class AgentRuntime:
                             _rtexts = _codex_reasoning_item_texts(it)
                             if _rtexts:
                                 got_reasoning = True
-                                # 与 rollout 的 reasoning 条目一一对应、同序 ⇒ 推进兜底游标，
-                                # 免得后续「无思考轮」的兜底按 index 把历史思考重放一遍。
-                                self._as_reasoning_seen += 1
+                                # 游标不在此自增：它已在**回合开始时**按 rollout 现状取过快照
+                                # （见 _codex_reasoning_cursor），live 产出的这些都是快照之后的新条目。
+                                # 原先在此按「item 数」自增同一个当「明文条数」用的游标，单位也不一致。
                                 for _t in _rtexts:
                                     yield ("thinking", _t)
                     # app-server 的 MCP 调用条目名为 mcpToolCall（驼峰），见 _is_mcp_tool_item
