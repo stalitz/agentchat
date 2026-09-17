@@ -616,6 +616,40 @@ setTimeout(async () => {
     check(doc.getElementById('selTeam').disabled === false,
       '点空 team 清空会话后锁定应解除，实际 disabled=' + doc.getElementById('selTeam').disabled);
 
+    // ---- 自动滚动跟随：仅当用户「贴在底部」时追加内容才自动下滚；上拉查看历史后不得被拉回 ----
+    // （jsdom 的 scrollHeight/clientHeight 恒为 0，故用 defineProperty 造出可变的真实布局尺寸）
+    var chatEl = doc.getElementById('chat');
+    var _sc = { h: 2000, c: 400 };
+    Object.defineProperty(chatEl, 'scrollHeight', { configurable: true, get: function () { return _sc.h; } });
+    Object.defineProperty(chatEl, 'clientHeight', { configurable: true, get: function () { return _sc.c; } });
+    chatEl.dispatchEvent(new dom.window.Event('scroll'));
+    // 贴底态（2000 - 1600 - 400 = 0）
+    chatEl.scrollTop = 1600;
+    chatEl.dispatchEvent(new dom.window.Event('scroll'));
+    check(dom.window.chatStickBottom === true, '在底部时状态应为「跟随」（实际 ' + dom.window.chatStickBottom + '）');
+    _sc.h = 2400;   // 模拟流式追加内容撑高
+    dom.window.appendThinking('A', '思考内容', 'claude-code');
+    check(chatEl.scrollTop === 2400, '贴底时追加内容应自动滚到底，实际 ' + chatEl.scrollTop);
+    // 用户上拉查看历史
+    chatEl.scrollTop = 300;
+    chatEl.dispatchEvent(new dom.window.Event('scroll'));
+    check(dom.window.chatStickBottom === false, '上拉离开底部后应停止跟随（实际 ' + dom.window.chatStickBottom + '）');
+    var keepTop = chatEl.scrollTop;
+    _sc.h = 3000;
+    dom.window.appendToken('A', '后续正文', 'claude-code');
+    check(chatEl.scrollTop === keepTop, '用户上拉后追加内容不得把滚动条拉回底部，实际 ' + chatEl.scrollTop);
+    dom.window.appendToolCall('bash', { cmd: 'ls' }, 'claude-code');
+    check(chatEl.scrollTop === keepTop, '用户上拉后工具块到达也不得抢滚动，实际 ' + chatEl.scrollTop);
+    // 重新拉回底部 ⇒ 恢复跟随
+    chatEl.scrollTop = 2600;   // 3000 - 2600 - 400 = 0
+    chatEl.dispatchEvent(new dom.window.Event('scroll'));
+    check(dom.window.chatStickBottom === true, '拉回底部后应恢复跟随（实际 ' + dom.window.chatStickBottom + '）');
+    // 自己发消息：强制回到底部（用户主动动作）
+    chatEl.scrollTop = 300;
+    chatEl.dispatchEvent(new dom.window.Event('scroll'));
+    dom.window.addRow('human', '我', '新任务');
+    check(chatEl.scrollTop === 3000, '自己发消息应强制回到底部，实际 ' + chatEl.scrollTop);
+
     if (!ok) { console.error('前端渲染回归测试失败'); process.exit(1); }
     console.log('前端渲染回归测试通过 ✓');
     process.exit(0);

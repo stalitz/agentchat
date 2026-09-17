@@ -396,6 +396,23 @@
 <script>
 var WS = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
 var chat = document.getElementById('chat');
+
+// ---------- 自动滚动跟随 ----------
+// 追加内容时默认自动滚到底，但**仅当用户本就贴在底部**时才跟随：
+// 用户手动上拉查看历史后不再被硬拉回，重新拉回底部即自动恢复跟随。
+// 阈值 48px 容忍「几乎贴底」的抖动（浏览器缩放 / 亚像素 / 一行未读完）。
+var chatStickBottom = true;
+var CHAT_STICK_EPS = 48;
+function chatAtBottom() {
+  if (!chat) return true;
+  return (chat.scrollHeight - chat.scrollTop - chat.clientHeight) <= CHAT_STICK_EPS;
+}
+// force=true 用于「用户主动动作」（自己发消息、切换/打开会话）——那时应当无条件回到底部。
+function scrollChatBottom(force) {
+  if (force) chatStickBottom = true;
+  if (chatStickBottom) chat.scrollTop = chat.scrollHeight;
+}
+if (chat) chat.addEventListener('scroll', function () { chatStickBottom = chatAtBottom(); });
 var cfg = { projects: [], teams: [], agents: {} };
 var agentNameColor = {};
 var cur = null;
@@ -612,7 +629,7 @@ function showLoading(name) {
   var spin = document.createElement('span'); spin.className = 'spinner';
   var txt = document.createElement('span'); txt.textContent = '「' + (name || 'Agent') + '」正在思考…';
   row.appendChild(spin); row.appendChild(txt);
-  chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+  chat.appendChild(row); scrollChatBottom();
   curLoading = row;
 }
 function hideLoading() {
@@ -629,7 +646,7 @@ function appendThinking(name, text, atype) {
   }
   curThinkingBody.textContent += text; curThinkingCnt += text.length;
   var tw = curThinking.querySelector('.tw'); if (tw) tw.textContent = curThinkingCnt + ' 字';
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatBottom();
 }
 function endThinking() {
   // 整轮结束：所有思考块内容渲染为 markdown（含被工具块打断后新建的后续思考块），随后自动收起
@@ -645,7 +662,7 @@ function appendToken(name, text, atype) {
   hideLoading();  // 首个内容到达：撤加载占位
   if (!cur) openTurn(name, atype);
   if (!curAnswer) { curAnswer = document.createElement('div'); curAnswer.className = 'turn-answer'; cur.appendChild(curAnswer); }
-  curAnswer.textContent += text; chat.scrollTop = chat.scrollHeight;
+  curAnswer.textContent += text; scrollChatBottom();
 }
 // 工具调用块：按时间线实时追加到当前气泡（排在思考/正文之后）；清空思考/正文游标，
 // 使工具之后的思考/正文新建独立块，保持「思考→正文→工具→思考→正文」的时间线顺序。
@@ -654,14 +671,14 @@ function appendToolCall(name, input, atype) {
   if (!cur) openTurn(curTurnAgent || 'Agent', atype);
   cur.appendChild(makeToolCallBlock({ name: name || '', input: input || {} }));
   curThinking = null; curThinkingBody = null; curThinkingCnt = 0; curAnswer = null;
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatBottom();
 }
 function appendToolResult(isError, content, atype) {
   hideLoading();
   if (!cur) openTurn(curTurnAgent || 'Agent', atype);
   cur.appendChild(makeToolResultBlock({ is_error: !!isError, content: content }, null));
   curThinking = null; curThinkingBody = null; curThinkingCnt = 0; curAnswer = null;
-  chat.scrollTop = chat.scrollHeight;
+  scrollChatBottom();
 }
 function addRow(cls, who, text, ts) {
   var row = document.createElement('div'); row.className = 'row' + (cls === 'human' ? ' human' : '');
@@ -669,7 +686,8 @@ function addRow(cls, who, text, ts) {
   // 系统消息 / 人工介入支持 markdown；错误等纯文本保持转义
   var rich = (cls === 'sys' || cls === 'human') ? mdToHtml(text) : esc(text);
   b.innerHTML = '<div class="who">' + esc(who) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '') + '</div>' + rich;
-  row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+  // 人类消息 = 用户主动动作 ⇒ 强制回到底部；系统提示/历史渲染走「贴底才跟随」
+  row.appendChild(b); chat.appendChild(row); scrollChatBottom(cls === 'human');
 }
 function esc(s) { return (s || '').replace(/[&<>]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]; }); }
 // 渲染兜底：剥离 gemma 等推理模型在思考/答案间吐的 --- 分隔符（与后端 _clean_answer 一致，仅去首尾），
@@ -1404,7 +1422,7 @@ function openSession(sid) {
       });
       addRow('sys', 'agent 持久会话', asp.join('；'));
     }
-    chat.scrollTop = chat.scrollHeight;
+    scrollChatBottom(true);   // 打开/切换会话：历史渲染完必定回到底部
     refreshSendBtn();
   })
   .catch(function () {});
@@ -1438,7 +1456,7 @@ function openTurn(name, atype, ts, interrupted) {
   b.innerHTML = '<div class="who">' + esc(name) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '')
     + (interrupted ? '<span class="abort-tag">已中止（本次发言作废）</span>' : '')
     + '</div><div class="turn-body"></div>';
-  row.appendChild(b); chat.appendChild(row); chat.scrollTop = chat.scrollHeight;
+  row.appendChild(b); chat.appendChild(row); scrollChatBottom();
   cur = b.querySelector('.turn-body');  // 修复：懒建必须挂到全局 cur（此前漏赋，实时流 appendThinking/appendToken 会崩）
   return cur;
 }
