@@ -957,6 +957,7 @@ function selectTeam(tid) {
   var sel = document.getElementById('selTeam');
   if (sel && !sel.disabled) { sel.value = tid; curTid = tid; updateRoundControl(); }
   renderTree();   // 左栏高亮跟随过滤状态
+  syncChatToFilter();   // 右栏随过滤结果切换（空 → 清空）
   if (!has) setStatus('当前项目下没有属于该 Team 的会话（已显示空列表）', false);
   else if (sel && sel.disabled) setStatus('已筛选该 Team 的会话；当前会话的 Team 已锁定（已有对话）', true);
 }
@@ -1160,6 +1161,24 @@ function filteredSessions() {
   return curProjSessions.filter(function (s) { return teamFilterKey(s) === teamFilter; });
 }
 
+// 过滤后让右栏（会话栏）与中栏保持一致：
+// - 当前打开的会话仍在过滤结果里 → 保持不动（不骚扰正在看的会话）；
+// - 不在了 → 打开过滤结果的第一个会话；
+// - 过滤结果为空 → 清空右栏（不再显示「不属于当前过滤条件」的旧会话）。
+// 只由两种过滤触发点调用（selectTeam / 过滤下拉 onchange），不进 renderSessions（避免标题编辑等场景误触发）。
+function syncChatToFilter() {
+  var list = filteredSessions();
+  if (!list.length) {
+    curSid = null;
+    chat.innerHTML = '';
+    addRow('sys', '系统', '（该 team 下暂无会话，切换过滤条件或点「＋ 新」可新建）');
+    curMsgCount = 0; curTeamLocked = false; applyTeamLock(); refreshSendBtn();
+    return;
+  }
+  if (list.some(function (s) { return s.id === curSid; })) return;
+  openSession(list[0].id);
+}
+
 // 按 team 汇总当前项目的会话（保留列表原有顺序），渲染过滤下拉 + 计数。
 // 只有一组时整条隐藏：过滤是个空操作，不占中栏高度。
 function renderTeamFilter() {
@@ -1198,7 +1217,7 @@ function renderTeamFilter() {
     sel.dataset.keys = keys;
   }
   sel.value = teamFilter;
-  sel.onchange = function () { teamFilter = sel.value; renderSessions(); renderTree(); };   // 左栏高亮跟随
+  sel.onchange = function () { teamFilter = sel.value; renderSessions(); renderTree(); syncChatToFilter(); };   // 左栏高亮跟随 + 右栏随过滤切换
   wrap.style.display = 'flex';
   cnt.textContent = teamFilter
     ? filteredSessions().length + ' / ' + curProjSessions.length

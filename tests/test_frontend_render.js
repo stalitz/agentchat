@@ -263,6 +263,9 @@ setTimeout(async () => {
   check(doc.getElementById('sessCount').textContent.indexOf('0 / 2') >= 0,
     '计数应显示「0 / 2」，实际 ' + doc.getElementById('sessCount').textContent);
   check(doc.getElementById('status').textContent.indexOf('没有') >= 0, '应给出「当前项目下没有属于该 Team 的会话」提示');
+  // 过滤到「无会话的 Team」时右栏也应清空（不再显示旧会话）—— 用户反馈：过滤中栏后会话栏没一起变
+  check(dom.window.curSid === null, '过滤到无会话的 Team 时，右栏会话应被清空（curSid 置空），实际 ' + dom.window.curSid);
+  check(doc.getElementById('chat').textContent.indexOf('暂无会话') >= 0, '右栏清空后应给出「暂无会话」提示');
   dom.window.selectTeam('tm_dual');   // 还原
   dom.window.curProjSessions = [demoSession]; dom.window.teamFilter = ''; dom.window.renderSessions();
 
@@ -289,7 +292,7 @@ setTimeout(async () => {
   check(doc.querySelectorAll('.node.team.selected').length === 1
     && doc.querySelector('.node.team.selected').textContent.indexOf('调试Team') >= 0,
     '被过滤的 Team 节点应在左栏高亮');
-  check(selTeam.value === 'tm_dual', '会话已锁 Team 时，点左栏其他 Team 不应改写 composer 的选择');
+  check(selTeam.value === 'tm_fake', '点左栏其他 Team 过滤后，右栏切到该 Team 的会话（composer 跟随显示 s_3 的 Team「调试Team」），实际 ' + selTeam.value);
   check(doc.getElementById('status').textContent.indexOf('锁定') >= 0, '锁定状态下点其他 Team 应给出可读提示');
   // 中栏过滤下拉反向联动左栏高亮
   fSel.value = 'tm_dual'; fSel.dispatchEvent(new dom.window.Event('change'));
@@ -313,6 +316,27 @@ setTimeout(async () => {
   // 还原 composer 的 Team：上面点过单 agent 的「调试Team」会把轮次置灰成 1，影响后续断言
   dom.window.curSid = null; dom.window.curTeamLocked = false;
   dom.window.selectTeam('tm_dual');
+
+  // ---- 过滤后右栏应随中栏切换（用户反馈：过滤中栏后会话栏没一起变）----
+  dom.window.curProjSessions = [
+    { id: 's_a', title: '甲A', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+    { id: 's_b', title: '甲B', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
+    { id: 's_c', title: '乙C', team_id: 'tm_fake', team_name: '调试Team', message_count: 1 },
+  ];
+  dom.window.teamFilter = ''; dom.window.renderSessions();
+  dom.window.openSession('s_a'); await tick();
+  check(dom.window.curSid === 's_a', '前置：先打开甲队会话 s_a，实际 ' + dom.window.curSid);
+  // 过滤到 tm_fake（乙队）→ 右栏应切到该队第一个会话 s_c，中栏只显示 1 条
+  dom.window.selectTeam('tm_fake'); await tick();
+  check(dom.window.curSid === 's_c', '过滤到 tm_fake 后右栏应切换到该队第一个会话 s_c，实际 ' + dom.window.curSid);
+  check(doc.getElementById('sessionList').querySelectorAll('.sess-card').length === 1,
+    '过滤后中栏只显示乙队 1 条，实际 ' + doc.getElementById('sessionList').querySelectorAll('.sess-card').length);
+  // 还原（避免单 agent Team 把「最大轮次」置灰成 1，影响后续断言）
+  dom.window.curProjSessions = [demoSession]; dom.window.teamFilter = ''; dom.window.renderSessions();
+  dom.window.curSid = null; dom.window.curTeamLocked = false;
+  dom.window.curTid = 'tm_dual';
+  var _sel = doc.getElementById('selTeam'); if (_sel) _sel.value = 'tm_dual';
+  dom.window.updateRoundControl();
 
   // ---- 点 agent 行内编辑图标 -> 预填 + 删除按钮 ----
   const agentEdit = doc.querySelector('.node.agent .edit-btn');
