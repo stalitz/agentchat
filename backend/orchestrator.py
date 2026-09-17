@@ -94,12 +94,8 @@ def _clean_answer(text: str) -> str:
 
 # claude-code 外壳把 API 失败 / resume 异常渲染为普通文本而非结构化错误（实测出现过的）：
 # 这类"回答"不是有效发言，须按执行失败处理——否则会被落盘成正常内容、再被当议题喂给下一个 agent。
-_CLAUDE_ERROR_PREFIXES = ("API Error:", "No response requested.", "Request Failed:")
-
-
-def _looks_like_claude_error(text: str) -> bool:
-    t = (text or "").strip()
-    return any(t.startswith(p) for p in _CLAUDE_ERROR_PREFIXES)
+# 判定与 reconcile 共用 `store.is_cli_error_text`（唯一权威定义在 store，此处不再各写一份）。
+_looks_like_claude_error = store.is_cli_error_text
 
 
 class Session:

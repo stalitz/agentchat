@@ -426,5 +426,125 @@ class TestCodexNativeToolItems(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e for e in evs if e[0] == "tool_result"], [])
 
 
+class TestCodexReasoningLiveItems(unittest.IsolatedAsyncioTestCase):
+    """codex 的「思考」item 必须**按位实时**产出，思考才会与工具调用按原生顺序交错。
+
+    2026-09-17 实测（s_5a0f8d10）：思考落盘已修好，但**流式期间是一整块、位置落在轮末**，
+    要等会话重开（走 rollout 回放）才按工具调用分块。原因：`item/completed` 只认
+    mcpToolCall/原生工具，`reasoning` 整类被忽略 ⇒ 只能靠回合末的 rollout 兜底补，
+    而兜底是「一次性追加在所有正文/工具之后」⇒ 前端把连续同类型合并成一块。
+
+    协议事实（`codex app-server generate-ts`，勿再猜）：
+    - ThreadItem 的 reasoning 变体 = `{type:"reasoning", id, summary: string[], content: string[]}`
+      —— 元素是**纯字符串**（rollout 里才是 `[{type:"summary_text", text}]` 字典形态）；
+    - `item/reasoning/textDelta` / `summaryTextDelta` 通知带 `itemId` ⇒ 可据此避免与
+      item/completed 重复产出同一段思考。
+    """
+
+    async def _collect(self, notifications):
+        rt = _rt()
+
+        async def _noop_ensure(cwd):
+            return None
+
+        async def _noop_drain():
+            return None
+
+        rt._ensure_appserver = _noop_ensure
+        rt._as_drain_stale = _noop_drain
+        rt._appserver_thread_id = "th_1"
+        rt._as_queue = asyncio.Queue()
+        for o in notifications:
+            await rt._as_queue.put(o)
+        return rt, [ev async for ev in rt._run_codex_appserver("hi", "/tmp", 5)]
+
+    @staticmethod
+    def _reasoning(item_id, text):
+        return {"method": "item/completed",
+                "params": {"item": {"type": "reasoning", "id": item_id,
+                                    "summary": [text], "content": []}}}
+
+    @staticmethod
+    def _cmd(cmd_id, cmd):
+        return {"method": "item/completed",
+                "params": {"item": {"id": cmd_id, "type": "commandExecution", "command": cmd,
+                                    "aggregatedOutput": "ok", "exitCode": 0}}}
+
+    async def test_reasoning_item_yields_thinking_in_place(self):
+        """思考 → 工具 → 思考：事件顺序必须是 thinking, tool_use, thinking（即分块交错）。"""
+        rt, evs = await self._collect([
+            self._reasoning("r1", "先看看有哪些工具"),
+            self._cmd("c1", "ls"),
+            self._reasoning("r2", "统计目录大小"),
+            {"method": "turn/completed", "params": {}},
+        ])
+        kinds = [e[0] for e in evs]
+        self.assertEqual(
+            kinds,
+            ["thinking", "tool_use", "tool_result", "thinking", "done"],
+            "思考必须按位交错，不能挤到轮末：" + repr(evs),
+        )
+        self.assertEqual(evs[0][1], "先看看有哪些工具")
+        self.assertEqual(evs[3][1], "统计目录大小")
+        # 兜底游标同步推进（否则后续「无思考轮」的兜底会把历史思考按 index 重放一遍）
+        self.assertEqual(rt._as_reasoning_seen, 2)
+
+    async def test_content_array_form_also_read(self):
+        """content 有值时优先取 content（元素同样是纯字符串）。"""
+        rt, evs = await self._collect([
+            {"method": "item/completed",
+             "params": {"item": {"type": "reasoning", "id": "r1",
+                                 "summary": ["摘要"], "content": ["正文思考"]}}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        self.assertEqual([e for e in evs if e[0] == "thinking"], [("thinking", "正文思考")])
+
+    async def test_delta_then_completed_not_duplicated(self):
+        """增量已流式吐过同一 item ⇒ 完成通知不得再吐一遍（否则思考出现两次）。"""
+        rt, evs = await self._collect([
+            {"method": "item/reasoning/textDelta",
+             "params": {"itemId": "r1", "delta": "想一下"}},
+            self._reasoning("r1", "想一下"),
+            {"method": "turn/completed", "params": {}},
+        ])
+        self.assertEqual([e for e in evs if e[0] == "thinking"], [("thinking", "想一下")])
+
+    async def test_reasoning_without_text_is_not_a_tool(self):
+        """空 reasoning item 不得被当成工具条目（否则界面冒假调用）。"""
+        rt, evs = await self._collect([
+            {"method": "item/completed",
+             "params": {"item": {"type": "reasoning", "id": "r1", "summary": [], "content": []}}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        self.assertEqual([e for e in evs if e[0] in ("tool_use", "tool_result")], [])
+
+    async def test_end_discussion_mcp_still_works_alongside_reasoning(self):
+        """新分支不得挡住原有 MCP 投票与原生工具捕获。"""
+        rt, evs = await self._collect([
+            self._reasoning("r1", "该收尾了"),
+            {"method": "item/completed",
+             "params": {"item": {"type": "mcpToolCall", "id": "m1", "server": "terminate-signal",
+                                 "tool": "end_discussion", "arguments": {"reason": "一致"}}}},
+            self._cmd("c1", "echo hi"),
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e[1]["name"] for e in evs if e[0] == "tool_use"]
+        self.assertEqual(tools, ["end_discussion", "exec_command"], evs)
+
+    def test_rollout_dict_form_still_supported(self):
+        """rollout / exec 的字典形态不能被新实现破坏（同一函数三通路共用）。"""
+        self.assertEqual(
+            executor._codex_reasoning_item_texts(
+                {"content": [{"type": "reasoning_text", "text": "A"}], "summary": []}),
+            ["A"])
+        self.assertEqual(
+            executor._codex_reasoning_item_texts({"content": None,
+                                                  "summary": [{"type": "summary_text",
+                                                               "text": "B"}]}),
+            ["B"])
+        # 纯字符串整体传入（防御性兜底）不得被逐字符拆开
+        self.assertEqual(executor._codex_reasoning_item_texts({"summary": "C"}), ["C"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,9 @@
 import asyncio
 import json
+import re
 import uuid
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -16,6 +18,20 @@ app = FastAPI(title="Agent CLI Orchestrator")
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
 
+# claude 工具往返 URL 的还原：`/http[%3A|:]//host[:port]/真实路径` → `/真实路径`
+_CLAUDE_ROUNDTRIP_RX = re.compile(r"^/https?://[^/]+(/.*)$")
+
+
+def _claude_roundtrip_path(path: str) -> str | None:
+    """把 claude 工具往返的「base_url 被整体编进 path」形态还原为真实 path；非该形态返回 None。"""
+    if not path.startswith("/http"):
+        return None
+    m = _CLAUDE_ROUNDTRIP_RX.match(unquote(path))
+    if not m:
+        return None
+    real = m.group(1)
+    return real if "/v1/messages" in real else None
+
 
 @app.middleware("http")
 async def _rewrite_claude_tool_roundtrip_url(request: Request, call_next):
@@ -27,17 +43,18 @@ async def _rewrite_claude_tool_roundtrip_url(request: Request, call_next):
 
     会话级思考开关把 sid 编进了 base_url 路径（如 `/gw/<pid>/<sid>/v1/messages`），
     工具往返的编码 URL 形如 `/http%3A//127.0.0.1%3A8777/gw/<pid>/<sid>/v1/messages?beta=true`，
-    这里用 urlparse 提取其中的 path 部分（保留 /gw/... 前缀）再改写，确保会话路径不丢。
-    """
-    from urllib.parse import unquote, urlparse
+    这里剥掉其中的 scheme+host、保留 `/gw/...` 前缀再改写，确保会话路径不丢。
 
-    path = request.url.path
-    if path.startswith("/http%3A") or path.startswith("/http:"):
-        decoded = unquote(path)
-        parsed = urlparse(decoded)
-        if parsed.path and "/v1/messages" in parsed.path:
-            request.scope["path"] = parsed.path
-            request.scope["raw_path"] = parsed.path.encode()
+    ⚠️ 勿改回 `urlparse(decoded).path`（2026-09-14 beac507 的回归）：uvicorn 在交给 app **之前
+    已 unquote**，而带前导 `/` 的串 `urlparse` **解析不出 scheme**（`parsed.path` 恒等于原串）
+    ⇒ 重写变成空操作 ⇒ 工具回执续接请求 404，claude 报「There's an issue with the selected model」
+    并退出（2026-09-17 s_5a0f8d10 实测；DEMO 里 claude 全部成功往返的 mtime 都在 regress 之前）。
+    正则显式剥前缀，对「已解码 / 未解码 / 部分编码 / 小写 %3a」四种形态都成立。
+    """
+    real = _claude_roundtrip_path(request.url.path)
+    if real:
+        request.scope["path"] = real
+        request.scope["raw_path"] = real.encode()
     return await call_next(request)
 
 clients: set[WebSocket] = set()

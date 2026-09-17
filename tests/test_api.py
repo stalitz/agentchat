@@ -345,5 +345,47 @@ class TestAPI(unittest.TestCase):
         self.assertIn("tools", r.json())
         self.client.delete(f"/api/session/{self.pr_id}/{sid}")
 
+class TestClaudeToolRoundtripUrlRewrite(unittest.TestCase):
+    """claude 工具回执续接请求的 URL 还原（中间件，2026-09-14 曾回归成空操作）。
+
+    现象：claude 发出 tool_use 后，续接请求把 ANTHROPIC_BASE_URL 整体编进 path
+    （`/http%3A//127.0.0.1%3A8777/gw/<pid>/<sid>/v1/messages`），本服务 404 ⇒ 工具往返拿不到
+    结果 ⇒ claude 报「There's an issue with the selected model」退出（2026-09-17 s_5a0f8d10）。
+    原实现用 `urlparse(decoded).path` 提取，但 uvicorn 交给 app **之前已 unquote**，而带前导 `/`
+    的串 `urlparse` 解析不出 scheme ⇒ `parsed.path` 恒等于原串 ⇒ 重写等于没写。
+
+    断言方式：GET 这些路径 —— 命中路由返回 405（方法不允许），未命中返回 404；405 即证明 path
+    已被改写回真实路径（不需要真跑网关/模型）。
+    """
+
+    def setUp(self):
+        fresh_config()
+        self.client = TestClient(main.app)
+
+    def test_encoded_base_url_paths_are_rewritten(self):
+        for p in (
+            "/http%3A//127.0.0.1%3A8777/gw/pidX/sidX/v1/messages",
+            "/http%3A%2F%2F127.0.0.1%3A8777%2Fgw%2FpidX%2FsidX%2Fv1%2Fmessages",
+            "/http%3a//127.0.0.1%3a8777/gw/pidX/sidX/v1/messages",   # 小写 %3a
+            "/http://127.0.0.1:8777/gw/pidX/sidX/v1/messages",       # 已解码（uvicorn 默认形态）
+            "/http%3A//127.0.0.1%3A8777/v1/messages",                # 无 /gw 前缀的老形态
+        ):
+            self.assertEqual(self.client.get(p).status_code, 405,
+                             f"应为改写后命中路由（405），实际未命中：{p}")
+
+    def test_normal_paths_untouched(self):
+        """不能误伤正常请求：辅助函数对非该形态一律返回 None（不重写）。"""
+        for p in ("/v1/messages", "/gw/pidX/sidX/v1/messages", "/api/config", "/"):
+            self.assertIsNone(main._claude_roundtrip_path(p), p)
+        # 编码形态但目标不是 /v1/messages 的路径不改写（保持 None，走原 404）
+        self.assertIsNone(main._claude_roundtrip_path("/http%3A//127.0.0.1%3A8777/api/config"))
+
+    def test_rewrite_keeps_gateway_session_prefix(self):
+        """会话级思考开关把 pid/sid/think 编进了 base_url：还原后这些段必须原样保留。"""
+        got = main._claude_roundtrip_path(
+            "/http%3A//127.0.0.1%3A8777/gw/pr_0335148e/s_5a0f8d10/think/1/v1/messages")
+        self.assertEqual(got, "/gw/pr_0335148e/s_5a0f8d10/think/1/v1/messages")
+
+
 if __name__ == "__main__":
     unittest.main()

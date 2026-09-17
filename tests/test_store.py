@@ -284,7 +284,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(a_msgs[0]["content"], "正常回答1")
         self.assertEqual(a_msgs[1]["content"], "正常回答2")
         self.assertEqual(a_msgs[2]["content"], "正常回答3")
-        self.assertTrue(all(not store._is_claude_error_text(m["content"]) for m in a_msgs))
+        self.assertTrue(all(not store.is_cli_error_text(m["content"]) for m in a_msgs))
 
     def test_reconcile_skips_when_no_cli_turns(self):
         # 找不到 transcript（离线 / 全新会话）→ 不动本地，作为回退

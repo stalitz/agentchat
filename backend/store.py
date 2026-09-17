@@ -391,14 +391,24 @@ def _similar_content(a: str, b: str) -> bool:
     return b[:30] in a or a[:30] in b
 
 
-# claude 外壳把 API 失败 / resume 异常渲染成普通文本（与 orchestrator._looks_like_claude_error 同源）；
-# 这些不是有效发言，reconcile 对账时应直接剔除（否则错误文本会从 transcript 被带回/追加为发言）。
-_CLAUDE_ERROR_PREFIXES = ("API Error:", "No response requested.", "Request Failed:")
+# claude 外壳把 API 失败 / resume 异常渲染成普通文本；
+# 这些不是有效发言，reconcile 对账时应直接剔除（否则错误文本会从 transcript 被带回/追加为发言），
+# 实时编排（orchestrator）也复用同一判定 —— **本处是唯一权威定义，勿再各写一份**（分叉会漏）。
+#
+# 实测两种形态：
+# ① 整段就是错误（前缀判定）：`API Error: ...` / `No response requested.` / `Request Failed: ...`；
+# ② 错误被**拼接在正文之后**（回答进行到一半才失败）——此时前缀判定不成立，会整轮被当正文落盘、
+#    再被当议题喂给下一个 agent（2026-09-17 s_5a0f8d10 实测文本结尾为
+#    "There's an issue with the selected model (gemma4:26b). It may not exist..."）⇒ 需包含判定。
+CLI_ERROR_PREFIXES = ("API Error:", "No response requested.", "Request Failed:")
+CLI_ERROR_MARKERS = ("There's an issue with the selected model",)
 
 
-def _is_claude_error_text(text: str) -> bool:
+def is_cli_error_text(text: str) -> bool:
+    """是否为 CLI 外壳渲染的失败文本（不是模型的真实发言）。"""
     t = (text or "").strip()
-    return any(t.startswith(p) for p in _CLAUDE_ERROR_PREFIXES)
+    return (any(t.startswith(p) for p in CLI_ERROR_PREFIXES)
+            or any(m in t for m in CLI_ERROR_MARKERS))
 
 
 _TOOL_BLOCK_TYPES = ("tool_use", "tool_result")
@@ -497,8 +507,8 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
     # （s_54d1232e 曾因 transcript 含错误文本而被带回）。
     # 但**不静默丢弃**：整条丢掉后会话会变成「只有提问、没有任何回应」的空白，看不出是运行失败
     # 还是漏落。改为转成可见的系统留痕（err_turns → 下方落盘段写 speaker="system"）。
-    err_turns = [t for t in cli_turns if _is_claude_error_text(t.get("content", ""))]
-    cli_turns = [t for t in cli_turns if not _is_claude_error_text(t.get("content", ""))]
+    err_turns = [t for t in cli_turns if is_cli_error_text(t.get("content", ""))]
+    cli_turns = [t for t in cli_turns if not is_cli_error_text(t.get("content", ""))]
     sessions = _load_sessions(project_path)
     changed = 0
     appended = 0

@@ -579,6 +579,9 @@ class AgentRuntime:
         await self._as_drain_stale()
         self._as_turn_id = None  # 上一轮 turn id 作废，避免中止动作打到已结束的 turn
         got_reasoning = False
+        # 本回合已由「增量」吐过的 reasoning item id：item/completed 时据此跳过，
+        # 否则同一段思考会被吐两遍（先增量流式、再整条完成通知）。
+        _delta_reasoning_ids: set[str] = set()
         rid = self._next_id()
         self._as_send({"jsonrpc": "2.0", "id": rid, "method": "turn/start",
                        "params": {"threadId": tid, "input": [{"type": "text", "text": prompt}]}})
@@ -621,16 +624,39 @@ class AgentRuntime:
                     d = (o.get("params") or {}).get("delta") or ""
                     if d:
                         got_reasoning = True
+                        _iid = (o.get("params") or {}).get("itemId")
+                        if _iid:
+                            _delta_reasoning_ids.add(str(_iid))
                         yield ("thinking", d)
                 elif m == "item/reasoning/summaryTextDelta":
                     d = (o.get("params") or {}).get("delta") or ""
                     if d:
                         got_reasoning = True
+                        _iid = (o.get("params") or {}).get("itemId")
+                        if _iid:
+                            _delta_reasoning_ids.add(str(_iid))
                         yield ("thinking", d)
                 elif m == "item/completed":
                     it = (o.get("params") or {}).get("item") or {}
+                    if str(it.get("type") or "") == "reasoning":
+                        # codex 原生「思考」item（协议 ThreadItem 的 reasoning 变体，
+                        # 明文在 summary[]/content[]）：**必须按位实时产出**。
+                        # 原先整类忽略 ⇒ 思考只能靠回合末的 rollout 兜底补，而兜底是一次性
+                        # 把整轮思考追加在**所有正文/工具之后** ⇒ 前端把连续同类型合并成一块、
+                        # 位置还落在轮末（用户实测：「流输出时是一整块，结束后才按工具调用分块」；
+                        # 结束后之所以对，是回放走 rollout 原生顺序）。
+                        # 已发过增量的 item 跳过，避免重复。
+                        if str(it.get("id") or "") not in _delta_reasoning_ids:
+                            _rtexts = _codex_reasoning_item_texts(it)
+                            if _rtexts:
+                                got_reasoning = True
+                                # 与 rollout 的 reasoning 条目一一对应、同序 ⇒ 推进兜底游标，
+                                # 免得后续「无思考轮」的兜底按 index 把历史思考重放一遍。
+                                self._as_reasoning_seen += 1
+                                for _t in _rtexts:
+                                    yield ("thinking", _t)
                     # app-server 的 MCP 调用条目名为 mcpToolCall（驼峰），见 _is_mcp_tool_item
-                    if _is_mcp_tool_item(it) and "end_discussion" in str(it.get("tool") or ""):
+                    elif _is_mcp_tool_item(it) and "end_discussion" in str(it.get("tool") or ""):
                         yield ("tool_use", {"name": "end_discussion",
                                              "input": _codex_parse_args(it.get("arguments"))})
                     else:
@@ -1661,35 +1687,47 @@ def _codex_assistant_text(pl: dict) -> str:
     return ""
 
 
-def _codex_reasoning_item_texts(pl: dict) -> list[str]:
-    """从一个 codex `reasoning` payload 里取出思考明文。
+def _codex_reasoning_list_texts(v) -> list[str]:
+    """取 codex reasoning 的 `content` / `summary` 列表明文（两种形态都吃）。
 
-    **两条通路（exec 兜底 / rollout 回放解析）共用此函数，勿再各写一份**——本文件
+    清单元素形态依通路而异（**勿只认一种**）：
+    - **app-server 通知**（`item/completed` 的 ThreadItem.reasoning，见协议 ts 定义）：
+      `summary: string[]` / `content: string[]` —— 元素是**纯字符串**；
+    - **rollout / exec --json**：元素是 `{type:"summary_text"|"reasoning_text", text}` 字典。
+    """
+    out: list[str] = []
+    if isinstance(v, str):          # 兜底：万一某通路把整段明文给成字符串（勿逐字符迭代）
+        return [v.strip()] if v.strip() else []
+    for b in (v or []):
+        if isinstance(b, str):
+            t = b.strip()
+        elif isinstance(b, dict):
+            t = (b.get("text") or "").strip()
+        else:
+            t = ""
+        if t:
+            out.append(t)
+    return out
+
+
+def _codex_reasoning_item_texts(pl: dict) -> list[str]:
+    """从一个 codex `reasoning` payload / item 里取出思考明文。
+
+    **三条通路（app-server 实时 / exec 兜底 / rollout 回放）共用此函数，勿再各写一份**——本文件
     已有同类教训（见 `_MCP_TOOL_ITEM_TYPES` 注释：分叉写法导致一条通路整条漏掉）。
 
-    实测 codex 0.146.x 有两种 payload 形态（取决于 provider / 接线方式）：
-    - `content[].type == "reasoning_text"`：`codex exec --json` 与部分 provider；
-    - **`summary[].type == "summary_text"`**：app-server 直连 Ollama 的 rollout 实测
-      —— `content` 是 **null**，明文全在 `summary`。旧实现只读 content，
-      `pl.get("content") or []` 把 null 变成空列表 ⇒ 循环体永不执行、思考解析恒为空
-      （实测 2026-09-17 s_a98be5f2：rollout 里 12 条 reasoning、app 落盘 0 条思考）。
+    实测 codex 0.146.x 的明文位置有两种（取决于 payload 形态，均见 `_codex_reasoning_list_texts`）：
+    - `content`：`codex exec --json` 与部分 provider（元素 type == "reasoning_text"）；
+    - **`summary`**：app-server 直连 Ollama 实测 —— `content` 是 **null**，明文全在 `summary`
+      （旧实现只读 content，`pl.get("content") or []` 把 null 变成空列表 ⇒ 循环体永不执行、
+      思考解析恒为空；实测 2026-09-17 s_a98be5f2：rollout 里 12 条 reasoning、app 落盘 0 条思考）。
 
     content 有值时不再读 summary（避免同一段思考被计两遍）。
     """
-    out: list[str] = []
-    for b in (pl.get("content") or []):
-        if isinstance(b, dict) and b.get("type") == "reasoning_text":
-            t = (b.get("text") or "").strip()
-            if t:
-                out.append(t)
+    out = [t for t in _codex_reasoning_list_texts(pl.get("content"))]
     if out:
         return out
-    for b in (pl.get("summary") or []):
-        if isinstance(b, dict):
-            t = (b.get("text") or "").strip()
-            if t:
-                out.append(t)
-    return out
+    return _codex_reasoning_list_texts(pl.get("summary"))
 
 
 def _codex_reasoning_texts(path: str) -> list[str]:
