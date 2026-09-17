@@ -20,20 +20,28 @@ from backend.executor import AgentRuntime, _CodexAppServerUnavailable
 from backend.models import AgentConfig
 
 
-def _rollout_file(reasoning_texts):
-    """写一个**真实 schema** 的 rollout（reasoning 明文放 summary，见 codex 0.146.1）。
-
-    建在 /tmp（不用 pytest 的 tmp_path：本机沙箱禁止在 /private/var/folders/... 建目录）。
-    """
+def _write_rollout(lines):
+    """写一个 rollout 文件（建在 /tmp：本机沙箱禁止在 /private/var/folders/... 建目录）。"""
     fd, path = tempfile.mkstemp(suffix=".jsonl", prefix="agentchat_rollout_", dir="/tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(json.dumps(x, ensure_ascii=False) for x in lines))
+    return path
+
+
+def _append_rollout(path, lines):
+    """回合进行中追加记录（真实 rollout 是随事件落盘的，不是回合末一次性写）。"""
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n" + "\n".join(json.dumps(x, ensure_ascii=False) for x in lines))
+
+
+def _rollout_file(reasoning_texts):
+    """写一个**真实 schema** 的 rollout（reasoning 明文放 summary，见 codex 0.146.1）。"""
     lines = [{"type": "session_meta", "payload": {"session_id": "tid-1", "cli_version": "0.146.1"}}]
     for i, t in enumerate(reasoning_texts, 1):
         lines.append({"type": "response_item",
                       "payload": {"type": "reasoning", "id": f"rs_{i}", "content": None,
                                   "summary": [{"type": "summary_text", "text": t}]}})
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(json.dumps(x, ensure_ascii=False) for x in lines))
-    return path
+    return _write_rollout(lines)
 
 
 class _FakeStdin:
@@ -654,6 +662,139 @@ class TestCodexReasoningFallbackCursor(unittest.IsolatedAsyncioTestCase):
             evs = [ev async for ev in rt._run_codex("hi", "/tmp", 5)]
         self.assertEqual([e[1] for e in evs if e[0] == "thinking"], self.texts[2:],
                          "exec 路径也只应补本回合新增的思考：" + repr(evs))
+
+
+class TestCodexRolloutToolFallback(unittest.IsolatedAsyncioTestCase):
+    """回合内「rollout 工具兜底」：命令被 codex 沙盒拦下时 app-server **一个 item 都不发**，
+    但 rollout 里照常落 `function_call` + `function_call_output`。
+
+    用户现象：「成功的工具调用直接就显示了，失败的调用全部结束后才显示」。本兜底让失败调用
+    也在回合内实时出现。fixture 用真实 rollout 原文（2026-09-17 `01a0aef5…`）的字段形态。
+    """
+
+    CID = "call_xzjzc0p5"
+    OLD_CID = "call_old00001"
+    SANDBOX_OUT = ("Chunk ID: 0c1fbb\nWall time: 0.0000 seconds\nProcess exited with code 71\n"
+                   "Original token count: 14\nOutput:\n"
+                   "sandbox-exec: sandbox_apply: Operation not permitted\n")
+
+    @staticmethod
+    def _call(cid, cmd, name="exec_command"):
+        return {"type": "response_item",
+                "payload": {"type": "function_call", "id": "fc_1", "name": name,
+                            "arguments": json.dumps({"cmd": cmd}), "call_id": cid}}
+
+    @staticmethod
+    def _out(cid, output):
+        return {"type": "response_item",
+                "payload": {"type": "function_call_output", "id": "fco_1", "call_id": cid,
+                            "output": output}}
+
+    def setUp(self):
+        # 历史（回合开始前就已落盘）：兜底绝不能把它重放出来
+        self.rollout = _write_rollout([
+            {"type": "session_meta", "payload": {"session_id": "tid-1"}},
+            self._call(self.OLD_CID, "date +%s.%N"),
+            self._out(self.OLD_CID, "Chunk ID: aa\nWall time: 0.0 seconds\nProcess exited with code 0\n"
+                                    "Original token count: 3\nOutput:\n1789642000.0\n"),
+        ])
+
+    def tearDown(self):
+        try:
+            os.unlink(self.rollout)
+        except OSError:
+            pass
+
+    def _rt(self):
+        rt = _rt()
+        rt.cli_session_id = "01a0aef5-c719-7fa1-bff6-2cfdb31e4cd7"
+        return rt
+
+    async def _run(self, rt, notifications, new_lines=(), delay=0.06):
+        async def _noop_ensure(cwd):
+            return None
+
+        async def _noop_drain():
+            return None
+
+        rt._ensure_appserver = _noop_ensure
+        rt._as_drain_stale = _noop_drain
+        rt._appserver_thread_id = "th_1"
+        rt._as_queue = asyncio.Queue()
+        for o in notifications:
+            await rt._as_queue.put(o)
+
+        async def feeder():
+            await asyncio.sleep(delay)
+            if new_lines:                       # 回合进行中才落盘（与真实一致）
+                _append_rollout(self.rollout, new_lines)
+            await asyncio.sleep(delay)
+            await rt._as_queue.put({"method": "turn/completed", "params": {}})
+
+        task = asyncio.create_task(feeder())
+        with unittest.mock.patch.object(executor, "_codex_transcript_path", return_value=self.rollout), \
+             unittest.mock.patch.object(executor, "_AS_ROLLOUT_POLL", 0.02):
+            evs = [ev async for ev in rt._run_codex_appserver("hi", "/tmp", 10)]
+        await task
+        return evs
+
+    async def test_blocked_command_is_emitted_in_turn(self):
+        """被沙盒拦下的命令（app-server 无 item）也要在回合内补出来：tool_use + tool_result(is_error)。"""
+        evs = await self._run(self._rt(), [{"method": "item/agentMessage/delta", "params": {"delta": "跑一下"}}],
+                              new_lines=[self._call(self.CID, "ls -la"), self._out(self.CID, self.SANDBOX_OUT)])
+        tools = [e[1] for e in evs if e[0] == "tool_use"]
+        results = [e[1] for e in evs if e[0] == "tool_result"]
+        self.assertEqual([t["name"] for t in tools], ["exec_command"], repr(evs))
+        self.assertEqual(tools[0]["input"], {"command": "ls -la"})
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0]["is_error"], True, "退出码 71 ⇒ is_error 必须为 True")
+        self.assertIn("sandbox_apply", results[0]["content"])
+        # 回执头（Chunk ID / Wall time / Process exited…）应已剥离，界面只见真实输出
+        self.assertNotIn("Chunk ID", results[0]["content"])
+
+    async def test_history_is_not_replayed(self):
+        """回合开始前就存在的调用/回执不得被兜底重放（只补本轮新增）。"""
+        evs = await self._run(self._rt(), [{"method": "item/agentMessage/delta", "params": {"delta": "只说不做"}}])
+        self.assertEqual([e for e in evs if e[0] in ("tool_use", "tool_result")], [], repr(evs))
+
+    async def test_dedup_with_live_item(self):
+        """同一条命令既走实时 item 又在 rollout 里 ⇒ 只能产出一次 tool_use / tool_result。"""
+        live = {"method": "item/completed",
+                "params": {"item": {"id": self.CID, "type": "commandExecution", "command": "ls -la",
+                                    "aggregatedOutput": "ok\n", "exitCode": 0}}}
+        evs = await self._run(self._rt(), [live],
+                              new_lines=[self._call(self.CID, "ls -la"), self._out(self.CID, self.SANDBOX_OUT)])
+        self.assertEqual(len([e for e in evs if e[0] == "tool_use"]), 1, repr(evs))
+        self.assertEqual(len([e for e in evs if e[0] == "tool_result"]), 1, repr(evs))
+
+    async def test_end_discussion_not_taken_from_rollout(self):
+        """end_discussion 由实时 MCP 通路产出，rollout 兜底**不得**再发一遍（会重复计票）。"""
+        evs = await self._run(self._rt(), [], new_lines=[
+            self._call("call_vote1", "", name="end_discussion"),
+            {"type": "response_item", "payload": {"type": "function_call_output", "id": "fco_v",
+                                                  "call_id": "call_vote1", "output": "已记录"}},
+        ])
+        self.assertEqual([e for e in evs if e[0] == "tool_use"], [], repr(evs))
+
+    def test_rollout_tool_input_shapes(self):
+        """兜底产出的 input 形状必须与实时通路一致（前端通用渲染同一条命令不能两种样子）。"""
+        self.assertEqual(executor._codex_rollout_tool_input("exec_command", '{"cmd":"ls"}'),
+                         {"command": "ls"})
+        self.assertEqual(executor._codex_rollout_tool_input("write_stdin", '{"chars":"y\\n"}'),
+                         {"input": "y\n"})
+        self.assertEqual(executor._codex_rollout_tool_input("apply_patch", '{"patch":"P"}'),
+                         {"patch": "P"})
+
+    def test_scan_skips_history_by_cursor(self):
+        """纯函数级：游标设在文件末尾 ⇒ 什么都不该捞到；回退游标才看得到（用于锁定语义）。"""
+        rt = self._rt()
+        with unittest.mock.patch.object(executor, "_codex_transcript_path", return_value=self.rollout):
+            rt._as_rollout_line = rt._codex_rollout_lines()
+            self.assertEqual(rt._codex_rollout_tool_events(), [])
+            rt._as_rollout_line = 0
+            rt._as_tool_call_seen.clear()
+            evs = rt._codex_rollout_tool_events()
+        self.assertEqual([e[0] for e in evs], ["tool_use", "tool_result"])
 
 
 if __name__ == "__main__":

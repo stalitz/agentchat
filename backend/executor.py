@@ -179,6 +179,11 @@ class AgentRuntime:
         self._as_stderr_task = None
         self._as_req_id = 100          # JSON-RPC 请求 id 计数器（initialize/thread/turn 用）
         self._as_reasoning_seen = 0    # 已吐出的 rollout reasoning 条数（仅当无 live 增量时兜底用）
+        # 回合内「rollout 工具兜底」状态（见 _codex_rollout_tool_events）：命令被 codex 沙盒
+        # 拦下时 app-server 一个 item 都不发，只能回合内轮询 rollout 补上。
+        self._as_rollout_line = 0      # 已扫到 rollout 的第几行（回合开始时按现状取快照）
+        self._as_tool_call_seen: set[str] = set()   # 已产出 tool_use 的 call_id（实时 + 兜底共用）
+        self._as_tool_out_seen: set[str] = set()    # 已产出 tool_result 的 call_id（同上）
         self._as_stderr_tail = []      # app-server stderr 尾部（最多 _AS_STDERR_TAIL 行）：断流诊断用
         self._as_returncode = None     # app-server 退出码（读循环 EOF 时记录）
 
@@ -545,6 +550,97 @@ class AgentRuntime:
         except Exception:
             return 0
 
+    def _codex_rollout_lines(self) -> int:
+        """rollout 当前行数（回合内工具兜底的起始游标）。读不到返回 0。"""
+        if not self.cli_session_id:
+            return 0
+        try:
+            p = _codex_transcript_path(self.cli_session_id)
+            if not p:
+                return 0
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                return sum(1 for _ in fh)
+        except Exception:
+            return 0
+
+    def _codex_rollout_tool_events(self) -> list[tuple[str, dict]]:
+        """从 rollout 第 `self._as_rollout_line` 行之后，取**本轮新增**的原生工具调用/回执。
+
+        为什么需要这条兜底：命令**被 codex 自带沙盒拦下**时，app-server **一个 item 都不发**
+        （2026-09-17 探针实测：`commandExecution` 出现 0 次，连 `exitCode`/`aggregatedOutput`
+        字段都没有），实时流里压根没有这条调用 ⇒ 界面只能等回合结束后由对账从 rollout 补出
+        ——用户看到的现象就是「失败的工具调用全部结束后才显示，成功的会实时显示」。
+        而 rollout 里**照常**落 `function_call` + `function_call_output`（同一会话实测
+        28 call / 28 output，其中 14 条含 `sandbox_apply: Operation not permitted`），
+        并且是**随事件追加落盘**（文件 birth = 首条记录时间、mtime = 末条记录时间，
+        进程此后仍在运行；CALL 与 OUT 常在同一秒写入）⇒ 回合内轮询即可补上、不必等结束。
+
+        去重：键 = `call_id`（app-server 的 `commandExecution.id` 与 rollout 的
+        `function_call.call_id` 同一命名空间，实测均为 `call_xxx`）。实时通路发过的调用/回执
+        记在 `_as_tool_call_seen` / `_as_tool_out_seen`，本方法复用同一对集合 ⇒ 两条路径
+        谁先到都不会重复产出。只认 `_CODEX_ROLLOUT_TOOL_NAMES`（命令/stdin/补丁），
+        end_discussion 不在其列（避免与实时 MCP 通路重复计票）。
+        """
+        if not self.cli_session_id:
+            return []
+        try:
+            path = _codex_transcript_path(self.cli_session_id)
+        except Exception:
+            return []
+        if not path:
+            return []
+        out: list[tuple[str, dict]] = []
+        idx = -1
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    idx += 1
+                    if idx < self._as_rollout_line:
+                        continue
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        o = json.loads(ln)
+                    except json.JSONDecodeError:
+                        continue
+                    pl = o.get("payload") if isinstance(o, dict) else None
+                    if not isinstance(pl, dict):
+                        continue
+                    pt = pl.get("type")
+                    if pt == "function_call":
+                        nm = str(pl.get("name") or "")
+                        if nm not in _CODEX_ROLLOUT_TOOL_NAMES:
+                            continue
+                        cid = str(pl.get("call_id") or "")
+                        if cid and cid in self._as_tool_call_seen:
+                            continue          # 实时已发过（或本轮兜底已发过）
+                        if cid:
+                            self._as_tool_call_seen.add(cid)
+                        out.append(("tool_use", {
+                            "name": _CODEX_ROLLOUT_TOOL_NAMES[nm],
+                            "input": _codex_rollout_tool_input(nm, pl.get("arguments")),
+                        }))
+                    elif pt == "function_call_output":
+                        cid = str(pl.get("call_id") or "")
+                        if not cid or cid in self._as_tool_out_seen:
+                            continue
+                        # 只补「本轮这一侧发过调用」的回执：历史回合的回执不该冒出来
+                        if cid not in self._as_tool_call_seen:
+                            continue
+                        text, is_err = _codex_tool_output(pl)
+                        if not text and not is_err:
+                            continue
+                        self._as_tool_out_seen.add(cid)
+                        out.append(("tool_result", {
+                            "is_error": is_err,
+                            "content": text or "（退出码非 0，且无输出）",
+                        }))
+        except OSError:
+            return out
+        self._as_rollout_line = idx + 1
+        return out
+
     def _codex_new_reasoning(self, seen: int) -> list[str]:
         """返回 rollout 里第 seen 条之后新增的 reasoning 文本；读不到就返回空（绝不影响主流程）。"""
         if not self.cli_session_id:
@@ -609,6 +705,9 @@ class AgentRuntime:
         # 重开会话）若本回合没收到 reasoning 增量，回合末兜底 `texts[0:]` 会把整条 rollout 的
         # 历史思考当本轮思考重放（实测 s_89d54f21：msg17/msg22 思考 19462 字且两者逐字节相同）。
         self._as_reasoning_seen = self._codex_reasoning_cursor()
+        # 回合内工具兜底的起始游标：同样按 rollout 现状取（历史回合的命令不得重放），
+        # 具体见 _codex_rollout_tool_events。
+        self._as_rollout_line = self._codex_rollout_lines()
         got_reasoning = False
         # 本回合已由「增量」吐过的 reasoning item id：item/completed 时据此跳过，
         # 否则同一段思考会被吐两遍（先增量流式、再整条完成通知）。
@@ -617,14 +716,26 @@ class AgentRuntime:
         self._as_send({"jsonrpc": "2.0", "id": rid, "method": "turn/start",
                        "params": {"threadId": tid, "input": [{"type": "text", "text": prompt}]}})
         try:
+            # 单轮超时按**截止时刻**判定（而非单次 wait 超时）：等待被切成 poll 间隔，
+            # 每段静默期顺带轮询 rollout 补工具块（见 _codex_rollout_tool_events）。
+            _loop = asyncio.get_running_loop()
+            _deadline = _loop.time() + timeout
             while True:
-                try:
-                    o = await asyncio.wait_for(self._as_queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
+                _remaining = _deadline - _loop.time()
+                if _remaining <= 0:
                     # 单轮超时：杀掉持久进程，下一轮重建（与 exec 超时等价）
                     self._kill_appserver()
                     yield ("error", f"单轮超时（>{timeout}s）已终止")
                     return
+                try:
+                    o = await asyncio.wait_for(self._as_queue.get(),
+                                               timeout=min(_AS_ROLLOUT_POLL, _remaining))
+                except asyncio.TimeoutError:
+                    # 队列静默（命令正跑 / 被沙盒拦下 / 模型长时间思考）：
+                    # 从 rollout 兜底补本轮新增的工具块；无新内容则空转，不影响主流程。
+                    for _ev in self._codex_rollout_tool_events():
+                        yield _ev
+                    continue
                 if o.get("_eof"):
                     # 给 stderr 排空任务一点时间收尾，尽量把崩溃原因一并带出（此前一律丢弃）。
                     await asyncio.sleep(0.15)
@@ -696,12 +807,24 @@ class AgentRuntime:
                         # started/completed 成对上报时重复产一次。
                         _tu = _codex_native_tool_use(it)
                         if _tu:
-                            yield ("tool_use", _tu)
-                            # 同一 item 带输出（aggregatedOutput / exitCode）⇒ 紧跟一条 tool_result，
-                            # 否则 app-server 通路下工具「只有调用、没有结果」。
+                            # call_id 与 rollout 兜底共用去重键：兜底可能已先扫到同一条
+                            # （正常命令也会出现在 rollout 里），此时只补可能缺的 tool_result。
+                            _cid = str(it.get("id") or "")
                             _tr = _codex_native_tool_result(it)
-                            if _tr:
-                                yield ("tool_result", _tr)
+                            if _cid and _cid in self._as_tool_call_seen:
+                                if _tr and _cid not in self._as_tool_out_seen:
+                                    self._as_tool_out_seen.add(_cid)
+                                    yield ("tool_result", _tr)
+                            else:
+                                if _cid:
+                                    self._as_tool_call_seen.add(_cid)
+                                yield ("tool_use", _tu)
+                                # 同一 item 带输出（aggregatedOutput / exitCode）⇒ 紧跟一条 tool_result，
+                                # 否则 app-server 通路下工具「只有调用、没有结果」。
+                                if _tr:
+                                    if _cid:
+                                        self._as_tool_out_seen.add(_cid)
+                                    yield ("tool_result", _tr)
                 elif m == "error":
                     params = o.get("params") or {}
                     yield ("error", str(params.get("message") or params.get("data") or params))
@@ -712,6 +835,10 @@ class AgentRuntime:
                 # 其余通知（thread/status/changed、tokenUsage、mcpServer/* 等）忽略
         finally:
             pass
+        # 回合结束：补最后一次 rollout 扫描——轮询间隔内到达（或 turn/completed 与 rollout
+        # 落盘之间的竞态）的那条工具块，不至于漏到「等下次打开会话对账才显示」。
+        for _ev in self._codex_rollout_tool_events():
+            yield _ev
         # 回合结束：若本模型未发 reasoning 增量（如 deepseek 高 effort 不吐 reasoning delta），
         # 从 rollout 文件兜底补推理（仅补本轮新增，避免跨轮重复）。
         if not got_reasoning:
@@ -1821,6 +1948,35 @@ _CODEX_NATIVE_TOOLS = {
     "file_change": "apply_patch",
     "filechange": "apply_patch",           # app-server 命名（驼峰）
 }
+
+# 回合内「rollout 兜底」认的 **rollout `function_call.name`**（注意：与上面的 item.type 表不是一回事，
+# 这张表是 rollout 里工具自己的名字）。2026-09-17 扫全机 rollout 实测出现过的名字：
+#   exec_command(642) / end_discussion(31) / mcp__node_repl.js(7) / write_stdin(7) / update_plan(6) /
+#   list_mcp_resources(2) / view_image(1) / list_agents(1) / probe_echo(1)
+# 兜底**只认**「命令 / stdin / 补丁」三类 —— 用户关心的失败面就在这（沙盒拦下的命令）。
+# 刻意**不含** `end_discussion`：它由实时 MCP 通路产出，兜底再发一遍就是重复计票。
+_CODEX_ROLLOUT_TOOL_NAMES = {
+    "exec_command": "exec_command",
+    "write_stdin": "write_stdin",
+    "apply_patch": "apply_patch",
+}
+
+# 回合内轮询 rollout 的间隔（秒）。1s：既能及时补上被沙盒拦下的命令，读取开销也可忽略。
+_AS_ROLLOUT_POLL = 1.0
+
+
+def _codex_rollout_tool_input(name: str, raw_args) -> dict:
+    """rollout `function_call.arguments`（JSON 字符串）→ 与实时通路同形的 input 展示字段。
+
+    实时通路（`_codex_native_tool_use`）产出 {command}/{patch}/{input}，兜底必须给同样的形状，
+    否则同一条命令在「实时」与「事后对账」两条路径下显示不同（前端只做通用渲染）。
+    """
+    a = _codex_parse_args(raw_args)
+    if name == "exec_command":
+        return {"command": a.get("cmd") or a.get("command") or ""}
+    if name == "write_stdin":
+        return {"input": a.get("chars") or a.get("input") or ""}
+    return {"patch": a.get("patch") or a.get("input") or ""}
 
 
 def _codex_native_tool_use(item) -> dict | None:
