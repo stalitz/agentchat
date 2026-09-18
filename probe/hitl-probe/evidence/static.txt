@@ -33,16 +33,14 @@ L2b · 回程名还原：模型以干净名调用 → 是否还原成 claude 注
 ==============================================================================
 L3 · codex 上报：MCP 调用是否被转成 tool_use 事件给编排层（HITL 状态机唯一的输入）
 ==============================================================================
-app-server 实时 item/completed type=mcpToolCall    → tool_use=[]
-app-server 实时 item/completed type=mcp_tool_call  → tool_use=[]
-exec/rollout _parse_codex_line type=mcpToolCall    → tool_use=[]
-exec/rollout _parse_codex_line type=mcp_tool_call  → tool_use=[]
+app-server 实时 item/completed type=mcpToolCall    → tool_use=[('tool_use', {'name': 'request_human_input', 'input': {'question': '你每周能练几次？', 'options': ['1-2 次', '3-4 次']}})]
+app-server 实时 item/completed type=mcp_tool_call  → tool_use=[('tool_use', {'name': 'request_human_input', 'input': {'question': '你每周能练几次？', 'options': ['1-2 次', '3-4 次']}})]
+exec/rollout _parse_codex_line type=mcpToolCall    → tool_use=[('tool_use', {'name': 'request_human_input', 'input': {'question': '你每周能练几次？', 'options': ['1-2 次', '3-4 次']}})]
+exec/rollout _parse_codex_line type=mcp_tool_call  → tool_use=[('tool_use', {'name': 'request_human_input', 'input': {'question': '你每周能练几次？', 'options': ['1-2 次', '3-4 次']}})]
 对照组 end_discussion(app-server)                   → tool_use=[('tool_use', {'name': 'end_discussion', 'input': {'reason': '一致'}})]
 
   → end_discussion 能被上报: True（对照组，正常）
-  → request_human_input 能被上报: False
-  ⚠️ 同一分支只放行 end_discussion：codex 调了 request_human_input 也会被吞掉，
-     编排层收不到 tool_use ⇒ 不会暂停、前端也不会弹人工介入。这是**真的断了**，不是模型不调。
+  → request_human_input 能被上报: True
 
 ==============================================================================
 L4 · 编排层： EVENT 到了之后能否被识别为人工介入（含文本 json 兜底）
@@ -65,6 +63,6 @@ L5 · 提示词注入：真实会话发给 agent 的 prompt 里是否带了 HITL
   ✅  L1 MCP server 提供工具 + 正常回执
   ✅  L2 网关把工具转发给本地模型（claude 路径）
   ✅  L2b 回程名还原（干净名 → MCP 原名）
-  ❌  L3 codex 把该 MCP 调用上报编排层
+  ✅  L3 codex 把该 MCP 调用上报编排层
   ✅  L4 编排层识别（含文本 json 兜底）
   ✅  L5 每轮 prompt 注入 HITL 指令

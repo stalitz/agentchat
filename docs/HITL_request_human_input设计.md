@@ -104,3 +104,51 @@ request_human_input(question: str, options: list[str] = [])
   不回归、不阻塞。
 - **暂停期间前端状态**：与现有 `paused` 一致，暂停时不消耗轮次预算，续跑接着算。
 - **多会话并发**：编排层状态机 per-session（Session 实例隔离），互不串场。
+
+## 10. 2026-09-19 修订：触发条件改硬条件 + codex 上报不再被吞
+
+### 10.1 prompt 由「软条件」改为「硬条件」（§7 替换）
+
+旧措辞「当你**需要**用户从多个方案中选择时」实测无效——跳高训练计划那场两个 gemma 都理解成
+「把方案摆出来即可」，改为在正文里反问；而辩论里正文反问会被**对方 agent** 接过去回答，用户
+根本看不到（界面上像 agent 在等回复，实际是自说自话：双壳探针 `s_a3d8022f` 中 codex 在一次
+prompt 内自驱 6 个内部 turn，连问三次「你选哪个」，无人回应）。
+
+现改为三层，落在 `prompt_defaults.py` 的三个可配置槽位（可被
+`settings.prompt_templates.debate.<slot>` 覆盖）：
+
+| 槽位 | 作用 |
+|---|---|
+| `hitl_chat` | 人机对话版通用规则 |
+| `hitl_debate` | 辩论版通用规则（多一条：正文反问会被对方 agent 接走） |
+| `hitl_opening` | 「先问后答」强指令（带 `<task>` 占位符） |
+
+通用规则要点：① 列举**硬触发条件**（结论取决于用户选择 / 关键信息缺失 / 议题含「多套方案让我选」
+类措辞）；② 明令**禁止正文反问**并说明后果；③ 给出无工具时的多行 json 兜底写法；④ 说明调用后
+系统会暂停、回答会交回，**不要**输出「等你回复」之类待命文字。
+
+`hitl_opening` 的注入条件（`orchestrator`）：议题命中 `_HITL_TASK_HINTS`
+（`_task_needs_human_choice`）、本场尚未问过（`_hitl_asked`）、且是首个发言者（debate `round_i==0` /
+chat 首轮）⇒ 要求先调工具问清决定性选择（给 2-4 个选项），拿到回答再给方案。
+
+### 10.2 codex 上报断链修复（§8 测试点补充）
+
+两条 codex 上报通路原先都只放行 `end_discussion`：
+
+- app-server 实时 `item/completed`（executor `_run_codex_appserver`）
+- `codex exec --json` / rollout 的 `item.completed`（`_parse_codex_line`）
+
+写法均为 `... and "end_discussion" in str(tool)`，`request_human_input` 掉进 else 被
+`_codex_native_tool_use` 判 `None` 吞掉 ⇒ codex 即便真调了，编排层也收不到、不会暂停。
+现统一走 `_guarded_mcp_tool(item)`（与 `_is_mcp_tool_item` 同处），认干净名与 `mcp__…__` 前缀名，
+产出干净名给编排层；非受控 MCP 调用仍不产事件。
+
+**与网关无关**：两个工具同属 `terminate-signal` MCP server，codex 直连 MCP，不走网关；
+end_discussion 走得通 ⇒ request_human_input 只需放开上报过滤。
+
+### 10.3 遗留（未做，等定）
+
+- codex + Ollama provider 下模型侧曾自述 `request_user_input is unavailable in Default mode`，
+  需再跑一次端到端确认修完是否真能调通。
+- codex 内建通道 `item/tool/requestUserInput` 目前被 `_as_autoanswer` 静默空应答
+  （`{"answers": {}}`）；该通道模型侧总是可见，可考虑接进 HITL，但涉及 app-server 应答时序，未改。
