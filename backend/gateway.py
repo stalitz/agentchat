@@ -155,7 +155,27 @@ def anthropic_to_openai(body: dict) -> dict:
     # 自然回落到 prompt 文本 json，由编排层 _extract_text_tool_call 兜底解析——两条路径并存。
     tools = body.get("tools")
     if tools:
-        keep = [t for t in tools if "end_discussion" in (t.get("name") or "")]
+        # 工具转发（2026-09-18 调整）：
+        # ① 受控工具 end_discussion / request_human_input（terminate-signal MCP server 下）始终转发（去前缀），
+        #    由编排层驱动终止 / 人工介入状态机；
+        # ② claude 内置工具（Bash/Read/Edit/Glob/Grep/Write/WebFetch/WebSearch/...）**不带 mcp__ 前缀**，
+        #    由 claude CLI 本地执行——原样转发给本地模型，让其能看到并产出 tool_use
+        #    （claude CLI 收到后匹配本地工具执行）。之前误剥全部非受控工具 → gemma 看不到工具定义只能猜名
+        #    （实测猜 shell:execute 失败、claude 回 No such tool available）；
+        # ③ 第三方 MCP 工具（带 mcp__ 前缀、非受控）仍剥，避免本地模型乱调产生副作用；
+        # ④ 交互型工具（AskUserQuestion/EnterPlanMode/ExitPlanMode）本 app 无 TTY 通道会卡死，也剥
+        #    （人工介入改用受控工具 request_human_input）。
+        keep = []
+        for t in tools:
+            name = t.get("name") or ""
+            if any(k in name for k in ("end_discussion", "request_human_input")):
+                keep.append(t)            # 受控工具：始终转发
+                continue
+            if name.startswith("mcp__"):
+                continue                  # 第三方 MCP 工具：剥
+            if name in _CLAUDE_INTERACTIVE_TOOLS:
+                continue                  # 交互工具无 TTY 通道：剥
+            keep.append(t)                # claude 内置工具：放行
         if keep:
             oa["tools"] = [{
                 "type": "function",
@@ -166,6 +186,13 @@ def anthropic_to_openai(body: dict) -> dict:
                 },
             } for t in keep]
     return oa
+
+
+# claude 内置的交互型工具：本 app 用无 TTY 子进程拉起 claude，
+# 这些工具需要真人实时回答 / 进入 plan 模式，无通道会卡死，必须剥（人工介入改用受控工具 request_human_input）。
+_CLAUDE_INTERACTIVE_TOOLS = frozenset({
+    "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+})
 
 
 def _strip_mcp_prefix(name: str) -> str:
@@ -183,13 +210,17 @@ def _strip_mcp_prefix(name: str) -> str:
 
 
 def _restore_mcp_name(name: str) -> str:
-    """end_discussion（或任意 *:end_discussion 变体）→ mcp__terminate-signal__end_discussion。
+    """end_discussion / request_human_input（或带前缀变体）→ mcp__terminate-signal__<基名>。
 
     模型可能以干净名或带其他前缀的名调用，claude 侧只注册了 MCP 原名——
     翻译 tool_calls 时必须还原，否则 claude 报「No such tool available」。
+    两个受控工具同属 terminate-signal server，故前缀统一为 mcp__terminate-signal__。
     """
-    if name and name.endswith("end_discussion") and not name.startswith("mcp__"):
-        return "mcp__terminate-signal__end_discussion"
+    if name and not name.startswith("mcp__"):
+        base = name.split("__")[-1] if "__" in name else name
+        base = base.split(":")[-1]  # 兼容 anthropic: 前缀变体
+        if base in ("end_discussion", "request_human_input"):
+            return f"mcp__terminate-signal__{base}"
     return name
 
 

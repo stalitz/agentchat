@@ -905,5 +905,68 @@ class TestThinkExplicitPassthrough(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await gateway._ollama_supports_thinking({"ollama_base_url": "http://x"}, None))
 
 
+class TestControlledToolForward(unittest.TestCase):
+    """HITL + 终止：网关只把受控工具（end_discussion / request_human_input）透传给模型。
+
+    锁定：其它 MCP 工具（如真实 bash）不得泄漏给本地模型；两个受控工具都转发且名被剥前缀；
+    _restore_mcp_name 对干净名 / anthrothic: 变体都能还原成 MCP 原名。
+    """
+
+    def _oa_tools(self, names):
+        body = {"model": "gemma", "messages": [], "tools": [
+            {"name": n, "description": "d", "input_schema": {}} for n in names
+        ]}
+        return gateway.anthropic_to_openai(body).get("tools", [])
+
+    def test_only_controlled_tools_forwarded(self):
+        out = self._oa_tools([
+            "mcp__terminate-signal__end_discussion",
+            "mcp__terminate-signal__request_human_input",
+            "mcp__some-server__bash",
+        ])
+        kept = [t["function"]["name"] for t in out]
+        self.assertIn("end_discussion", kept)
+        self.assertIn("request_human_input", kept)
+        self.assertNotIn("bash", kept)
+        self.assertEqual(len(out), 2, "只应转发 2 个受控工具，实际 " + str(kept))
+
+    def test_no_controlled_tools_drops_all(self):
+        # 没有任何受控工具时不应伪造 tools 给本地模型
+        out = self._oa_tools(["mcp__some-server__bash"])
+        self.assertEqual(out, [])
+
+    def test_restore_mcp_name_both(self):
+        self.assertEqual(gateway._restore_mcp_name("end_discussion"),
+                         "mcp__terminate-signal__end_discussion")
+        self.assertEqual(gateway._restore_mcp_name("request_human_input"),
+                         "mcp__terminate-signal__request_human_input")
+        self.assertEqual(gateway._restore_mcp_name("anthropic:request_human_input"),
+                         "mcp__terminate-signal__request_human_input")
+        # 非受控工具名原样返回
+        self.assertEqual(gateway._restore_mcp_name("bash"), "bash")
+
+    def test_claude_builtin_tools_forwarded(self):
+        # claude 内置工具（无 mcp__ 前缀）应原样转发给本地模型，让其能调；
+        # 第三方 MCP 工具与交互型（无 TTY 通道）工具必须剥。
+        out = self._oa_tools([
+            "Bash", "Read", "Glob", "Grep",
+            "mcp__terminate-signal__end_discussion",
+            "mcp__some-server__secret",
+            "AskUserQuestion",
+        ])
+        kept = [t["function"]["name"] for t in out]
+        for n in ("Bash", "Read", "Glob", "Grep", "end_discussion"):
+            self.assertIn(n, kept)
+        self.assertNotIn("secret", kept)
+        self.assertNotIn("AskUserQuestion", kept)
+        self.assertEqual(len(out), 5, "应保留 4 内置 + 1 受控，实际 " + str(kept))
+
+    def test_claude_builtin_without_controlled_kept(self):
+        # 无受控工具、只有 claude 内置工具时，内置工具仍应转发（不误剥）
+        out = self._oa_tools(["Bash", "Read"])
+        kept = [t["function"]["name"] for t in out]
+        self.assertEqual(set(kept), {"Bash", "Read"})
+
+
 if __name__ == "__main__":
     unittest.main()
