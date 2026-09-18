@@ -111,6 +111,9 @@
   #ctxHead .ghost { margin-left:auto; font-size:12px; padding:3px 8px; }
   .head-toggle { display:inline-flex; align-items:center; gap:5px; font-size:12px; color:var(--muted); cursor:pointer; user-select:none; }
   .head-toggle input { width:14px; height:14px; cursor:pointer; }
+  /* 「思考」开关后面的生效值提示：会话头开关本身只代表会话级；生效值可能被 agent 级/全局决定 */
+  .think-hint { font-size:11.5px; color:var(--muted); opacity:.9; }
+  .think-hint.off { color:#d08a2a; }   /* 生效值为「关」时给个可见提示，避免"勾着却不思考"的误读 */
   #chat { flex:1; min-height:0; overflow:auto; padding:16px 20px; }
   .row { display:flex; margin:10px 0; }
   .row.human { justify-content:flex-end; }
@@ -318,7 +321,7 @@
       <button class="ghost" onclick="openPromptLog()">提示词</button>
       <button class="ghost" onclick="openToolLog()">工具</button>
       <label class="head-toggle" title="会话级开关（优先级最高：会话 &gt; agent &gt; 全局）：开=保留模型思考过程；关=不输出思考。对 Ollama（经内置网关）与 codex 生效；真实 claude 直连无干净开关">
-        💡 思考 <input type="checkbox" id="chkThink" onchange="toggleThink(this.checked)">
+        💡 思考 <input type="checkbox" id="chkThink" onchange="toggleThink(this.checked)"><span id="thinkHint" class="think-hint"></span>
       </label>
     </div>
     <div id="chat"></div>
@@ -1394,9 +1397,10 @@ function openSession(sid) {
     curToolLog = (td && td.tools) || [];
     // 待续接状态（权威值）：该会话有「被中止、等待重新发言」的发言 → 主按钮显示「继续」
     pendingBySid[sid] = d.pending_turn || null;
-    // 会话级「思考」开关：按 get_session 返回的 think（会话显式值或全局默认）初始化
-    var chk = document.getElementById('chkThink');
-    if (chk) chk.checked = d.think !== false;
+    // 会话级「思考」开关 + 生效值提示：按 get_session 下发的 think_session / think_agents /
+    // think_effective 初始化（开关状态与提示文案都走 applyThinkState，避免"界面勾着、实际被
+    // agent 级压成关"的误读）
+    applyThinkState(d);
     chat.innerHTML = ''; cur = null; curThinking = null;
     var msgs = d.messages || [];
     // 系统消息（终止原因 / 会话结束）不计入「已有 N 条」计数
@@ -1437,14 +1441,68 @@ function updateCtxHead(s) {
   document.getElementById('ctxMeta').textContent = meta.join(' · ');
 }
 
+// 「思考」开关的真实状态与提示。会话头那个 checkbox 只代表**会话级**取值；真正生效的是
+// 三级里最具体的一级（会话 > agent > 全局）。历史现象：agent 级被设成「关」时，界面照样
+// 显示勾选（因为只读了会话级 ?? 全局）⇒ 用户以为思考开着，实际不产思考。
+// 后端 get_session 已逐 agent 算好：think_session（会话级显式值，未设为 null）、
+// think_agents [{name, think, source}]、think_effective（各 agent 一致时为该值，否则 null）。
+var curThinkState = null;
+var THINK_SRC_CN = { session: '会话级', agent: 'agent 级', global: '全局' };
+function applyThinkState(d) {
+  curThinkState = d || null;
+  var chk = document.getElementById('chkThink');
+  var hint = document.getElementById('thinkHint');
+  var ags = (d && d.think_agents) || [];
+  var sess = (d && d.think_session !== undefined) ? d.think_session : null;
+  var eff = (d && d.think_effective !== undefined) ? d.think_effective : null;
+  if (chk) {
+    // 会话级显式设过 → 按会话级；否则按「生效值」（各 agent 一致时）——这样 agent 级把它
+    // 关掉时开关不再显示成勾着的假象。各 agent 不一致时回退旧逻辑（会话级 ?? 全局）。
+    if (sess !== null) chk.checked = sess !== false;
+    else if (eff !== null && eff !== undefined) chk.checked = eff !== false;
+    else if (d) chk.checked = d.think !== false;
+  }
+  if (!hint) return;
+  var detail = ags.map(function (a) {
+    return a.name + ' ' + (a.think ? '开' : '关') + '（' + (THINK_SRC_CN[a.source] || a.source) + '）';
+  }).join(' · ');
+  if (!ags.length) {
+    hint.textContent = '';
+    hint.className = 'think-hint';
+    hint.title = '未绑定 team：按' + (sess !== null ? '会话级' : '全局') + '设置生效';
+    return;
+  }
+  if (sess !== null) {
+    hint.textContent = '本会话已设';
+    hint.className = 'think-hint';
+  } else if (eff !== null && eff !== undefined) {
+    hint.textContent = '生效：' + (eff ? '开' : '关');
+    hint.className = 'think-hint' + (eff ? '' : ' off');
+  } else {
+    hint.textContent = '各 agent 不同';
+    hint.className = 'think-hint off';
+  }
+  hint.title = '生效值（会话 > agent > 全局）：' + detail;
+}
+
 // 会话级「思考」开关：当前会话展开时切换。三级开关最高优先级（会话 > agent > 全局）：
-// 编排层按会话+agent 算好生效值随 /gw/<pid>/<sid>?think= 下发；网关据此带 think:false。
+// 编排层按会话+agent 算好生效值随 /gw/<pid>/<sid>/think/<0|1> 下发；网关据此带 think:false。
 function toggleThink(on) {
   if (!curPid || !curSid) return;
   fetch('/api/session/' + curPid + '/' + curSid + '/think', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ think: !!on }),
+  }).then(function (r) { return r.json(); }).then(function () {
+    // 写入成功后本会话已有显式会话级值 ⇒ 提示与开关状态按「已设」刷新（agent 级不再决定）
+    if (curThinkState) {
+      curThinkState.think_session = !!on;
+      curThinkState.think_effective = !!on;
+      curThinkState.think_agents = (curThinkState.think_agents || []).map(function (a) {
+        return { id: a.id, name: a.name, think: !!on, source: 'session' };
+      });
+      applyThinkState(curThinkState);
+    }
   }).catch(function () {});
 }
 

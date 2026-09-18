@@ -387,5 +387,81 @@ class TestClaudeToolRoundtripUrlRewrite(unittest.TestCase):
         self.assertEqual(got, "/gw/pr_0335148e/s_5a0f8d10/think/1/v1/messages")
 
 
+class TestSessionThinkDecomposition(unittest.TestCase):
+    """会话头「思考」开关的生效值分解（会话 > agent > 全局）。
+
+    历史现象：界面只按「会话级 ?? 全局」渲染开关，agent 级把它设成「关」时仍显示勾选
+    ⇒ 用户以为思考开着、实际不产思考（agent-probes s_89d54f21）。故 get_session 需下发生效值。
+    """
+
+    def setUp(self):
+        fresh_config()
+        self.client = TestClient(main.app)
+
+    def _mk(self, agent_think=None, session_think="unset"):
+        ag = store.upsert_agent(models.AgentConfig(name="A", type="fake", think=agent_think))
+        tm = store.upsert_team(models.TeamConfig(name="T", agent_ids=[ag.id]))
+        pdir = TMP / "think_proj"
+        pdir.mkdir(parents=True, exist_ok=True)
+        pr = store.upsert_project(models.ProjectConfig(name="P", path=str(pdir), team_ids=[tm.id]))
+        s = store.create_session(str(pdir), "S", tm.id)
+        if session_think != "unset":
+            store.set_session_think(str(pdir), s["id"], session_think)
+        return pr.id, s["id"]
+
+    def _get(self, pid, sid):
+        return self.client.get(f"/api/session/{pid}/{sid}").json()
+
+    def test_agent_false_surfaces_as_effective_off(self):
+        """会话级未设 + agent 级 false ⇒ 生效值为关、来源 agent（这正是"勾着却不思考"的情形）。"""
+        pid, sid = self._mk(agent_think=False)
+        d = self._get(pid, sid)
+        self.assertIsNone(d["think_session"])
+        self.assertIs(d["think_effective"], False)
+        self.assertEqual(len(d["think_agents"]), 1)
+        self.assertEqual(d["think_agents"][0]["source"], "agent")
+        self.assertIs(d["think_agents"][0]["think"], False)
+
+    def test_session_level_overrides_agent(self):
+        """会话级为开时压过 agent 级 false（用户实测：agent 关着，会话开照样有思考）。"""
+        pid, sid = self._mk(agent_think=False, session_think=True)
+        d = self._get(pid, sid)
+        self.assertIs(d["think_session"], True)
+        self.assertIs(d["think_effective"], True)
+        self.assertIs(d["think_agents"][0]["think"], True)
+        self.assertEqual(d["think_agents"][0]["source"], "session")
+
+    def test_inherit_global_source(self):
+        """agent 级 None ⇒ 来源记为 global，生效值随全局（默认 True）。"""
+        pid, sid = self._mk(agent_think=None)
+        d = self._get(pid, sid)
+        self.assertEqual(d["think_agents"][0]["source"], "global")
+        self.assertIs(d["think_effective"], True)
+
+    def test_disagreeing_agents_effective_none(self):
+        """多 agent 取值不一致 ⇒ think_effective 为 None（前端显示「各 agent 不同」）。"""
+        a1 = store.upsert_agent(models.AgentConfig(name="A1", type="fake", think=False))
+        a2 = store.upsert_agent(models.AgentConfig(name="A2", type="fake", think=True))
+        tm = store.upsert_team(models.TeamConfig(name="T2", agent_ids=[a1.id, a2.id]))
+        pdir = TMP / "think_proj2"
+        pdir.mkdir(parents=True, exist_ok=True)
+        pr = store.upsert_project(models.ProjectConfig(name="P2", path=str(pdir), team_ids=[tm.id]))
+        s = store.create_session(str(pdir), "S2", tm.id)
+        d = self._get(pr.id, s["id"])
+        self.assertIsNone(d["think_effective"])
+        self.assertEqual({x["think"] for x in d["think_agents"]}, {False, True})
+
+    def test_no_team_falls_back_to_session_or_global(self):
+        """未绑定 team ⇒ think_agents 为空，生效值即「会话级 ?? 全局」。"""
+        ag = store.upsert_agent(models.AgentConfig(name="A", type="fake"))
+        pdir = TMP / "think_proj3"
+        pdir.mkdir(parents=True, exist_ok=True)
+        pr = store.upsert_project(models.ProjectConfig(name="P3", path=str(pdir), team_ids=[]))
+        s = store.create_session(str(pdir), "S3", None)
+        d = self._get(pr.id, s["id"])
+        self.assertEqual(d["think_agents"], [])
+        self.assertIs(d["think_effective"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

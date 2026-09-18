@@ -380,13 +380,35 @@ async def get_session(pid: str, sid: str):
     # 找不到 transcript（agent 不可连 / 全新会话）则保持本地不动，作为离线回退。
     _reconcile_with_cli(proj["path"], sid, s.get("agent_sessions", {}))
     s = store.read_session(proj["path"], sid)  # 重新读回对账后的最新消息
-    # 会话级「思考」开关的当前生效值：会话显式设置过用会话值，否则回退全局默认
-    # （前端据此初始化开关状态；切换时写入显式值）。兼容 #104 旧字段 ollama_think。
-    think = s.get("think")
-    if think is None:
-        think = s.get("ollama_think")
-    if think is None:
-        think = bool((store.get_settings()).get("think", True))
+    # 会话级「思考」开关：会话显式设置过用会话值，否则回退全局默认（前端据此初始化开关状态）。
+    # 兼容 #104 旧字段 ollama_think。
+    settings = store.get_settings()
+    think_session = s.get("think")
+    if think_session is None:
+        think_session = s.get("ollama_think")
+    think = think_session if think_session is not None else bool(settings.get("think", True))
+    # 逐 agent 的**生效值**（三级：会话 > agent > 全局）。会话头开关原先只反映「会话级 ?? 全局」，
+    # 若更具体的 agent 级把它设成「关」，界面仍显示勾选 ⇒ 用户误以为思考开着（实测 agent-probes
+    # s_89d54f21：会话级未设 + agent 级 false ⇒ 实际不带思考，界面却勾着）。这里把后端算好的
+    # 生效值与来源一并下发，前端据此显示真实状态。
+    think_agents: list[dict] = []
+    for _aid in ((store.get_team(s.get("team_id") or "") or {}).get("agent_ids") or []):
+        _a = store.get_agent(_aid)
+        if not _a:
+            continue
+        if think_session is not None:
+            _src = "session"
+        elif _a.get("think") is not None:
+            _src = "agent"
+        else:
+            _src = "global"
+        think_agents.append({"id": _aid, "name": _a.get("name", ""),
+                             "think": store.resolve_think(_a, s, settings), "source": _src})
+    if think_agents:
+        _vals = {bool(x["think"]) for x in think_agents}
+        think_effective = _vals.pop() if len(_vals) == 1 else None   # 各 agent 不一致时为 None
+    else:
+        think_effective = think   # 未绑定 team：生效值即「会话级 ?? 全局」
     return {
         "id": s["id"], "title": s.get("title", "会话"),
         "team_id": s.get("team_id", ""),
@@ -394,6 +416,10 @@ async def get_session(pid: str, sid: str):
         "messages": s.get("messages", []),
         "agent_sessions": s.get("agent_sessions", {}),
         "think": think,
+        # 思考三级开关的分解信息：会话级显式值 / 各 agent 生效值（含来源）/ 一致时的生效值
+        "think_session": think_session,
+        "think_agents": think_agents,
+        "think_effective": think_effective,
         # 待续接记录：某次发言被「中止」后尚未兑现 → 前端主按钮显示「继续」
         "pending_turn": s.get("pending_turn") or None,
         "exists": True,

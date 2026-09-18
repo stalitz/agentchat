@@ -317,6 +317,51 @@ setTimeout(async () => {
   dom.window.curSid = null; dom.window.curTeamLocked = false;
   dom.window.selectTeam('tm_dual');
 
+  // ---- 「思考」开关显示**生效值**（历史 bug：agent 级被设成关时，开关仍按"会话级 ?? 全局"
+  //      渲染成勾着 ⇒ 用户以为思考开着，实际不产思考。后端下发 think_session/think_agents/
+  //      think_effective 三件套，前端 applyThinkState 据此显示真实状态与来源）----
+  const realFetch2 = dom.window.fetch;
+  const thinkDetail = {
+    id: 's_t', title: '思考态', team_id: 'tm_dual', messages: [], agent_sessions: {}, exists: true,
+    think: true, think_session: null, think_effective: false,
+    think_agents: [{ id: 'ag_arch', name: '架构师', think: false, source: 'agent' }],
+  };
+  dom.window.fetch = function () {
+    return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(thinkDetail); } });
+  };
+  dom.window.openSession('s_t'); await tick();
+  const chkThink = doc.getElementById('chkThink');
+  const hintTh = doc.getElementById('thinkHint');
+  check(chkThink.checked === false, '会话级未设 + agent 级关 ⇒ 开关应显示生效值「关」（不再假装勾着）');
+  check(hintTh.textContent.indexOf('生效：关') >= 0, '提示应写「生效：关」，实际 ' + JSON.stringify(hintTh.textContent));
+  check(hintTh.className.indexOf('off') >= 0, '生效为关时提示应带 off 高亮类，实际 ' + JSON.stringify(hintTh.className));
+  check(hintTh.title.indexOf('agent 级') >= 0, 'tooltip 应写明来源（agent 级），实际 ' + JSON.stringify(hintTh.title));
+
+  // 会话级显式设过（开）→ 压过 agent 级 false
+  thinkDetail.think_session = true; thinkDetail.think_effective = true;
+  thinkDetail.think_agents = [{ id: 'ag_arch', name: '架构师', think: true, source: 'session' }];
+  dom.window.applyThinkState(thinkDetail);
+  check(chkThink.checked === true, '会话级为开时应压过 agent 级 false（勾选）');
+  check(hintTh.textContent.indexOf('本会话已设') >= 0, '会话级已设时提示应写「本会话已设」，实际 ' + JSON.stringify(hintTh.textContent));
+
+  // 各 agent 取值不一致 → 生效值未知，提示「各 agent 不同」，开关回退旧逻辑（think=true ⇒ 勾选）
+  thinkDetail.think_session = null; thinkDetail.think_effective = null; thinkDetail.think = true;
+  thinkDetail.think_agents = [
+    { id: 'ag_arch', name: '架构师', think: false, source: 'agent' },
+    { id: 'ag_impl', name: '实现者', think: true, source: 'global' },
+  ];
+  dom.window.applyThinkState(thinkDetail);
+  check(hintTh.textContent.indexOf('各 agent 不同') >= 0, '多 agent 不一致时应提示「各 agent 不同」，实际 ' + JSON.stringify(hintTh.textContent));
+  check(chkThink.checked === true, '各 agent 不一致时开关回退「会话级 ?? 全局」（此处全局开 ⇒ 勾选）');
+
+  // 切换会话级开关后：提示应立刻变成「本会话已设」（不再让 agent 级决定显示）
+  thinkDetail.think_session = true; thinkDetail.think_effective = true;
+  dom.window.applyThinkState(thinkDetail);
+  dom.window.toggleThink(false); await tick();
+  check(chkThink.checked === false, 'toggleThink(false) 后开关应为未勾选');
+  check(hintTh.textContent.indexOf('本会话已设') >= 0, 'toggleThink 成功后提示应刷新为「本会话已设」，实际 ' + JSON.stringify(hintTh.textContent));
+  dom.window.fetch = realFetch2;
+
   // ---- 过滤后右栏应随中栏切换（用户反馈：过滤中栏后会话栏没一起变）----
   dom.window.curProjSessions = [
     { id: 's_a', title: '甲A', team_id: 'tm_dual', team_name: '双核Team', message_count: 1 },
