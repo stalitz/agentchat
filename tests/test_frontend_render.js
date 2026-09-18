@@ -731,6 +731,35 @@ setTimeout(async () => {
     dom.window.composeClear();
     check(hitlPanel.style.display === 'none', '切会话（composeClear）应关闭残留的 HITL 面板');
 
+    // ---- 气泡颜色按「发言者名」解析 agent 类型；名字不在配置里 → 中性灰 unknown（不伪装成 claude 蓝）----
+    // 历史 bug：导入/改名过的历史会话 speaker 名对不上配置，回落 claude-code，
+    // 导致 codex 会话显示成 claude 蓝气泡、fake 陪练也显示成蓝的，看上去像 claude 在说话。
+    const chatEl2 = doc.getElementById('chat');
+    chatEl2.innerHTML = '';
+    dom.window.renderHistoryEntry({ round: 0, speaker: '架构师', role: '架构师', content: '先定义接口', ts: '' });
+    dom.window.renderHistoryEntry({ round: 1, speaker: '实现者', role: '实现者', content: '我来写', ts: '' });
+    dom.window.renderHistoryEntry({ round: 2, speaker: 'H-Probe Codex', role: '', content: '旧探针名（配置里已无此 agent）', ts: '' });
+    const bubs = Array.from(chatEl2.querySelectorAll('.bubble'));
+    check(bubs.length === 3, '应渲染 3 个气泡，实际 ' + bubs.length);
+    check(bubs[0] && bubs[0].classList.contains('claude-code'), '名字命中 claude-code agent → 气泡类 claude-code');
+    check(bubs[1] && bubs[1].classList.contains('codex'), '名字命中 codex agent → 气泡类 codex（绿）');
+    check(bubs[2] && bubs[2].classList.contains('unknown') && !bubs[2].classList.contains('claude-code'),
+      '名字不在配置里 → 气泡类 unknown，不得回落 claude-code，实际 ' + (bubs[2] && bubs[2].className));
+    check(bubs[1] && cs(bubs[1]).backgroundColor === 'rgb(230, 246, 236)',
+      'codex 气泡背景应为绿(#e6f6ec)，实际 ' + (bubs[1] && cs(bubs[1]).backgroundColor));
+    check(bubs[2] && cs(bubs[2]).backgroundColor === 'rgb(242, 243, 247)',
+      'unknown 气泡背景应为中性灰(#f2f3f7)，实际 ' + (bubs[2] && cs(bubs[2]).backgroundColor));
+    check(bubs[2] && cs(bubs[2]).backgroundColor !== cs(bubs[0]).backgroundColor,
+      'unknown 气泡颜色必须与 claude-code 明显不同（避免误读成 claude 发言）');
+    // 实时流同理：turn_start 未带 atype 时不得默认成 claude 蓝
+    chatEl2.innerHTML = '';
+    dom.window.cur = null; dom.window.agentNameColor = {};
+    dom.window.handleEvent({ type: 'turn_start', agent: '未登记的发言者', sid: 's_b' });
+    dom.window.handleEvent({ type: 'token', agent: '未登记的发言者', text: '实时流正文', sid: 's_b' });
+    const live = chatEl2.querySelector('.bubble');
+    check(live && live.classList.contains('unknown'),
+      '实时流：turn_start 未带 atype 时气泡应为 unknown，实际 ' + (live && live.className));
+
     if (!ok) { console.error('前端渲染回归测试失败'); process.exit(1); }
     console.log('前端渲染回归测试通过 ✓');
     process.exit(0);

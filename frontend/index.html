@@ -125,6 +125,8 @@
   .bubble.claude-code { background:#eaf1ff; border:1px solid #cfe0ff; }
   .bubble.codex { background:#e6f6ec; border:1px solid #c7ecd4; }
   .bubble.fake { background:#fff4e6; border:1px solid #ffd8a8; }
+  /* 未知发言者（名字不在配置里，多见于导入的历史会话）：中性灰，绝不伪装成 claude 蓝 */
+  .bubble.unknown { background:#f2f3f7; border:1px solid #dcdfe8; }
   .bubble.human { background:#fff2dc; border:1px solid #ffe0a8; }
   .bubble.sys { background:#f0f1f3; border:1px solid var(--line); color:var(--muted); font-size:12px; max-width:90%; }
   /* 单气泡内子块（方案 B：一个 agent 回合 = 一个气泡，内部按 思考→调用工具→工具结果→正文 顺序） */
@@ -162,6 +164,8 @@
   .turn-block.thinking.codex > summary .th-title { color:#2f9e63; }
   .turn-block.thinking.fake { border-left-color:#ffc078; }
   .turn-block.thinking.fake > summary .th-title { color:#e8851a; }
+  .turn-block.thinking.unknown { border-left-color:#c8ccd6; }
+  .turn-block.thinking.unknown > summary .th-title { color:#6b6b76; }
   /* 工具调用 / 结果配色 */
   .turn-block.tool-call { border-left-color:#8a8ad1; }
   .turn-block.tool-call > summary { color:#5b5bb0; }
@@ -603,7 +607,7 @@ function handleEvent(ev) {
       break;
     case 'error': addRow('sys', '错误', ev.text); break;
     case 'turn_start':
-      agentNameColor[ev.agent] = ev.atype || 'claude-code';
+      agentNameColor[ev.agent] = ev.atype || 'unknown';
       curTurnAgent = ev.agent;
       // 标记会话正在跑：任何入口（开始 / 继续 / 介入触发）只要后端开始流式发 turn_start 即视为
       // 在跑，保证 run_end 的 250ms 重载守卫生效，不会把续接首个 agent 刚渲染的内容抹掉。
@@ -624,21 +628,21 @@ function handleEvent(ev) {
       break;
     case 'token':
       curTurnAgent = ev.agent || curTurnAgent;
-      appendToken(ev.agent, ev.text, agentNameColor[ev.agent] || 'claude-code');
+      appendToken(ev.agent, ev.text, agentNameColor[ev.agent] || 'unknown');
       break;
     case 'tool_use':
       curTurnAgent = ev.agent || curTurnAgent;
-      appendToolCall(ev.name, ev.input, agentNameColor[ev.agent] || 'claude-code');
+      appendToolCall(ev.name, ev.input, agentNameColor[ev.agent] || 'unknown');
       break;
     case 'tool_result':
       curTurnAgent = ev.agent || curTurnAgent;
-      appendToolResult(ev.is_error, ev.content, agentNameColor[ev.agent] || 'claude-code');
+      appendToolResult(ev.is_error, ev.content, agentNameColor[ev.agent] || 'unknown');
       break;
     case 'turn_end':
       hideLoading();  // 防御：确保加载占位被撤（内容流正常时已在 thinking/token 撤掉）
       // 只有思考、无正文时也要建气泡（承载思考子块）
       if (!cur && curThinking && curThinkingBody && curThinkingBody.textContent.trim()) {
-        openTurn(curTurnAgent || ev.agent || 'Agent', agentNameColor[curTurnAgent || ev.agent] || 'claude-code');
+        openTurn(curTurnAgent || ev.agent || 'Agent', agentNameColor[curTurnAgent || ev.agent] || 'unknown');
       }
       if (cur) {
         // 所有正文块渲染为 markdown（含被工具块打断后新建的后续正文块）
@@ -1580,7 +1584,7 @@ function toggleThink(on) {
 function openTurn(name, atype, ts, interrupted) {
   var row = document.createElement('div'); row.className = 'row';
   var b = document.createElement('div');
-  b.className = 'bubble ' + (atype || 'claude-code') + (interrupted ? ' interrupted' : '');
+  b.className = 'bubble ' + (atype || 'unknown') + (interrupted ? ' interrupted' : '');
   b.innerHTML = '<div class="who">' + esc(name) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '')
     + (interrupted ? '<span class="abort-tag">已中止（本次发言作废）</span>' : '')
     + '</div><div class="turn-body"></div>';
@@ -1662,7 +1666,9 @@ function toolStatusCnFor(speaker, round) {
 function renderHistoryEntry(h) {
   if (h.speaker === 'system') { addRow('sys', h.role || '系统', h.content || '', h.ts); return; }
   if (h.speaker === 'human') { addRow('human', h.role || '人工介入', h.content || '', h.ts); return; }
-  var type = cfg_agents_by_name(h.speaker) || 'claude-code';
+  // 名字不在配置里 → 中性灰（unknown），不再回落 claude-code：
+  // 否则导入/改名过的历史会话会被染成 claude 蓝，看上去像 claude 在说话。
+  var type = cfg_agents_by_name(h.speaker) || 'unknown';
   var body = openTurn(h.speaker, type, h.ts, !!h.interrupted);
   // 时间线渲染：优先按后端产出的有序 blocks（思考/正文/工具调用/工具结果 按发生顺序），
   // 旧消息无 blocks 时回退到固定顺序（思考 → 工具调用 → 工具结果 → 正文）。
