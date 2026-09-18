@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from tests.base import models, orch, store
-from backend.orchestrator import _clean_answer, _extract_text_tool_call, _is_end_discussion
+from backend.orchestrator import _clean_answer, _extract_text_tool_call, _is_end_discussion, _is_human_input
 
 
 class Recorder:
@@ -1230,3 +1230,37 @@ class TestAbortAndResume(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHumanInputDetection(unittest.TestCase):
+    """HITL：request_human_input 工具的检测（agent 调它 → 编排层暂停整场等人）。
+
+    锁定：_is_human_input 对干净名与 MCP 原名都认；_extract_text_tool_call 对
+    request_human_input 的文本 json 兜底（给 deepseek 等不走网关的模型）能解析出
+    question + options。
+    """
+
+    def test_is_human_input_both_names(self):
+        self.assertTrue(_is_human_input("request_human_input"))
+        self.assertTrue(_is_human_input("mcp__terminate-signal__request_human_input"))
+        # 非人工介入工具不认
+        self.assertFalse(_is_human_input("end_discussion"))
+        self.assertFalse(_is_human_input("mcp__terminate-signal__end_discussion"))
+        self.assertFalse(_is_human_input("bash"))
+
+    def test_extract_text_tool_call_human_input(self):
+        # 模型把调用写成 prompt 约定的文本 json（代码围栏包裹）时，兜底解析应识别 request_human_input
+        s = _extract_text_tool_call(
+            '```json\n{"tool":"request_human_input","question":"选哪个方案？","options":["方案A","方案B"]}\n```')
+        self.assertIsNotNone(s)
+        self.assertEqual(s["name"], "request_human_input")
+        self.assertEqual(s["input"].get("question"), "选哪个方案？")
+        self.assertEqual(s["input"].get("options"), ["方案A", "方案B"])
+
+    def test_extract_text_tool_call_human_input_no_options(self):
+        s = _extract_text_tool_call(
+            '```json\n{"tool":"request_human_input","question":"请澄清任务范围"}\n```')
+        self.assertIsNotNone(s)
+        self.assertEqual(s["name"], "request_human_input")
+        self.assertEqual(s["input"].get("question"), "请澄清任务范围")
+        self.assertEqual(s["input"].get("options"), [])

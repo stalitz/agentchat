@@ -31,6 +31,28 @@ INPUT_SCHEMA = {
     "required": ["reason"],
 }
 
+# 第二个工具：请求人工介入（HITL）。agent 需要用户从多方案中选择或澄清任务时调用，
+# 编排层据此暂停整场、把问题推前端、等用户回答后作为下一条 delta 续跑。
+TOOL2_NAME = "request_human_input"
+TOOL2_DESC = (
+    "当你需要用户（人类）从多个方案中选择、或需要澄清任务/需求时才调用。"
+    "调用后系统会暂停当前多 agent 讨论并等待人工介入——请勿在文本里直接反问对方 agent，"
+    "因为对方会替你回答、导致结果偏离用户意图。question 写要问用户的问题；"
+    "options 可列出候选项（前端渲染为可点选按钮，用户也可自行输入）。"
+)
+TOOL2_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question": {"type": "string", "description": "要问用户的问题"},
+        "options": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "可选候选项，前端渲染为可点选按钮",
+        },
+    },
+    "required": ["question"],
+}
+
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "terminate-signal", "version": "0.2.0"}
 
@@ -38,6 +60,16 @@ SERVER_INFO = {"name": "terminate-signal", "version": "0.2.0"}
 def _handle_call(params: dict) -> dict:
     args = params.get("arguments") or {}
     name = params.get("name", "")
+    if name == TOOL2_NAME:
+        question = str(args.get("question", "") or "")
+        # 无状态确认：真实暂停/续跑由编排层执行；本服务仅提供工具调用通道。
+        return {
+            "content": [{"type": "text", "text": (
+                f"【工具回执】你的 request_human_input 调用已收到（问题：{question}）。"
+                "系统将暂停并等待人工介入；人工回答将作为后续用户输入，你无需自行猜测答案。"
+            )}],
+            "isError": False,
+        }
     if name != TOOL_NAME:
         return {
             "content": [{"type": "text", "text": f"未知工具: {name}"}],
@@ -148,11 +180,18 @@ def main() -> int:
             _write_frame({
                 "jsonrpc": "2.0", "id": msg_id,
                 "result": {
-                    "tools": [{
-                        "name": TOOL_NAME,
-                        "description": TOOL_DESC,
-                        "inputSchema": INPUT_SCHEMA,
-                    }],
+                    "tools": [
+                        {
+                            "name": TOOL_NAME,
+                            "description": TOOL_DESC,
+                            "inputSchema": INPUT_SCHEMA,
+                        },
+                        {
+                            "name": TOOL2_NAME,
+                            "description": TOOL2_DESC,
+                            "inputSchema": TOOL2_SCHEMA,
+                        },
+                    ],
                 },
             })
         elif method == "tools/call":

@@ -968,14 +968,16 @@ class AgentRuntime:
                     o = json.loads(line)
                 except Exception:
                     continue
-                # 动态工具调用（含 end_discussion 经 client 路由的罕见情况）：先捕获投票，再自动应答
+                # 动态工具调用（含 end_discussion / request_human_input 经 client 路由的罕见情况）：
+                # 先捕获为 _tool_use 供编排层识别，再由其默认 item/tool/call 空成功应答让 codex 本轮结束。
                 if o.get("method") == "item/tool/call":
                     it = o.get("params") or {}
                     tool = str(it.get("tool") or "")
-                    if "end_discussion" in tool:
+                    if "end_discussion" in tool or "request_human_input" in tool:
+                        base = tool.split("__")[-1] if "__" in tool else tool
                         try:
                             await self._as_queue.put(
-                                {"_tool_use": {"name": "end_discussion",
+                                {"_tool_use": {"name": base,
                                               "input": _codex_parse_args(it.get("arguments"))}})
                         except Exception:
                             pass

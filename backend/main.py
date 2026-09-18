@@ -63,7 +63,7 @@ clients: set[WebSocket] = set()
 sessions: dict[str, Session] = {}
 
 ACTION_CN = {"stop": "停止", "pause": "暂停", "resume": "继续", "inject": "介入",
-             "abort": "中止", "resume_turn": "继续"}
+             "abort": "中止", "resume_turn": "继续", "human_input": "人工介入"}
 
 
 async def broadcast(event: dict):
@@ -303,7 +303,7 @@ async def ws_endpoint(ws: WebSocket):
             elif action == "resume_turn":
                 # turn 级续接：不需要议题输入，兑现「待续接」记录
                 await handle_resume_turn(msg)
-            elif action in ("stop", "pause", "resume", "inject"):
+            elif action in ("stop", "pause", "resume", "inject", "human_input"):
                 # 按 session_id 路由到对应会话（只操作目标会话，其他会话并行不受影响）
                 sid = msg.get("session_id")
                 s = sessions.get(sid) if sid else None
@@ -313,6 +313,17 @@ async def ws_endpoint(ws: WebSocket):
                         "text": f"当前没有正在运行的会话，「{ACTION_CN.get(action, action)}」无效。"
                                 "请先点「开始讨论」/「发送」。",
                     })
+                elif action == "human_input":
+                    # 只接受「编排层正暂停等人」时的回答，避免误置位导致下次暂停被陈旧回答瞬间通过
+                    if not getattr(s, "_human_input_request", None):
+                        await broadcast({"type": "error", "text": "当前没有等待人工介入的问题。"})
+                    else:
+                        text = (msg.get("text") or "").strip()
+                        if not text:
+                            await broadcast({"type": "error", "text": "回答内容为空。"})
+                        else:
+                            s.provide_human_input(text)
+                            await broadcast({"type": "system", "msg": "已提交人工回答，讨论将继续。"})
                 elif s.mode == "chat":
                     await broadcast({
                         "type": "error",

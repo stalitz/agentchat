@@ -209,6 +209,28 @@
   .fs-enter { color:var(--muted); font-size:12px; }
   .fs-empty { padding:10px; color:var(--muted); font-size:13px; }
 
+  /* ---- HITL：agent 请求人工介入面板 ---- */
+  .hitl-panel { margin-top:10px; padding:12px 14px; border:1px solid var(--border);
+                border-left:3px solid var(--codex); border-radius:10px;
+                background:rgba(26, 161, 110, 0.06); }
+  .hitl-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .hitl-badge { display:inline-block; background:var(--codex); color:#fff; font-size:12px;
+                font-weight:700; padding:3px 10px; border-radius:12px; }
+  .hitl-agent { font-size:13px; font-weight:600; color:var(--fg); }
+  .hitl-q { font-size:14px; color:var(--txt); line-height:1.5; margin-bottom:8px;
+            white-space:pre-wrap; word-break:break-word; }
+  .hitl-opts { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:8px; }
+  .hitl-opt { background:#fff; border:1px solid var(--border); color:var(--fg);
+              font-size:13px; padding:6px 13px; border-radius:16px; cursor:pointer;
+              transition:background .12s, border-color .12s; }
+  .hitl-opt:hover { background:#e3f5ea; border-color:var(--codex); }
+  .hitl-panel textarea { width:100%; box-sizing:border-box; resize:vertical; min-height:54px;
+                         font-size:14px; padding:9px 11px; border:1px solid var(--line);
+                         border-radius:9px; background:#fff; color:var(--txt); }
+  .hitl-panel textarea:focus { outline:none; border-color:var(--codex); box-shadow:0 0 0 3px rgba(26,161,110,.15); }
+  .hitl-foot { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:9px; }
+  .hitl-foot .hint { margin:0; }
+
   /* ---- 现代设置面板（全局设置）---- */
   .set-head { padding:20px 22px 14px; border-bottom:1px solid var(--line); background:linear-gradient(180deg,#fafbff,#fff); }
   .set-title { font-size:18px; font-weight:700; color:var(--txt); }
@@ -372,6 +394,19 @@
       <div id="injectRow" style="margin-top:6px; position:relative;">
         <textarea id="inject" style="width:100%; resize:vertical; min-height:64px; padding:8px 78px 8px 8px; box-sizing:border-box;" rows="2" placeholder="人工介入：讨论进行中插入一条人类消息（下一轮 agent 基于它继续）"></textarea>
         <button class="primary" onclick="doInject()" style="position:absolute; right:8px; bottom:8px; min-width:56px; border-radius:16px; padding:6px 14px; font-weight:600;">介入</button>
+      </div>
+      <div id="hitlPanel" class="hitl-panel" style="display:none;">
+        <div class="hitl-head">
+          <span class="hitl-badge">需要你介入</span>
+          <span id="hitlAgent" class="hitl-agent"></span>
+        </div>
+        <div id="hitlQuestion" class="hitl-q"></div>
+        <div id="hitlOptions" class="hitl-opts"></div>
+        <textarea id="hitlAnswer" rows="2" placeholder="在此输入你的回答（也可先点选上方选项，再补充）"></textarea>
+        <div class="hitl-foot">
+          <span class="hint">讨论已暂停，等待你的回答后继续</span>
+          <button class="primary" onclick="submitHumanInput()" style="border-radius:16px; padding:6px 16px; font-weight:600;">提交回答</button>
+        </div>
       </div>
     </div>
   </main>
@@ -561,6 +596,11 @@ function handleEvent(ev) {
       }, 250);
       break;
     case 'human': addRow('human', ev.role || '人工介入', ev.text); break;
+    case 'human_input_required':
+      // agent 调 request_human_input → 编排层暂停整场等人。只处理当前会话：
+      // 上方 guard 已把非当前会话事件（含本类）丢弃，避免串场污染。
+      showHitlPanel(ev);
+      break;
     case 'error': addRow('sys', '错误', ev.text); break;
     case 'turn_start':
       agentNameColor[ev.agent] = ev.atype || 'claude-code';
@@ -1174,8 +1214,38 @@ function doInject() {
   WS.send(JSON.stringify({ action: 'inject', text: x, session_id: curSid }));
   document.getElementById('inject').value = '';
 }
+// HITL：agent 请求人工介入 → 弹出回答面板
+function showHitlPanel(ev) {
+  document.getElementById('hitlAgent').textContent = ev.agent ? ('· ' + ev.agent) : '';
+  document.getElementById('hitlQuestion').textContent = ev.question || '(无具体问题，请自由回复)';
+  var opts = ev.options || [];
+  var box = document.getElementById('hitlOptions');
+  box.innerHTML = '';
+  opts.forEach(function (o) {
+    var b = document.createElement('button');
+    b.className = 'hitl-opt';
+    b.textContent = o;
+    b.onclick = function () {
+      var ta = document.getElementById('hitlAnswer');
+      ta.value = o;
+      ta.focus();
+    };
+    box.appendChild(b);
+  });
+  document.getElementById('hitlAnswer').value = '';
+  document.getElementById('hitlPanel').style.display = 'block';
+  document.getElementById('hitlAnswer').focus();
+}
+function submitHumanInput() {
+  var x = document.getElementById('hitlAnswer').value.trim();
+  if (!x) { setStatus('回答为空', false); return; }
+  WS.send(JSON.stringify({ action: 'human_input', text: x, session_id: curSid }));
+  document.getElementById('hitlPanel').style.display = 'none';
+  document.getElementById('hitlAnswer').value = '';
+}
 function composeClear() {
   chat.innerHTML = ''; cur = null;
+  var hp = document.getElementById('hitlPanel'); if (hp) hp.style.display = 'none';
   document.getElementById('ctxTitle').textContent = '未选择会话';
   document.getElementById('ctxMeta').textContent = '';
   curMsgCount = 0; refreshSendBtn();
@@ -2141,6 +2211,10 @@ document.getElementById('task').addEventListener('input', refreshSendBtn);
 // 介入框：Enter 直接介入；Shift+Enter 换行
 document.getElementById('inject').addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doInject(); }
+});
+// HITL 回答框：Enter 直接提交；Shift+Enter 换行
+document.getElementById('hitlAnswer').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitHumanInput(); }
 });
 
 function closeFs() { document.getElementById('fsModal').classList.remove('show'); }

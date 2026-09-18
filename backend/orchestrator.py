@@ -42,6 +42,12 @@ def _is_end_discussion(name) -> bool:
     return isinstance(name, str) and name.endswith("end_discussion")
 
 
+def _is_human_input(name) -> bool:
+    """判定是否为 request_human_input 调用（HITL 人工介入请求）——兼容干净名与
+    MCP 原名（mcp__terminate-signal__request_human_input）。"""
+    return isinstance(name, str) and "request_human_input" in name
+
+
 # 「中止 → 继续」时发给被中止 agent 的提示：那半截内容已作废，必须显式告知别再往下接，
 # 否则它会在 CLI 会话里接着自己的半句继续说（历史上下文里那半截仍在），出现「从中间续写」。
 _RESUME_NOTICE = (
@@ -58,15 +64,16 @@ def _now_str() -> str:
 
 def _extract_text_tool_call(full: str) -> dict | None:
     """兜底解析：模型未拿到工具 schema 时（如 deepseek 走云端直连、不经本地网关），
-    会把 end_discussion 调用写成 prompt 指令约定的文本 json：
+    会把 end_discussion / request_human_input 调用写成 prompt 指令约定的文本 json：
 
         ```json
         {"tool": "end_discussion", "reason": "..."}
+        {"tool": "request_human_input", "question": "...", "options": ["A", "B"]}
         ```
 
-    编排层解析后并入 tool_uses，让终止状态机对两种表达（真 tool_use 块 / 文本 json）
+    编排层解析后并入 tool_uses，让终止/人工介入状态机对两种表达（真 tool_use 块 / 文本 json）
     行为一致——否则 deepseek 的 json 不被识别、终止永不收敛、只能靠轮次上限强停。
-    返回 {"name": "end_discussion", "input": {"reason": ...}} 或 None。
+    返回 {"name": ..., "input": {...}} 或 None。
     """
     if not full:
         return None
@@ -75,11 +82,21 @@ def _extract_text_tool_call(full: str) -> dict | None:
             data = json.loads(m.group(1))
         except (ValueError, TypeError):
             continue
-        if isinstance(data, dict) and data.get("tool") == "end_discussion":
+        tool = data.get("tool")
+        if tool == "end_discussion":
             reason = data.get("reason", "")
             if not isinstance(reason, str):
                 reason = str(reason) if reason is not None else ""
             return {"name": "end_discussion", "input": {"reason": reason}}
+        if tool == "request_human_input":
+            question = data.get("question", "")
+            if not isinstance(question, str):
+                question = str(question) if question is not None else ""
+            opts = data.get("options") or []
+            if not isinstance(opts, list):
+                opts = []
+            return {"name": "request_human_input",
+                    "input": {"question": question, "options": opts}}
     return None
 
 
@@ -162,6 +179,11 @@ class Session:
         # （立论轮只在会话真正第一次开口时出现，见 _is_opening_turn）。
         self._resumed = False
         self.inject_queue: asyncio.Queue = asyncio.Queue()
+        # HITL 人工介入：agent 调 request_human_input 时编排层暂停整场、等用户回答。
+        # human_input_event 初始未置位（await 即阻塞），provide_human_input 置位并存入回答。
+        self.human_input_event = asyncio.Event()
+        self._human_input_request = None   # {question, options}：待用户回答的问题
+        self._human_input_answer = None    # str：用户回答
         self.running = False
         # end_discussion 终止状态机（FR5.3b 多数同意）：
         # - terminate_proposed_by：首个提议方（用于 prompt 提示「谁先提的」）
@@ -264,6 +286,22 @@ class Session:
     async def inject(self, text: str):
         await self.inject_queue.put(text)
 
+    def provide_human_input(self, text: str):
+        """前端交付人工介入的回答：存回答并置位 human_input_event，唤醒暂停中的编排层。"""
+        self._human_input_answer = text
+        self.human_input_event.set()
+
+    async def _pause_for_human_input(self, agent):
+        """检测到 request_human_input 后：广播问题给前端、阻塞等用户回答、落盘回答。"""
+        req = self._human_input_request or {}
+        await self._emit(type="human_input_required", agent=agent.name,
+                         question=req.get("question", ""), options=req.get("options") or [])
+        await self.human_input_event.wait()
+        self.human_input_event.clear()
+        answer = (self._human_input_answer or "").strip()
+        if answer:
+            await self._record_human(answer, "人工回答")
+
     # ---------------- prompt ----------------
     def _render_slot(self, slot: str, **kw) -> str:
         """渲染提示词模板槽位：配置模板优先，缺省回退内置默认；<name> 占位符 replace 替换。"""
@@ -350,6 +388,8 @@ class Session:
             else:
                 parts.append("（请基于我们之前的对话继续）")
             parts.append("请以对话方式直接回复。这是人机对话，不要调用 end_discussion 工具或输出其调用文本（辩论模式专用）。")
+            parts.append("当你需要我（用户）从多个方案中选择、或需要澄清任务时，调用 request_human_input 工具"
+                         "（而非在文本里反问）——我会收到问题并回答，讨论随之继续。")
             return "\n\n".join(parts)
 
         # 多 agent 辩论（FR5.3b 子项2）：回传「本方上次发言之后的全部他人发言」（按发生顺序），
@@ -451,6 +491,11 @@ class Session:
                     agent=agent.name,
                     turn=round_i // len(self.agents) + 1, max_rounds=self.max_rounds,
                 ))
+        # 人工介入提示：需要用户从多方案中选、或需澄清任务时，调 request_human_input 工具，
+        # 而非在文本里反问对方 agent——辩论中对方会替你回答，导致结果偏离用户意图。
+        parts.append("当你需要用户从多个方案中选择、或需要澄清任务时，调用 request_human_input 工具"
+                     "（而非在文本里反问对方 agent）——本场是多人辩论，对方 agent 会替你回答你的反问，"
+                     "导致结果偏离用户意图；调用后系统会暂停并等待用户回答。")
         return "\n\n".join(parts)
 
     # ---------------- 单轮执行（两种模式共用） ----------------
@@ -599,6 +644,17 @@ class Session:
             if tool_use_ts is None:
                 tool_use_ts = _now_str()   # 文本表达无独立时间戳，以解析时刻近似
             tool_uses.append(text_tool)
+        # request_human_input（HITL 人工介入）：记录待问问题，_debate/_chat_turn 据此暂停整场等人。
+        # 取最后一个调用（避免多调用时取错）；不中止本轮——发言正常落盘，由调用方续跑。
+        if not self._human_input_request:
+            for tu in reversed(tool_uses):
+                if isinstance(tu, dict) and _is_human_input(tu.get("name")):
+                    inp = tu.get("input") or {}
+                    self._human_input_request = {
+                        "question": str(inp.get("question", "") or ""),
+                        "options": inp.get("options") or [],
+                    }
+                    break
         # end_discussion 终止状态机（编排层权威判定）——必须先于 errors 检查：
         # 工具由网关注入、claude 侧无对应实现，模型调用后 claude 会因「未知工具」报错退出；
         # 若先查 errors 会把工具轮误判为失败而中止。工具轮的错误应忽略（意图已被捕获）。
@@ -799,6 +855,16 @@ class Session:
             if text:
                 await self._record_human(text, "用户")
             await self._run_turn(self.agents[0], len(self.history), text or None)
+        # HITL 人工介入（chat 模式）：agent 调 request_human_input → 暂停等人 → 同 agent 续跑。
+        # while 支持连续多次提问；被停止/中止则退出。
+        while self._human_input_request:
+            await self._pause_for_human_input(self.agents[0])
+            if self.stop_event.is_set() or self._abort_requested:
+                break
+            answer = self._human_input_answer or ""
+            self._human_input_request = None
+            self._human_input_answer = None
+            await self._run_turn(self.agents[0], len(self.history), answer)
         # 失败时 _run_turn 已落 system 错误消息并广播 error；单 agent 本轮即结束，无需额外处理
         await self._emit(type="run_end", mode="chat", aborted=self._abort_requested)
 
@@ -846,6 +912,18 @@ class Session:
             current = self.agents[round_i % len(self.agents)]
             full, errors = await self._run_turn(current, round_i, pending_inject)
             pending_inject = None
+
+            # HITL 人工介入：agent 调 request_human_input → 暂停整场等人，
+            # 回答作为下一条 delta 由「发起提问的 agent」续跑（round_i 不增，不消耗额外轮次）。
+            # 须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获不应中止。
+            if self._human_input_request:
+                await self._pause_for_human_input(current)
+                if self.stop_event.is_set() or self._abort_requested:
+                    break
+                pending_inject = self._human_input_answer or ""
+                self._human_input_request = None
+                self._human_input_answer = None
+                continue  # 同 agent 续跑（round_i 保持不变）
 
             # 发言被中止：整场停下（不推进 round_i、不喂给下一位），等「继续」由同一 agent 重说。
             # 中止 ≠ 停止：停止是「跑完当前发言不再开下一轮」，中止是当场作废这次发言。

@@ -695,6 +695,42 @@ setTimeout(async () => {
     dom.window.addRow('human', '我', '新任务');
     check(chatEl.scrollTop === 3000, '自己发消息应强制回到底部，实际 ' + chatEl.scrollTop);
 
+    // ---- HITL：agent 请求人工介入面板（request_human_input → 暂停等人）----
+    const hitlPanel = doc.getElementById('hitlPanel');
+    check(hitlPanel.style.display === 'none', 'HITL 面板默认应隐藏');
+    // 非当前会话的请求：不应弹面板，也不应泄漏进当前聊天区（并行会话互不污染）
+    dom.window.curSid = 's_b';
+    dom.window.handleEvent({ type: 'human_input_required', sid: 's_other', agent: '架构师',
+      question: '选哪个方案？', options: ['方案A', '方案B'] });
+    check(hitlPanel.style.display === 'none', '非当前会话的 human_input_required 不应弹面板');
+    check(doc.getElementById('chat').textContent.indexOf('选哪个方案') < 0, '非当前会话请求不得泄漏进当前聊天区');
+    // 当前会话请求：弹面板 + 渲染提问 agent / 问题 / 选项
+    dom.window.handleEvent({ type: 'human_input_required', sid: 's_b', agent: '架构师',
+      question: '选哪个方案？', options: ['方案A', '方案B'] });
+    check(hitlPanel.style.display === 'block', '当前会话 human_input_required 应弹出 HITL 面板');
+    check(doc.getElementById('hitlAgent').textContent.indexOf('架构师') >= 0, '面板应显示提问 agent 名');
+    check(doc.getElementById('hitlQuestion').textContent.indexOf('选哪个方案') >= 0, '面板应显示问题文本');
+    const optBtns = doc.getElementById('hitlOptions').querySelectorAll('.hitl-opt');
+    check(optBtns.length === 2, '面板应按 options 渲染 2 个可点选按钮，实际 ' + optBtns.length);
+    // 点选选项 → 回填回答框
+    optBtns[0].click();
+    check(doc.getElementById('hitlAnswer').value === '方案A', '点选选项应回填到回答框，实际 ' + JSON.stringify(doc.getElementById('hitlAnswer').value));
+    // 捕获 WS 发送，提交回答
+    const captured = [];
+    dom.window.WS.send = function (m) { captured.push(m); };
+    dom.window.submitHumanInput();
+    check(captured.length === 1, '提交应发送 1 条 WS 消息，实际 ' + captured.length);
+    let sent = null; try { sent = JSON.parse(captured[0]); } catch (e) {}
+    check(sent && sent.action === 'human_input', '提交 WS 动作应为 human_input，实际 ' + (sent && sent.action));
+    check(sent && sent.text === '方案A', '提交内容应为回填的答案，实际 ' + (sent && sent.text));
+    check(sent && sent.session_id === 's_b', '提交应带当前会话 id，实际 ' + (sent && sent.session_id));
+    check(hitlPanel.style.display === 'none', '提交回答后面板应隐藏');
+    // 切会话（composeClear）应关闭残留面板
+    dom.window.handleEvent({ type: 'human_input_required', sid: 's_b', agent: '实现者', question: '另一个问题', options: [] });
+    check(hitlPanel.style.display === 'block', '再次收到当前会话请求应重新弹面板');
+    dom.window.composeClear();
+    check(hitlPanel.style.display === 'none', '切会话（composeClear）应关闭残留的 HITL 面板');
+
     if (!ok) { console.error('前端渲染回归测试失败'); process.exit(1); }
     console.log('前端渲染回归测试通过 ✓');
     process.exit(0);
