@@ -48,6 +48,24 @@ def _is_human_input(name) -> bool:
     return isinstance(name, str) and "request_human_input" in name
 
 
+# 「议题明显要用户拍板」的措辞：命中且本场尚未问过用户时，首个发言者必须先问后答（hitl_opening）。
+# 背景（2026-09-19 实测）：议题写成「请给多套方案让我选」时，两个 gemma 都理解成「把方案摆出来
+# 即可」，各自假设条件直接开讲，用户要的「按我的情况选一套」反而没发生。命中词表刻意放宽：
+# 漏判的代价（又一场自说自话）远大于误判的代价（多问一个问题）。
+_HITL_TASK_HINTS = (
+    "多套", "多种方案", "几个方案", "两套", "三套", "备选", "方案让我", "让我选", "帮我选",
+    "让我看看", "给我方案", "哪个更好", "哪个更合适", "选一个", "挑一个", "你建议", "推荐哪个",
+    "适合我", "我该选",
+    "options", "alternatives", "choose", "pick one", "which one", "which do",
+)
+
+
+def _task_needs_human_choice(text) -> bool:
+    """议题是否明显要用户做选择（据此决定是否注入「先问后答」强指令）。"""
+    t = (text or "").lower()
+    return any(h in t for h in _HITL_TASK_HINTS)
+
+
 # 「中止 → 继续」时发给被中止 agent 的提示：那半截内容已作废，必须显式告知别再往下接，
 # 否则它会在 CLI 会话里接着自己的半句继续说（历史上下文里那半截仍在），出现「从中间续写」。
 _RESUME_NOTICE = (
@@ -184,6 +202,11 @@ class Session:
         self.human_input_event = asyncio.Event()
         self._human_input_request = None   # {question, options}：待用户回答的问题
         self._human_input_answer = None    # str：用户回答
+        # 本场是否已向用户提过问：用于抑制「先问后答」强指令重复注入（问过一次即不再要求）。
+        self._hitl_asked = False
+        # 本场议题（debate 由 _debate 写入 / resume 时从历史回填；chat 不用）。
+        # 在此先初始化为空：_build_prompt 在 _debate 之外（单测、chat 首轮）也会读它。
+        self._initial_task = ""
         self.running = False
         # end_discussion 终止状态机（FR5.3b 多数同意）：
         # - terminate_proposed_by：首个提议方（用于 prompt 提示「谁先提的」）
@@ -293,6 +316,7 @@ class Session:
 
     async def _pause_for_human_input(self, agent):
         """检测到 request_human_input 后：广播问题给前端、阻塞等用户回答、落盘回答。"""
+        self._hitl_asked = True   # 已问过：后续轮次不再注入「先问后答」强指令
         req = self._human_input_request or {}
         await self._emit(type="human_input_required", agent=agent.name,
                          question=req.get("question", ""), options=req.get("options") or [])
@@ -388,8 +412,11 @@ class Session:
             else:
                 parts.append("（请基于我们之前的对话继续）")
             parts.append("请以对话方式直接回复。这是人机对话，不要调用 end_discussion 工具或输出其调用文本（辩论模式专用）。")
-            parts.append("当你需要我（用户）从多个方案中选择、或需要澄清任务时，调用 request_human_input 工具"
-                         "（而非在文本里反问）——我会收到问题并回答，讨论随之继续。")
+            # 人工介入（HITL）：硬触发条件 + 禁止正文反问 + 仅无工具时的 json 兜底写法。
+            parts.append(self._render_slot("hitl_chat"))
+            # 本轮诉求要用户拍板、且本场还没问过 → 先问后答（否则只能替用户假设条件）。
+            if not self._hitl_asked and _task_needs_human_choice(inject):
+                parts.append(self._render_slot("hitl_opening", task=(inject or "")[:120]))
             return "\n\n".join(parts)
 
         # 多 agent 辩论（FR5.3b 子项2）：回传「本方上次发言之后的全部他人发言」（按发生顺序），
@@ -491,11 +518,13 @@ class Session:
                     agent=agent.name,
                     turn=round_i // len(self.agents) + 1, max_rounds=self.max_rounds,
                 ))
-        # 人工介入提示：需要用户从多方案中选、或需澄清任务时，调 request_human_input 工具，
-        # 而非在文本里反问对方 agent——辩论中对方会替你回答，导致结果偏离用户意图。
-        parts.append("当你需要用户从多个方案中选择、或需要澄清任务时，调用 request_human_input 工具"
-                     "（而非在文本里反问对方 agent）——本场是多人辩论，对方 agent 会替你回答你的反问，"
-                     "导致结果偏离用户意图；调用后系统会暂停并等待用户回答。")
+        # 人工介入提示（HITL）：需要用户拍板时必须调 request_human_input 工具，而非在正文里
+        # 反问对方 agent——辩论中对方会替你回答，导致结果偏离用户意图（2026-09-19 实测：agent
+        # 连续三轮在正文里「等用户回复」，实际是它在自说自话）。措辞见 prompt_defaults.hitl_debate。
+        parts.append(self._render_slot("hitl_debate"))
+        # 议题要用户拍板、且本场还没问过 → 首个发言者（round_i == 0）先问后答。
+        if not self._hitl_asked and round_i == 0 and _task_needs_human_choice(self._initial_task):
+            parts.append(self._render_slot("hitl_opening", task=(self._initial_task or "")[:120]))
         return "\n\n".join(parts)
 
     # ---------------- 单轮执行（两种模式共用） ----------------
