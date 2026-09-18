@@ -1,0 +1,62 @@
+{
+  "projects": {
+    "pr_probe": {
+      "id": "pr_probe",
+      "name": "probe-interrupt",
+      "path": "/Users/stalitz/www/agent-chat/probe/app-repro/work",
+      "team_ids": [
+        "tm_probe"
+      ]
+    }
+  },
+  "teams": {
+    "tm_probe": {
+      "id": "tm_probe",
+      "name": "probe（claude+gemma vs fake）",
+      "description": "中断续接复现用",
+      "agent_ids": [
+        "ag_probe_claude",
+        "ag_probe_fake"
+      ]
+    }
+  },
+  "agents": {
+    "ag_probe_claude": {
+      "id": "ag_probe_claude",
+      "name": "Probe Claude",
+      "type": "claude-code",
+      "role": "你是探针 agent，一律用中文回复。",
+      "model": "gemma4:26b",
+      "cli_args": "",
+      "fake_terminate_round": 0,
+      "base_url": "http://127.0.0.1:8780",
+      "api_key": null,
+      "think": null
+    },
+    "ag_probe_fake": {
+      "id": "ag_probe_fake",
+      "name": "Probe Fake",
+      "type": "fake",
+      "role": "你是假对手，仅用于驱动辩论轮次。",
+      "model": null,
+      "cli_args": "",
+      "fake_terminate_round": 0,
+      "base_url": null,
+      "api_key": null,
+      "think": null
+    }
+  },
+  "settings": {
+    "default_timeout": 300,
+    "default_max_rounds": 2,
+    "default_model": "gemma4:26b",
+    "default_model_codex": "deepseek-v4-flash",
+    "ollama_base_url": "http://127.0.0.1:11434",
+    "ollama_num_ctx": 16384,
+    "think": true,
+    "claude_max_output_tokens": 64000,
+    "prompt_templates": {
+      "debate": {}
+    }
+  }
+}

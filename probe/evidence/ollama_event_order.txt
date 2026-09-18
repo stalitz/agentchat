@@ -1,0 +1,18 @@
+# Ollama /v1/responses 原生事件序（思考开启、流式）
+# 源文件 probe/app-repro/raw/ollama_event_order.sse（curl 直连 11434 实测）
+# 事件总数 159；下面把连续同类型折叠
+
+  下标区间        次数  事件类型
+  [   0-0   ] x1    response.created
+  [   1-1   ] x1    response.in_progress
+  [   2-2   ] x1    response.output_item.added
+  [   3-155 ] x153  response.reasoning_summary_text.delta
+  [ 156-156 ] x1    response.reasoning_summary_text.done
+  [ 157-157 ] x1    response.output_item.done
+  [ 158-158 ] x1    response.completed
+
+要点：
+① reasoning 先在 `response.reasoning_summary_text.delta` 逐片给出（旧网关未处理该事件 → 忽略）；
+② 末尾 `response.reasoning_summary_text.done` 才一次性给出思考**全文**；
+③ 因此「思考」在网关侧必然是一个**迟到的大块**：若模型在思考之前已吐过正文（如 `---` 分隔符），
+   旧实现就会把 thinking_delta 写进已经打开的 text 块同一个 index → 非法流。

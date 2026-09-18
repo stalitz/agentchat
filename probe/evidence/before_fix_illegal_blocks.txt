@@ -1,0 +1,29 @@
+# 修复前抓包（节选）· 源文件 probe/app-repro/raw/tap.before_fix.jsonl
+# 场景：app 内真跑 claude+gemma（隔离实例 8779，经抓包代理 8780），任务「请从 1 数到 300」
+
+## 请求 1（claude SDK 流式请求）
+18:43:32.439  stream=True  max_tokens=64000  messages=2
+
+## 请求 1 的响应（Anthropic SSE，原文；在 1901B 处被 claude 掐断）
+18:43:33.094  event: message_start
+18:43:33.094  data: {"type": "message_start", "message": {"id": "msg_34fc60bf384ced63", "type": "message", "role": "assistant", "model": "gemma4:26b", "content": [], "usage": {"input_tokens": 3953, "output_tokens": 0}}}
+18:43:33.096  event: content_block_start
+18:43:33.096  data: {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+18:43:33.097  event: content_block_delta
+18:43:33.097  data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "---"}}
+18:43:33.120  event: content_block_delta
+18:43:33.120  data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "\n"}}
+18:43:39.046  event: content_block_delta
+18:43:39.046  data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The user wants me to count from 1 to 300, one number per line, without any explanation.\nThe user's prompt includes some instructions about being an \"探针 agent\" and responding in Simplified Chinese.\nHowever, the core task is a mechanical one: counting from 1 to 3/00.\n\nWait, I am an agent in a multi-agent debate context (based on the system instructions).\nThe user's input is: \"请从 1 数到 300，每行一个数字，不要任何解释。\"\nI must follow the instruction: 1 to 300, one per line, no explanation.\n\nI should check if I need to use any tools. The task is simple text generation.\nThe system instructions say I am a \"探针 agent\" (Probe agent) and must use Simplified Chinese.\nThe task itself is just numbers.\n\nPlan:\nGenerate numbers 1 to 300, each on a new line.\n\nOne detail: \"不要任何解释\" (No explanation). This means I should only output the numbers.\n\nLet's start."}}
+18:43:39.052  event: content_block_delta
+18:43:39.052  data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "1"}}
+18:43:39.059  event: content_block_delta
+18:43:39.059  data: {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "\n"}}
+
+(以上共 14 行；随后 claude SDK 判流非法，掐断并转入非流式回退)
+
+## 请求 2（SDK 非流式回退：body 里没有 stream 字段）
+18:43:39.069  body 含 stream 字段？ False  （实际值 None → 缺省应为 false）
+18:43:39.091  响应头 content-type = ['text/event-stream; charset=utf-8']   ← 非流式请求却收到 text/event-stream ❌
+18:44:16.761  该响应共 138690 字节 SSE → claude 当 JSON 解析失败 → 报 empty or malformed (HTTP 200)
+（注：18:43:39.062 的 1901 字节是请求 1 那个被掐断的响应）
