@@ -62,20 +62,25 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         self.assertEqual(oa["messages"][3], {"role": "tool", "tool_call_id": "t1", "content": "file content"})
 
     def test_tools_not_translated(self):
-        # 2026-08-19：只转发「含 end_discussion 的 MCP 工具」给模型，不转发 claude 内置工具；
-        # 且转发时去 mcp__ 前缀（模型见干净名 end_discussion）
+        # 2026-09-18 工具政策：受控工具 end_discussion 始终转发（去前缀）、claude 内置工具
+        # （无 mcp__ 前缀）原样转发让其能调用；第三方 MCP（mcp__ 前缀、非受控）与交互型工具
+        # （无 TTY 通道）仍剥。转发时去 mcp__ 前缀（模型见干净名 end_discussion）。
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [],
             "tools": [
                 {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
                 {"name": "mcp__terminate-signal__end_discussion", "description": "d",
                  "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}},
+                {"name": "mcp__some-server__secret", "description": "z", "input_schema": {}},
+                {"name": "AskUserQuestion", "description": "w", "input_schema": {}},
             ],
         })
         tools = oa.get("tools") or []
         names = [t["function"]["name"] for t in tools]
-        self.assertEqual(names, ["end_discussion"], "只转发 end_discussion 且去前缀")
-        self.assertNotIn("Bash", names, "claude 内置工具不得转发")
+        self.assertIn("end_discussion", names, "受控工具应转发且去前缀")
+        self.assertIn("Bash", names, "claude 内置工具应转发（让其能调用）")
+        self.assertNotIn("secret", names, "第三方 MCP 非受控工具不得泄漏")
+        self.assertNotIn("AskUserQuestion", names, "交互型工具无 TTY 通道，必须剥")
         self.assertNotIn("mcp__", names[0], "模型侧应为干净名")
 
     def test_mcp_name_mapping(self):
@@ -99,13 +104,19 @@ class TestAnthropicToOpenAI(unittest.TestCase):
         # 受支持的通用字段应保留
         self.assertEqual(oa["temperature"], 0.7)
 
-    def test_internal_tools_not_forwarded(self):
-        # claude 内置工具（Bash 等）不转发给模型（防乱调）；无 end_discussion 的请求不带 tools 字段
+    def test_internal_tools_forwarded(self):
+        # claude 内置工具（Bash 等）原样转发给模型（让其能调用），第三方 MCP 非受控工具不得泄漏；
+        # 无 tools 的请求不带 tools 字段。
         oa = gateway.anthropic_to_openai({
             "model": "gemma", "messages": [],
-            "tools": [{"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
+            "tools": [
+                {"name": "Bash", "description": "d", "input_schema": {"type": "object"}},
+                {"name": "mcp__some-server__secret", "description": "z", "input_schema": {}},
+            ],
         })
-        self.assertNotIn("tools", oa, "claude 内置工具不应转发")
+        names = [t["function"]["name"] for t in oa.get("tools") or []]
+        self.assertIn("Bash", names, "claude 内置工具应转发")
+        self.assertNotIn("secret", names, "第三方 MCP 非受控工具不得泄漏")
         # 无 tools 请求同样不带 tools 字段
         oa3 = gateway.anthropic_to_openai({"model": "gemma", "messages": []})
         self.assertNotIn("tools", oa3)
@@ -250,37 +261,6 @@ class TestStreamTranslator(unittest.TestCase):
         self.assertEqual(gateway._estimate_input_tokens({"messages": []}), 1)
 
 
-class TestNonStreamResponse(unittest.TestCase):
-    def test_translate(self):
-        body = {"model": "gemma"}
-        oa_resp = {
-            "id": "chatcmpl-1", "choices": [{"index": 0, "finish_reason": "stop",
-                "message": {"role": "assistant", "content": "hi"}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 2},
-        }
-        a = gateway._non_stream_response(body, oa_resp)
-        self.assertEqual(a["type"], "message")
-        self.assertEqual(a["role"], "assistant")
-        self.assertEqual(a["content"][0], {"type": "text", "text": "hi"})
-        self.assertEqual(a["stop_reason"], "end_turn")
-        self.assertEqual(a["usage"]["input_tokens"], 5)
-        self.assertEqual(a["usage"]["output_tokens"], 2)
-
-    def test_translate_with_tool(self):
-        body = {"model": "gemma"}
-        oa_resp = {
-            "id": "c", "choices": [{"index": 0, "finish_reason": "tool_calls",
-                "message": {"role": "assistant", "content": None,
-                    "tool_calls": [{"id": "t1", "function": {"name": "read", "arguments": "{\"path\":\"/x\"}"}}]}}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-        }
-        a = gateway._non_stream_response(body, oa_resp)
-        self.assertEqual(a["content"][0]["type"], "tool_use")
-        self.assertEqual(a["content"][0]["name"], "read")
-        self.assertEqual(a["content"][0]["input"], {"path": "/x"})
-        self.assertEqual(a["stop_reason"], "tool_use")
-
-
 class _FakeOllamaCtx:
     def __init__(self, lines, status_code=200, err=b""):
         self.lines = lines
@@ -298,7 +278,7 @@ class _FakeOllamaCtx:
 
 
 class _FakeOllamaClient:
-    """模拟 Ollama 原生 /api/chat 流式响应（增量在 message.content，done 事件带计数）。"""
+    """模拟 Ollama /v1/responses 流式响应（text 在 response.output_text.delta）。"""
     def __init__(self, *a, **k):
         pass
     async def __aenter__(self):
@@ -307,13 +287,14 @@ class _FakeOllamaClient:
         return False
     def stream(self, method, url, json=None, headers=None):
         return _FakeOllamaCtx([
-            'data: {"message":{"role":"assistant","content":"你好"}}',
-            'data: {"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":2}',
+            'data: {"type":"response.output_text.delta","delta":"你好"}',
+            'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":5,"output_tokens":2}}}',
         ])
 
 
 class _FakeOllamaClientThinkingTool:
-    """模拟 Ollama 原生 /api/chat：thinking → text → tool_calls → done(tool_calls)。"""
+    """模拟 Ollama /v1/responses：reasoning_summary_text.done → output_text.delta →
+    function_call_arguments.delta/done → completed(tool_use)。"""
     def __init__(self, *a, **k):
         pass
     async def __aenter__(self):
@@ -322,17 +303,18 @@ class _FakeOllamaClientThinkingTool:
         return False
     def stream(self, method, url, json=None, headers=None):
         return _FakeOllamaCtx([
-            'data: {"message":{"role":"assistant","thinking":"让我想想"}}',
-            'data: {"message":{"role":"assistant","content":"结论"}}',
-            'data: {"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"end_discussion","arguments":"{\\"reason\\":\\"x\\"}"}}]}}',
-            'data: {"done":true,"done_reason":"tool_calls","prompt_eval_count":10,"eval_count":3}',
+            'data: {"type":"response.reasoning_summary_text.done","item_id":"rs1","text":"让我想想"}',
+            'data: {"type":"response.output_text.delta","delta":"结论"}',
+            'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc1","call_id":"call_1","name":"end_discussion"}}',
+            'data: {"type":"response.function_call_arguments.delta","item_id":"fc1","output_index":0,"delta":"{\\"reason\\":\\"x\\"}"}',
+            'data: {"type":"response.function_call_arguments.done","item_id":"fc1","output_index":0,"arguments":"{\\"reason\\":\\"x\\"}"}',
+            'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":10,"output_tokens":3}}}',
         ])
 
 
 class _FakeOllamaClientNativeNoPrefix:
-    """模拟 Ollama 原生 /api/chat 真实流式格式：不带 data: 前缀的纯 JSON 行
-    （8e0eef0 的假数据带 data: 前缀，掩盖了网关要求 data: 前缀导致空流的 bug）。
-    同时 tool_calls.arguments 用对象（gemma4 实测返回对象），覆盖参数类型兼容。"""
+    """模拟 Ollama /v1/responses 真实流式格式：不带 data: 前缀的纯 JSON 行
+    （8e0eef0 的假数据带 data: 前缀，掩盖了网关要求 data: 前缀导致空流的 bug）。"""
     def __init__(self, *a, **k):
         pass
     async def __aenter__(self):
@@ -341,15 +323,17 @@ class _FakeOllamaClientNativeNoPrefix:
         return False
     def stream(self, method, url, json=None, headers=None):
         return _FakeOllamaCtx([
-            '{"message":{"role":"assistant","thinking":"让我想想"}}',
-            '{"message":{"role":"assistant","content":"结论"}}',
-            '{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"end_discussion","arguments":{"reason":"x"}}}]}}',
-            '{"done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":3}',
+            '{"type":"response.reasoning_summary_text.done","item_id":"rs1","text":"让我想想"}',
+            '{"type":"response.output_text.delta","delta":"结论"}',
+            '{"type":"response.output_item.added","item":{"type":"function_call","id":"fc1","call_id":"call_1","name":"end_discussion"}}',
+            '{"type":"response.function_call_arguments.delta","item_id":"fc1","output_index":0,"delta":"{\\"reason\\":\\"x\\"}"}',
+            '{"type":"response.function_call_arguments.done","item_id":"fc1","output_index":0,"arguments":"{\\"reason\\":\\"x\\"}"}',
+            '{"type":"response.completed","response":{"output":[],"usage":{"input_tokens":10,"output_tokens":3}}}',
         ])
 
 
 class _FakeCaptureBody:
-    """捕获发给 Ollama 的请求体，验证 options.num_ctx 注入。"""
+    """捕获发给 Ollama 的 /v1/responses 请求体，验证 options.num_ctx / input 数组 / tools。"""
     captured: dict = {}
     def __init__(self, *a, **k):
         pass
@@ -360,8 +344,36 @@ class _FakeCaptureBody:
     def stream(self, method, url, json=None, headers=None):
         _FakeCaptureBody.captured = json or {}
         return _FakeOllamaCtx([
-            'data: {"message":{"role":"assistant","content":"ok"}}',
-            'data: {"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}',
+            'data: {"type":"response.output_text.delta","delta":"ok"}',
+            'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":1,"output_tokens":1}}}',
+        ])
+
+
+class _FakeCaptureShowBody:
+    """捕获 /v1/responses 请求体，并支持 /api/show 能力查询（思考开关显式透传需查能力）。"""
+    caps: list = ["completion", "tools", "thinking"]
+    captured: dict = {}
+    show_calls: int = 0
+    def __init__(self, *a, **k):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    async def post(self, url, json=None, **kw):
+        cls = _FakeCaptureShowBody
+        cls.show_calls += 1
+        class _R:
+            status_code = 200
+            def json(self):
+                return {"capabilities": list(cls.caps)}
+        return _R()
+    def stream(self, method, url, json=None, headers=None):
+        cls = _FakeCaptureShowBody
+        cls.captured = json or {}
+        return _FakeOllamaCtx([
+            'data: {"type":"response.output_text.delta","delta":"ok"}',
+            'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":1,"output_tokens":1}}}',
         ])
 
 
@@ -478,70 +490,42 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
                         "message_start 应先发，claude 才不至于误判空响应")
 
 
-class TestOllamaNativeGateway(unittest.TestCase):
-    """原生 /api/chat 端点（options.num_ctx 控制上下文）相关测试。"""
+class TestResponsesGateway(unittest.TestCase):
+    """网关走 Ollama /v1/responses（Responses API）相关测试。"""
 
-    def test_ollama_tool_calls_to_openai(self):
-        # Ollama 原生 tool_calls（无 index/id）→ OpenAI 增量格式，供 translator 复用
-        out = gateway._ollama_tool_calls_to_openai([
-            {"function": {"name": "end_discussion", "arguments": '{"reason":"x"}'}},
-        ])
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["index"], 0)
-        self.assertEqual(out[0]["id"], "tool_0")
-        self.assertEqual(out[0]["function"]["name"], "end_discussion")
-        self.assertEqual(out[0]["function"]["arguments"], '{"reason":"x"}')
-        self.assertIsNone(gateway._ollama_tool_calls_to_openai(None))
+    def setUp(self):
+        # 思考能力探测结果按 (base, model) 进程内缓存；部分 fake 无 .post 会让探测失败并
+        # 缓存 False，清除避免跨用例污染（尤其 think 开关用例依赖 fresh 探测）。
+        gateway._THINK_CAP_CACHE.clear()
 
-    def test_openai_messages_to_ollama(self):
-        # 历史含 OpenAI 格式 tool_calls（arguments 字符串、content null）→ Ollama 原生格式
-        #（arguments 对象、content 空串），否则 Ollama /api/chat 直接 400 拒绝
-        msgs = [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": None,
-             "tool_calls": [{"id": "t1", "type": "function",
-                             "function": {"name": "end_discussion", "arguments": '{"reason":"x"}'}}]},
-            {"role": "tool", "tool_call_id": "t1", "content": "已收到"},
-        ]
-        out = gateway._openai_messages_to_ollama(msgs)
-        self.assertEqual(out[0], msgs[0])
-        self.assertEqual(out[1]["content"], "", "null content 应转为空串")
-        tc = out[1]["tool_calls"][0]
-        self.assertEqual(tc["function"]["name"], "end_discussion")
-        self.assertEqual(tc["function"]["arguments"], {"reason": "x"}, "arguments 字符串应解析为对象")
-        self.assertNotIn("id", tc, "Ollama 原生不需要 id/type")
-        self.assertEqual(out[2]["role"], "tool")
-        self.assertEqual(out[2]["content"], "已收到")
-
-    def test_map_stop_ollama(self):
-        self.assertEqual(gateway._map_stop_ollama("stop"), "end_turn")
-        self.assertEqual(gateway._map_stop_ollama("tool_calls"), "tool_use")
-        self.assertEqual(gateway._map_stop_ollama("length"), "max_tokens")
-        self.assertEqual(gateway._map_stop_ollama("unknown"), "end_turn")
-
-    def test_non_stream_response_ollama(self):
-        # Ollama 原生非流式响应（message.thinking/content/tool_calls + prompt_eval_count/eval_count）
+    def test_non_stream_response_responses(self):
+        # Ollama /v1/responses 非流式响应（output[]: reasoning/message/function_call + usage）
         # → Anthropic Messages 响应
         resp = {
-            "message": {"role": "assistant", "thinking": "推理", "content": "答案",
-                        "tool_calls": [{"function": {"name": "read", "arguments": '{"path":"/x"}'}}]},
-            "done_reason": "tool_calls", "prompt_eval_count": 7, "eval_count": 4,
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "推理"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "答案"}]},
+                {"type": "function_call", "call_id": "c1", "name": "end_discussion",
+                 "arguments": '{"reason":"x"}'},
+            ],
+            "usage": {"input_tokens": 7, "output_tokens": 4},
         }
-        a = gateway._non_stream_response_ollama({"model": "gemma"}, resp)
+        a = gateway._non_stream_response_responses({"model": "gemma4:26b"}, resp)
         self.assertEqual(a["type"], "message")
-        # thinking 块在 answer 块之前
-        self.assertEqual(a["content"][0], {"type": "thinking", "thinking": "推理", "signature": a["content"][0]["signature"]})
+        # thinking 块在 answer 块之前（干净名 end_discussion 还原为 MCP 原名）
+        self.assertEqual(a["content"][0]["type"], "thinking")
+        self.assertIn("推理", a["content"][0]["thinking"])
         self.assertEqual(a["content"][1], {"type": "text", "text": "答案"})
         self.assertEqual(a["content"][2]["type"], "tool_use")
-        self.assertEqual(a["content"][2]["name"], "read")
-        self.assertEqual(a["content"][2]["input"], {"path": "/x"})
+        self.assertEqual(a["content"][2]["name"], "mcp__terminate-signal__end_discussion")
+        self.assertEqual(a["content"][2]["input"], {"reason": "x"})
         self.assertEqual(a["stop_reason"], "tool_use")
-        # 原生计数映射到 Anthropic usage
         self.assertEqual(a["usage"]["input_tokens"], 7)
         self.assertEqual(a["usage"]["output_tokens"], 4)
 
     def test_stream_route_injects_num_ctx(self):
-        # 请求必须发往 /api/chat 且带 options.num_ctx（默认 16384）
+        # 请求必须发往 /v1/responses 且带 options.num_ctx（默认 16384）；
+        # 历史 tool_use 必须转为 input 数组独立 function_call 项（去前缀），否则 Ollama 400
         orig = gateway.httpx.AsyncClient
         gateway.httpx.AsyncClient = _FakeCaptureBody
         try:
@@ -559,12 +543,12 @@ class TestOllamaNativeGateway(unittest.TestCase):
         finally:
             gateway.httpx.AsyncClient = orig
         body = _FakeCaptureBody.captured
-        self.assertTrue(body.get("model") == "gemma")
+        self.assertEqual(body.get("model"), "gemma")
         self.assertEqual(body["options"]["num_ctx"], 16384, "默认 num_ctx 应为 16384")
-        # 历史 tool_calls 必须转为 Ollama 原生（arguments 对象），否则 Ollama 400 拒绝整轮
-        hist = [m for m in body["messages"] if m.get("tool_calls")]
-        self.assertEqual(len(hist), 1)
-        self.assertEqual(hist[0]["tool_calls"][0]["function"]["arguments"], {"reason": "x"})
+        fcs = [it for it in body["input"] if it.get("type") == "function_call"]
+        self.assertEqual(len(fcs), 1, "历史 tool_use 必须转为独立 function_call 项")
+        self.assertEqual(fcs[0]["name"], "end_discussion")
+        self.assertEqual(fcs[0]["call_id"], "t1")
         # 覆盖 settings 生效
         gateway.httpx.AsyncClient = _FakeCaptureBody
         try:
@@ -583,18 +567,16 @@ class TestOllamaNativeGateway(unittest.TestCase):
             gateway.httpx.AsyncClient = orig
         self.assertEqual(_FakeCaptureBody.captured["options"]["num_ctx"], 8192, "settings.ollama_num_ctx 应覆盖默认")
 
-    def test_stream_route_parses_ollama_native_thinking_and_tool(self):
-        # 原生 /api/chat 流式（thinking→text→tool_calls→done）应被正确翻译为 Anthropic SSE
+    def test_stream_route_parses_responses_thinking_and_tool(self):
+        # /v1/responses 流式（reasoning_summary_text.done → output_text.delta →
+        # function_call_arguments → completed）应被正确翻译为 Anthropic SSE
         orig = gateway.httpx.AsyncClient
         gateway.httpx.AsyncClient = _FakeOllamaClientThinkingTool
         try:
             async def run():
                 resp = await gateway.handle_messages(
-                    _FakeRequest({"model": "gemma", "messages": [
-                        {"role": "user", "content": "hi"},
-                        {"role": "assistant", "content": [
-                            {"type": "tool_use", "id": "t1", "name": "end_discussion", "input": {"reason": "x"}}]},
-                    ], "stream": True}),
+                    _FakeRequest({"model": "gemma4:26b", "messages": [
+                        {"role": "user", "content": "hi"}], "stream": True}),
                     {"ollama_base_url": "http://x"},
                 )
                 return "".join([c async for c in resp.body_iterator])
@@ -602,44 +584,42 @@ class TestOllamaNativeGateway(unittest.TestCase):
         finally:
             gateway.httpx.AsyncClient = orig
         self.assertIn("message_start", out)
-        self.assertIn("thinking_delta", out, "原生 thinking 块应产出 thinking_delta")
+        self.assertIn("thinking_delta", out, "reasoning_summary_text.done 应产出 thinking_delta")
         self.assertIn("text_delta", out)
-        self.assertIn("tool_use", out, "tool_calls 应翻译为 tool_use 块")
+        self.assertIn("tool_use", out, "function_call 应翻译为 tool_use 块")
         self.assertIn("message_stop", out)
-        self.assertIn('"input_tokens": 10', out, "done 事件 prompt_eval_count 应回填 usage")
+        self.assertIn('"input_tokens": 10', out, "response.completed usage 应回填")
         self.assertIn('"output_tokens": 3', out)
         self.assertLess(out.index("thinking_delta"), out.index("tool_use"), "思考块应在工具块之前")
 
     def test_stream_route_respects_think_switch(self):
-        # think=False → 请求带 think:false（gemma 关思考，防 thinking 爆 output token）；
-        # 默认 True 不带该字段（对不支持 think 参数的模型无影响）
+        # think=False → reasoning.effort=none（关思考）；think=True 且模型支持 →
+        # reasoning.effort=low（与 codex 路径一致）；默认 True 同 think=True
         def send(settings):
             orig = gateway.httpx.AsyncClient
-            gateway.httpx.AsyncClient = _FakeCaptureBody
+            gateway.httpx.AsyncClient = _FakeCaptureShowBody
             try:
                 async def run():
                     resp = await gateway.handle_messages(
-                        _FakeRequest({"model": "gemma", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                        _FakeRequest({"model": "gemma4:26b", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
                         settings,
                     )
                     return "".join([c async for c in resp.body_iterator])
                 asyncio.run(run())
             finally:
                 gateway.httpx.AsyncClient = orig
-            return _FakeCaptureBody.captured
+            return _FakeCaptureShowBody.captured
 
         body_on = send({"ollama_base_url": "http://x", "think": True})
-        self.assertNotIn("think", body_on, "think=True 时不应传 think 字段")
+        self.assertEqual(body_on.get("reasoning"), {"effort": "low"}, "think=True 且支持思考 → effort=low")
         body_off = send({"ollama_base_url": "http://x", "think": False})
-        self.assertIs(body_off.get("think"), False, "think=False 时应传 think:false")
-        # 未配置默认 True
+        self.assertEqual(body_off.get("reasoning"), {"effort": "none"}, "think=False → effort=none")
         body_default = send({"ollama_base_url": "http://x"})
-        self.assertNotIn("think", body_default)
+        self.assertEqual(body_default.get("reasoning"), {"effort": "low"}, "默认 think=True → effort=low")
 
-    def test_stream_route_forwards_tools_to_ollama(self):
-        # 真工具调用路径：请求带 end_discussion 工具时，必须透传给 Ollama 原生 /api/chat，
-        # 否则 gemma 收不到工具定义、永不产出 tool_calls（8e0eef0 改原生端点时漏传，回归）。
-        # 这里端到端经过 anthropic_to_openai（过滤+去前缀+input_schema→parameters）再发出。
+    def test_stream_route_forwards_tools(self):
+        # 真工具调用路径：请求带 end_discussion 工具时，必须透传给 Ollama /v1/responses，
+        # 否则 gemma 收不到工具定义、永不产出 tool_calls。格式为扁平 name/parameters。
         orig = gateway.httpx.AsyncClient
         gateway.httpx.AsyncClient = _FakeCaptureBody
         try:
@@ -661,32 +641,19 @@ class TestOllamaNativeGateway(unittest.TestCase):
             gateway.httpx.AsyncClient = orig
         body = _FakeCaptureBody.captured
         self.assertIn("tools", body, "tools 必须透传给 Ollama，否则 gemma 无法调用 end_discussion")
-        names = [t["function"]["name"] for t in body["tools"]]
-        self.assertEqual(names, ["end_discussion"], "只转发 end_discussion 且去前缀")
-        self.assertNotIn("Bash", names, "claude 内置工具不转发")
+        names = [t["name"] for t in body["tools"]]
+        self.assertIn("end_discussion", names, "受控工具应转发且去前缀")
+        self.assertIn("Bash", names, "claude 内置工具应转发（让其能调用）")
         self.assertNotIn("mcp__", names[0], "模型侧应为干净名")
-        self.assertEqual(body["tools"][0]["function"]["parameters"],
+        # end_discussion 的 input_schema 应映射为 parameters 透传（扁平 Responses 格式）
+        ed = next(t for t in body["tools"] if t["name"] == "end_discussion")
+        self.assertEqual(ed["parameters"],
                          {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
                          "input_schema 应映射为 parameters 透传")
 
-    def test_ollama_tool_calls_arguments_object(self):
-        # gemma4 原生 /api/chat 返回 tool_calls.arguments 为对象（非字符串增量），
-        # 网关必须统一 json.dumps 成字符串 partial_json，否则下游把 dict 当 partial_json 出错
-        out = gateway._ollama_tool_calls_to_openai([
-            {"function": {"name": "end_discussion", "arguments": {"reason": "x"}}},
-        ])
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["function"]["name"], "end_discussion")
-        self.assertEqual(out[0]["function"]["arguments"], '{"reason": "x"}', "对象 arguments 应转成字符串")
-        # 字符串 arguments 保持原样（旧模型增量格式）
-        out2 = gateway._ollama_tool_calls_to_openai([
-            {"function": {"name": "end_discussion", "arguments": '{"reason":"x"}'}},
-        ])
-        self.assertEqual(out2[0]["function"]["arguments"], '{"reason":"x"}')
-
     def test_stream_route_parses_native_no_prefix(self):
-        # 真实 Ollama 原生 /api/chat 流式不带 data: 前缀，网关必须能解析（否则空流）；
-        # 同时覆盖 tool_calls.arguments 为对象的真实格式。断言翻译出 tool_use 块、无空流错误。
+        # 真实 Ollama /v1/responses 流式不带 data: 前缀，网关必须能解析（否则空流）；
+        # 断言翻译出 tool_use 块、无空流错误、usage 回填。
         orig = gateway.httpx.AsyncClient
         gateway.httpx.AsyncClient = _FakeOllamaClientNativeNoPrefix
         try:
@@ -706,8 +673,8 @@ class TestOllamaNativeGateway(unittest.TestCase):
         self.assertIn("tool_use", out, "无前缀原生流式应翻译出 tool_use 块")
         self.assertIn("thinking_delta", out)
         self.assertNotIn("empty or malformed stream", out, "不得再误判空流")
-        self.assertIn('"input_tokens": 10', out, "done 事件 usage 应回填")
-        self.assertIn('"stop_reason": "tool_use"', out, "有 tool_use 块时 stop_reason 必须为 tool_use（gemma4 实测 done_reason=stop）")
+        self.assertIn('"input_tokens": 10', out, "response.completed usage 应回填")
+        self.assertIn('"stop_reason": "tool_use"', out, "有 tool_use 块时 stop_reason 必须为 tool_use")
 
 
 class TestSessionThinkOverride(unittest.TestCase):
@@ -799,7 +766,7 @@ class TestThinkRouteRegistered(unittest.TestCase):
 
 
 class _FakeShowAndChat:
-    """同时支持 /api/show（thinking 能力查询，走 client.post）与 /api/chat 流式，并捕获请求体。"""
+    """同时支持 /api/show（thinking 能力查询，走 client.post）与 /v1/responses 流式，并捕获请求体。"""
     caps: list = ["completion", "tools", "thinking"]
     show_calls: int = 0
     captured: dict = {}
@@ -832,18 +799,18 @@ class _FakeShowAndChat:
     def stream(self, method, url, json=None, headers=None):
         _FakeShowAndChat.captured = json or {}
         return _FakeOllamaCtx([
-            '{"message":{"role":"assistant","content":"ok"}}',
-            '{"done":true,"done_reason":"stop","prompt_eval_count":1,"eval_count":1}',
+            'data: {"type":"response.output_text.delta","delta":"ok"}',
+            'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":1,"output_tokens":1}}}',
         ])
 
 
 class TestThinkExplicitPassthrough(unittest.IsolatedAsyncioTestCase):
-    """思考开关必须**显式双向透传**（2026-09-17 修）。
+    """思考开关必须**显式双向透传**（2026-09-17 修，2026-09-18 改为 Responses API 契约）。
 
-    原实现只在生效值 False 时传 think:false，True 时**不传**、假设「不传 = 模型默认 = 思考开」。
-    实测不成立：Ollama 0.33.3 的 /api/chat 不带 think 时 gemma4:26b 根本不思考（server.log
-    三次 /api/chat 27.7s/24.9s/24.1s、claude transcript out=447/392/402 无思考 token），
-    于是用户「明明勾了思考」在 claude→网关 链路静默失效。
+    网关走 Ollama /v1/responses：生效值 False → reasoning.effort=none（关思考）；True 且模型
+    声明支持 thinking → reasoning.effort=low（与 codex 路径一致，显式比依赖默认更稳）。
+    实测 Ollama 0.33.3 的 /v1/responses 不带 reasoning 时 gemma4:26b 思考不稳定，故生效值 True
+    必须显式下发 effort，否则用户「勾了思考」在 claude→网关 链路静默失效。
     """
 
     def setUp(self):
@@ -870,8 +837,8 @@ class TestThinkExplicitPassthrough(unittest.IsolatedAsyncioTestCase):
 
     async def test_think_true_sent_explicitly(self):
         body = await self._run({"ollama_base_url": "http://x", "think": True})
-        self.assertIs(body.get("think"), True,
-                      "生效值 True 必须显式带 think:true（不传时 Ollama 实测不思考）")
+        self.assertEqual(body.get("reasoning"), {"effort": "low"},
+                          "生效值 True 且模型支持思考必须显式带 reasoning.effort=low")
 
     async def test_think_true_via_override(self):
         # 编排层算好的 think_override 优先（claude 会话路径 /gw/<pid>/<sid>/think/1）
@@ -879,17 +846,17 @@ class TestThinkExplicitPassthrough(unittest.IsolatedAsyncioTestCase):
             _FakeRequest({"model": "gemma4:26b", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
             {"ollama_base_url": "http://x", "think": False}, think_override=True)
         await resp.body_iterator.__anext__()
-        self.assertIs(_FakeShowAndChat.captured.get("think"), True)
+        self.assertEqual(_FakeShowAndChat.captured.get("reasoning"), {"effort": "low"})
 
     async def test_think_false_still_sent(self):
         body = await self._run({"ollama_base_url": "http://x", "think": False})
-        self.assertIs(body.get("think"), False)
+        self.assertEqual(body.get("reasoning"), {"effort": "none"}, "think=False → reasoning.effort=none")
         self.assertEqual(_FakeShowAndChat.show_calls, 0, "关思考无需查能力")
 
     async def test_think_omitted_when_model_lacks_thinking(self):
         _FakeShowAndChat.caps = ["completion", "tools"]
         body = await self._run({"ollama_base_url": "http://x", "think": True})
-        self.assertNotIn("think", body, "模型不声明 thinking 时保持旧行为（不传）")
+        self.assertNotIn("reasoning", body, "模型不声明 thinking 时保持旧行为（不传 reasoning）")
 
     async def test_capability_probe_cached(self):
         await self._run({"ollama_base_url": "http://x", "think": True})
@@ -966,6 +933,130 @@ class TestControlledToolForward(unittest.TestCase):
         out = self._oa_tools(["Bash", "Read"])
         kept = [t["function"]["name"] for t in out]
         self.assertEqual(set(kept), {"Bash", "Read"})
+
+
+class TestResponsesTranslation(unittest.TestCase):
+    def _run_adapter(self, events):
+        """把一串 Responses SSE 事件喂给 _ResponsesStreamAdapter，收集所有 Anthropic SSE dict。"""
+        a = gateway._ResponsesStreamAdapter(model="gemma4:26b", est_input_tokens=10)
+        out = list(a.start())
+        for ev in events:
+            out += a.handle(ev)
+        out += a.finish()
+        return out
+
+    def test_anthropic_to_responses_basic(self):
+        resp = gateway.anthropic_to_responses({
+            "model": "gemma4:26b", "stream": True,
+            "system": [{"type": "text", "text": "你是架构师"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        })
+        self.assertEqual(resp["model"], "gemma4:26b")
+        self.assertIn("你是架构师", resp["instructions"])
+        self.assertIn("【语言强制指令】", resp["instructions"])
+        self.assertEqual(resp["input"][0], {"role": "user", "content": "hi"})
+        self.assertTrue(resp["stream"])
+
+    def test_anthropic_to_responses_tool_history(self):
+        # assistant tool_use → 独立 function_call 项（去 mcp__ 前缀）；tool_result → function_call_output
+        resp = gateway.anthropic_to_responses({
+            "model": "gemma4:26b", "stream": True,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "算一下"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "我来算"},
+                    {"type": "tool_use", "id": "tool_abc", "name": "mcp__terminate-signal__end_discussion", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tool_abc", "content": "ok"},
+                ]},
+            ],
+        })
+        items = resp["input"]
+        # 顺序：user 文本 → assistant 文本(output_text) → 独立 function_call → function_call_output
+        self.assertEqual(items[0], {"role": "user", "content": "算一下"})
+        self.assertEqual(items[1], {"role": "assistant", "content": [{"type": "output_text", "text": "我来算"}]})
+        self.assertEqual(items[2]["type"], "function_call")
+        self.assertEqual(items[2]["call_id"], "tool_abc")
+        self.assertEqual(items[2]["name"], "end_discussion")  # 历史名也去前缀，与广告一致
+        self.assertEqual(items[3], {"type": "function_call_output", "call_id": "tool_abc", "output": "ok"})
+
+    def test_anthropic_to_responses_tools_filtered(self):
+        # 注意：claude 请求里的 tools 是 Anthropic 格式（name/description/input_schema 平铺），
+        # 经 anthropic_to_openai 过滤后转成 OpenAI 嵌套（function:{name,...}），
+        # anthropic_to_responses 再展平成 Responses 扁平格式。
+        resp = gateway.anthropic_to_responses({
+            "model": "gemma4:26b", "stream": True,
+            "messages": [],
+            "tools": [
+                {"name": "mcp__terminate-signal__end_discussion", "description": "x", "input_schema": {}},
+                {"name": "Bash", "description": "y", "input_schema": {}},
+                {"name": "mcp__some-server__secret", "description": "z", "input_schema": {}},
+                {"name": "AskUserQuestion", "description": "w", "input_schema": {}},
+            ],
+        })
+        names = [t["name"] for t in resp["tools"]]
+        self.assertIn("end_discussion", names)
+        self.assertIn("Bash", names)
+        self.assertNotIn("secret", names)
+        self.assertNotIn("AskUserQuestion", names)
+        # Responses 格式应为扁平 name/description/parameters（非嵌套 function）
+        self.assertIn("parameters", resp["tools"][0])
+
+    def test_adapter_text_and_thinking(self):
+        events = [
+            {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs1"}},
+            {"type": "response.reasoning_summary_text.done", "item_id": "rs1",
+             "text": "先想一下：2+3=5。"},
+            {"type": "response.output_item.added", "item": {"type": "message", "id": "m1"}},
+            {"type": "response.content_part.added", "output_index": 1},
+            {"type": "response.output_text.delta", "delta": "结果是"},
+            {"type": "response.output_text.delta", "delta": " 5。"},
+            {"type": "response.output_text.done", "text": "结果是 5。"},
+            {"type": "response.content_part.done", "output_index": 1},
+            {"type": "response.output_item.done", "item": {"type": "message", "id": "m1"}},
+            {"type": "response.completed", "response": {"output": [], "usage": {"input_tokens": 12, "output_tokens": 9}}},
+        ]
+        out = self._run_adapter(events)
+        types = [e["type"] for e in out]
+        self.assertIn("message_start", types)
+        self.assertIn("content_block_start", types)
+        self.assertIn("message_stop", types)
+        # 思考块：content_block_start(type=thinking) + content_block_delta(delta.type=thinking_delta)
+        # + signature_delta（原生 thinking 块，claude 原样落盘）
+        thinking_start = [e for e in out if e["type"] == "content_block_start" and e["content_block"]["type"] == "thinking"]
+        self.assertEqual(len(thinking_start), 1)
+        self.assertTrue(any(e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "signature_delta" for e in out))
+        # 思考内容随 thinking_delta 出现（可能被拆成多片，拼接后校验）
+        think_txt = "".join(e["delta"].get("thinking", "") for e in out
+                            if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "thinking_delta")
+        self.assertIn("2+3=5", think_txt)
+        # 正文随 text_delta 出现（拼接后校验）
+        ans_txt = "".join(e["delta"].get("text", "") for e in out
+                         if e["type"] == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta")
+        self.assertIn("结果是 5", ans_txt)
+        # 结束 stop_reason=end_turn
+        md = [e for e in out if e["type"] == "message_delta"][0]
+        self.assertEqual(md["delta"]["stop_reason"], "end_turn")
+        self.assertEqual(md["usage"]["output_tokens"], 9)
+
+    def test_adapter_tool_call_restores_mcp_name(self):
+        events = [
+            {"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc1",
+             "call_id": "call_1", "name": "end_discussion", "arguments": ""}},
+            {"type": "response.function_call_arguments.delta", "item_id": "fc1", "output_index": 0, "delta": "{\"reason\""},
+            {"type": "response.function_call_arguments.delta", "item_id": "fc1", "output_index": 0, "delta": ":\"x\"}"},
+            {"type": "response.function_call_arguments.done", "item_id": "fc1", "output_index": 0, "arguments": "{\"reason\":\"x\"}"},
+            {"type": "response.output_item.done", "item": {"type": "function_call", "id": "fc1", "call_id": "call_1", "name": "end_discussion", "arguments": "{\"reason\":\"x\"}"}},
+            {"type": "response.completed", "response": {"output": [], "usage": {"input_tokens": 5, "output_tokens": 3}}},
+        ]
+        out = self._run_adapter(events)
+        tus = [e for e in out if e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use"]
+        self.assertEqual(len(tus), 1)
+        # 干净名 end_discussion 应被还原为 mcp__terminate-signal__end_discussion（claude 才能匹配 MCP server）
+        self.assertEqual(tus[0]["content_block"]["name"], "mcp__terminate-signal__end_discussion")
+        md = [e for e in out if e["type"] == "message_delta"][0]
+        self.assertEqual(md["delta"]["stop_reason"], "tool_use")
 
 
 if __name__ == "__main__":

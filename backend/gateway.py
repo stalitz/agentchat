@@ -1,11 +1,19 @@
 """内置 Anthropic↔Ollama 翻译网关。
 
 为什么需要它：Claude Code CLI 说 Anthropic Messages API 格式（system / tool_use /
-tool_result），而本地 Ollama 说 OpenAI Chat Completions 格式。两者协议不兼容。
+tool_result），而本地 Ollama 说 Responses API 格式（/v1/responses）。两者协议不兼容。
 把这一层翻译做进 app 本身，claude-code 类型的 agent 就能把 `base_url` 指向本网关
 （如 http://127.0.0.1:8777），从而直连 Ollama 上已 pull 好的模型（gemma / deepseek 等），
-**无需用户另起 litellm、也完全不改动 Ollama 自身配置**——本网关只是去读 Ollama 既有的
-原生 /api/chat 端点（默认 http://localhost:11434/api/chat，可传 options.num_ctx 控制上下文长度）。
+**无需用户另起 litellm、也完全不改动 Ollama 自身配置**。
+
+2026-09-18 改造（用户裁定方案 A）：本地模型统一走 Ollama 的 `/v1/responses`
+（Responses API）而非旧的 `/api/chat`（chat completions）。原因：gemma 等本地模型在
+Responses API 端点适配好（会重试工具、正确命名、像 codex 路径一样稳定），而在 /api/chat
+端点表现差（猜错工具名、不重试、被英文 system 带偏）。codex 路径本就直连 /v1/responses，
+现在 claude 路径对齐它，claude+gemma 不再「瘸」。翻译：anthropic_to_responses 把
+Messages 请求转成 /v1/responses 请求（input 数组 + tools + reasoning 开关），
+_ResponsesStreamAdapter 把 Responses 流式 SSE 翻回 Anthropic Messages SSE（thinking /
+text / tool_use 块序、signature、stop_reason、usage）给 claude CLI。
 
 路由：POST /v1/messages（与 Anthropic SDK 追加的路径一致：ANTHROPIC_BASE_URL + /v1/messages）。
 """
@@ -19,9 +27,9 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-# Ollama 原生 /api/chat 端点（只读 Ollama，不改 Ollama 配置）；可被全局设置 ollama_base_url 或
-# 环境变量 OLLAMA_BASE_URL 覆盖。走原生端点而非 OpenAI 兼容端点，因为只有原生端点接受
-# options.num_ctx，才能由本网关控制上下文长度（KV cache 上限），不影响 Ollama GUI/全局设置。
+# 本地模型经 Ollama（默认 127.0.0.1:11434），可由全局设置 ollama_base_url 或环境变量
+# OLLAMA_BASE_URL 覆盖。网关把 Anthropic Messages 翻成 Ollama /v1/responses（Responses API），
+# 由 Responses 请求体里的 options.num_ctx 控制上下文长度（KV cache 上限），不影响 Ollama GUI/全局设置。
 # 思考/答案块的边界哨兵：仅用于**读取旧 transcript 时的兜底清洗**（executor._clean_sentinels），
 # 新版网关已改为原生 Anthropic `thinking` 块（带 signature）+ `text` 块，claude-code 会原样落盘、
 # 原生 claude / 外部工具可直接识别思考与答案，不再依赖哨兵。
@@ -195,6 +203,88 @@ _CLAUDE_INTERACTIVE_TOOLS = frozenset({
 })
 
 
+def anthropic_to_responses(body: dict) -> dict:
+    """把 Anthropic Messages 请求体翻译为 Ollama /v1/responses（Responses API）请求体。
+
+    复用 anthropic_to_openai 的工具过滤 + 中文强制 system（LANG_MANDATE）注入，再把
+    OpenAI 格式的 messages 转成 Responses API 的 `input` 数组。关键差异（已对 Ollama
+    0.33.3 实测）：
+    - system → 顶层 `instructions` 字段；
+    - 历史里的 assistant tool_use → **独立顶层项** `{type:"function_call", call_id,
+      name, arguments}`（Ollama 不允许把它嵌进 `role:assistant` 的 content，会 400）；
+    - tool_result → 独立顶层项 `{type:"function_call_output", call_id, output}`；
+    - tools 格式为扁平 `{type:"function", name, description, parameters}`（非 OpenAI 的
+      嵌套 `function:{...}`）；
+    - 广告给模型的工具名用干净名（去 mcp__ 前缀），与历史 function_call 名一致，
+      回程由 _ResponsesStreamAdapter / _restore_mcp_name 还原 mcp__ 前缀给 claude。
+    """
+    oa = anthropic_to_openai(body)
+    oa_messages = list(oa.get("messages") or [])
+    instructions = None
+    if oa_messages and oa_messages[0].get("role") == "system":
+        instructions = oa_messages[0].get("content") or ""
+        oa_messages = oa_messages[1:]
+
+    input_items: list[dict] = []
+    for m in oa_messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "tool":
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id"),
+                "output": m.get("content") or "",
+            })
+            continue
+        if role == "assistant":
+            text = content if isinstance(content, str) else "".join(
+                b.get("text", "") for b in (content or [])
+                if isinstance(b, dict) and b.get("type") == "text")
+            if text:
+                input_items.append({"role": "assistant",
+                                     "content": [{"type": "output_text", "text": text}]})
+            for tc in (m.get("tool_calls") or []):
+                f = tc.get("function") or {}
+                args = f.get("arguments")
+                if not isinstance(args, str):
+                    args = json.dumps(args or {}, ensure_ascii=False)
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id"),
+                    "name": _strip_mcp_prefix(f.get("name", "")),
+                    "arguments": args,
+                })
+            continue
+        # role == "user"
+        if isinstance(content, str):
+            input_items.append({"role": "user", "content": content})
+        else:
+            parts = [b.get("text", "") for b in (content or [])
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            input_items.append({"role": "user", "content": "".join(parts)})
+
+    resp: dict[str, Any] = {
+        "model": oa.get("model"),
+        "input": input_items,
+        "stream": bool(body.get("stream", True)),
+    }
+    if instructions:
+        resp["instructions"] = instructions
+    tools = oa.get("tools")
+    if tools:
+        resp["tools"] = [{
+            "type": "function",
+            "name": t.get("function", {}).get("name"),
+            "description": t.get("function", {}).get("description", ""),
+            "parameters": t.get("function", {}).get("parameters", {}),
+        } for t in tools]
+    if oa.get("temperature") is not None:
+        resp["temperature"] = oa["temperature"]
+    if oa.get("max_tokens") is not None:
+        resp["max_output_tokens"] = oa["max_tokens"]
+    return resp
+
+
 def _strip_mcp_prefix(name: str) -> str:
     """mcp__terminate-signal__end_discussion → end_discussion（给模型侧的干净名）。
 
@@ -222,82 +312,6 @@ def _restore_mcp_name(name: str) -> str:
         if base in ("end_discussion", "request_human_input"):
             return f"mcp__terminate-signal__{base}"
     return name
-
-
-def _map_stop(reason: str | None) -> str:
-    return {
-        "stop": "end_turn",
-        "tool_calls": "tool_use",
-        "length": "max_tokens",
-        "content_filter": "end_turn",
-    }.get(reason or "", "end_turn")
-
-
-def _map_stop_ollama(done_reason: str | None) -> str:
-    """Ollama 原生 /api/chat 的 done_reason → Anthropic stop_reason。"""
-    return {
-        "stop": "end_turn",
-        "tool_calls": "tool_use",
-        "length": "max_tokens",
-    }.get(done_reason or "", "end_turn")
-
-
-def _ollama_tool_calls_to_openai(tcs: Any) -> list[dict] | None:
-    """Ollama 原生 /api/chat 流式 tool_calls（无 index/id）转 OpenAI 增量格式，供 translator 复用。
-
-    Ollama 原生 tool_calls 形如 [{function:{name, arguments:"{...增量json}"}]，arguments 是
-    字符串增量；OpenAI 格式 translator 期望 {index, id, function:{name, arguments}}，二者兼容，
-    这里补上 index/id 即可。
-    """
-    if not tcs:
-        return None
-    out = []
-    for i, tc in enumerate(tcs):
-        f = tc.get("function") or {}
-        arg = f.get("arguments")
-        # Ollama 原生 /api/chat 的 tool_calls.arguments 可能是字符串增量（旧模型），
-        # 也可能是对象（gemma4 实测返回对象）。translator 需要字符串 partial_json，
-        # 故对象统一 json.dumps 成字符串，避免下游把 dict 当 partial_json 出错
-        if isinstance(arg, dict):
-            arg = json.dumps(arg, ensure_ascii=False)
-        elif arg is None:
-            arg = ""
-        out.append({
-            "index": i,
-            "id": "tool_" + str(i),
-            "function": {"name": f.get("name", ""), "arguments": arg},
-        })
-    return out
-
-
-def _openai_messages_to_ollama(messages: Any) -> list[dict]:
-    """把 OpenAI 格式的 messages（tool_calls.arguments 为 JSON 字符串，content 可能为 null）
-
-    转 Ollama 原生 /api/chat 格式（tool_calls.arguments 为对象、content 为空串而非 null）。
-    Ollama 原生端点拒绝字符串型 arguments（实测 HTTP 400），且对 null content 不友好。
-     debate 场景下 agent 历史含上一轮的 end_discussion tool_use（OpenAI 字符串格式），
-    必须转换否则 Ollama 直接 400 拒绝整轮请求。
-    """
-    out = []
-    for m in messages or []:
-        nm = dict(m)
-        if nm.get("content") is None:
-            nm["content"] = ""
-        tcs = m.get("tool_calls")
-        if tcs:
-            converted = []
-            for tc in tcs:
-                f = tc.get("function") or {}
-                arg = f.get("arguments")
-                if isinstance(arg, str):
-                    try:
-                        arg = json.loads(arg) if arg.strip() else {}
-                    except Exception:
-                        arg = {}
-                converted.append({"function": {"name": f.get("name", ""), "arguments": arg}})
-            nm["tool_calls"] = converted
-        out.append(nm)
-    return out
 
 
 def _estimate_input_tokens(body: dict) -> int:
@@ -472,80 +486,111 @@ def _sse_event(data: dict) -> str:
     return "event: " + data["type"] + "\ndata: " + json.dumps(data, ensure_ascii=False) + "\n\n"
 
 
-def _non_stream_response(body: dict, oa_resp: dict) -> dict:
-    """把 Ollama 非流式响应翻译为 Anthropic 非流式 Messages 响应。"""
-    choice = (oa_resp.get("choices") or [{}])[0]
-    msg = choice.get("message", {})
+def _non_stream_response_responses(body: dict, resp: dict) -> dict:
+    """把 Ollama /v1/responses 非流式响应翻译为 Anthropic 非流式 Messages 响应。"""
+    output = resp.get("output") or []
     content: list[dict] = []
-    reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
-    text = msg.get("content") or ""
-    # 思考模型：reasoning 作为原生 thinking 块（带 signature），answer 作为 text 块；
-    # claude-code 原样落盘，原生 claude / 外部工具可直接识别「思考」与「答案」。
+    reasoning = ""
+    for item in output:
+        t = item.get("type")
+        if t == "reasoning":
+            for s in (item.get("summary") or []):
+                reasoning += s.get("text", "")
+        elif t == "message":
+            for c in (item.get("content") or []):
+                if c.get("type") == "output_text":
+                    content.append({"type": "text", "text": c.get("text", "")})
+        elif t == "function_call":
+            try:
+                inp = json.loads(item.get("arguments") or "{}")
+            except Exception:
+                inp = {}
+            content.append({"type": "tool_use", "id": item.get("call_id") or item.get("id"),
+                            "name": _restore_mcp_name(item.get("name", "")), "input": inp})
+    final: list[dict] = []
     if reasoning:
-        content.append({"type": "thinking", "thinking": reasoning, "signature": _make_signature(body.get("model", ""), reasoning)})
-        if text:
-            content.append({"type": "text", "text": text})
-    elif text:
-        content.append({"type": "text", "text": text})
-    for tc in msg.get("tool_calls") or []:
-        func = tc.get("function") or {}
-        try:
-            inp = json.loads(func.get("arguments") or "{}")
-        except Exception:
-            inp = {}
-        content.append({"type": "tool_use", "id": tc.get("id"), "name": _restore_mcp_name(func.get("name", "")), "input": inp})
-    usage = oa_resp.get("usage") or {}
-    return {
-        "id": oa_resp.get("id", "msg_" + os.urandom(8).hex()),
-        "type": "message",
-        "role": "assistant",
-        "model": body.get("model"),
-        "stop_reason": _map_stop(choice.get("finish_reason")),
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-        },
-        "content": content,
-    }
-
-
-def _non_stream_response_ollama(body: dict, resp: dict) -> dict:
-    """把 Ollama 原生 /api/chat 非流式响应翻译为 Anthropic 非流式 Messages 响应。"""
-    msg = resp.get("message") or {}
-    content: list[dict] = []
-    reasoning = msg.get("thinking") or ""
-    text = msg.get("content") or ""
-    if reasoning:
-        content.append({"type": "thinking", "thinking": reasoning, "signature": _make_signature(body.get("model", ""), reasoning)})
-        if text:
-            content.append({"type": "text", "text": text})
-    elif text:
-        content.append({"type": "text", "text": text})
-    for tc in msg.get("tool_calls") or []:
-        f = tc.get("function") or {}
-        try:
-            inp = json.loads(f.get("arguments") or "{}")
-        except Exception:
-            inp = {}
-        content.append({"type": "tool_use", "id": tc.get("id") or ("tool_" + os.urandom(4).hex()),
-                        "name": _restore_mcp_name(f.get("name", "")), "input": inp})
-    pe = resp.get("prompt_eval_count")
-    ec = resp.get("eval_count")
+        final.append({"type": "thinking", "thinking": reasoning,
+                      "signature": _make_signature(body.get("model", ""), reasoning)})
+    final += [c for c in content if c["type"] == "text"]
+    final += [c for c in content if c["type"] == "tool_use"]
     usage = resp.get("usage") or {}
     return {
         "id": "msg_" + os.urandom(8).hex(),
-        "type": "message",
-        "role": "assistant",
-        "model": body.get("model"),
-        "stop_reason": _map_stop_ollama(resp.get("done_reason")),
+        "type": "message", "role": "assistant", "model": body.get("model"),
+        "stop_reason": "tool_use" if any(c["type"] == "tool_use" for c in final) else "end_turn",
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens") or pe or 0,
-            "output_tokens": usage.get("completion_tokens") or ec or 0,
-        },
-        "content": content,
+        "usage": {"input_tokens": usage.get("input_tokens", 0),
+                  "output_tokens": usage.get("output_tokens", 0)},
+        "content": final,
     }
+
+
+class _ResponsesStreamAdapter:
+    """把 Ollama /v1/responses 流式 SSE 事件翻译为 Anthropic Messages SSE 事件序列。
+
+    复用 _AnthropicTranslator（thinking index0 / text index1 / tool_use 块序、
+    signature、stop_reason=tool_use）。Ollama 实测：reasoning 仅在
+    `reasoning_summary_text.done` 给全文（delta 为空），text 在 `output_text.delta`，
+    tool 参数在 `function_call_arguments.delta`+`done`。
+    """
+
+    def __init__(self, model: str = "", est_input_tokens: int = 0):
+        self.t = _AnthropicTranslator(model=model, est_input_tokens=est_input_tokens)
+        self._tool_name: dict[str, str] = {}
+        self._tool_callid: dict[str, str] = {}
+        self._tool_seen: set[str] = set()
+        self._usage: dict = {}
+
+    def start(self) -> list[dict]:
+        return self.t._start()
+
+    def handle(self, ev: dict) -> list[dict]:
+        out: list[dict] = []
+        typ = ev.get("type")
+        if typ == "response.output_item.added":
+            item = ev.get("item") or {}
+            if item.get("type") == "function_call":
+                self._tool_name[item.get("id")] = item.get("name", "")
+                self._tool_callid[item.get("id")] = item.get("call_id") or item.get("id")
+        elif typ == "response.reasoning_summary_text.done":
+            txt = ev.get("text") or ""
+            if txt:
+                out += self.t.feed({"reasoning": txt, "content": "", "tool_calls": None})
+        elif typ == "response.output_text.delta":
+            txt = ev.get("delta") or ""
+            if txt:
+                out += self.t.feed({"content": txt, "reasoning": "", "tool_calls": None})
+        elif typ == "response.function_call_arguments.delta":
+            iid = ev.get("item_id")
+            piece = ev.get("delta") or ""
+            if piece:
+                name = self._tool_name.get(iid, "")
+                cid = self._tool_callid.get(iid, iid)
+                idx = ev.get("output_index", 0)
+                out += self.t.feed({"content": "", "reasoning": "", "tool_calls": [
+                    {"index": idx, "id": cid, "function": {"name": name, "arguments": piece}}]})
+                self._tool_seen.add(iid)
+        elif typ == "response.function_call_arguments.done":
+            iid = ev.get("item_id")
+            if iid not in self._tool_seen:
+                args = ev.get("arguments") or ""
+                if args:
+                    name = self._tool_name.get(iid, "")
+                    cid = self._tool_callid.get(iid, iid)
+                    idx = ev.get("output_index", 0)
+                    out += self.t.feed({"content": "", "reasoning": "", "tool_calls": [
+                        {"index": idx, "id": cid, "function": {"name": name, "arguments": args}}]})
+        elif typ == "response.completed":
+            self._usage = (ev.get("response") or {}).get("usage") or {}
+        return out
+
+    def finish(self) -> list[dict]:
+        if self._usage:
+            self.t.usage = {
+                "prompt_tokens": self._usage.get("input_tokens"),
+                "completion_tokens": self._usage.get("output_tokens"),
+            }
+        return self.t.finish()
 
 
 def _resolve_think(settings: dict, project_path: str | None, sid: str | None,
@@ -608,12 +653,14 @@ async def handle_messages(req: Request, settings: dict, project_path: str | None
                         think_override: bool | None = None):
     """FastAPI 路由处理函数：POST /v1/messages 或 /gw/<pid>/<sid>/v1/messages。
 
-    project_path / sid 由带会话路径的路由传入，用于按会话解析思考开关（会话级覆盖全局）。
-    think_override 由编排层按 会话>agent>全局 算好并随 URL 查询传入，存在时优先采用。
+    本地模型统一走 Ollama /v1/responses（Responses API），由 _ResponsesStreamAdapter 把
+    流式 SSE 翻回 Anthropic Messages SSE。project_path / sid 由带会话路径的路由传入，
+    用于按会话解析思考开关（会话级覆盖全局）。think_override 由编排层按
+    会话>agent>全局 算好并随 URL 查询传入，存在时优先采用。
     """
     body = await req.json()
-    oa = anthropic_to_openai(body)
-    url = _ollama_base_url(settings) + "/api/chat"
+    resp_body = anthropic_to_responses(body)
+    url = _ollama_base_url(settings) + "/v1/responses"
 
     auth = req.headers.get("x-api-key") or req.headers.get("authorization", "")
     headers = {"Content-Type": "application/json"}
@@ -622,50 +669,35 @@ async def handle_messages(req: Request, settings: dict, project_path: str | None
 
     want_stream = bool(body.get("stream", True))
 
-    # 走 Ollama 原生 /api/chat 端点（非 OpenAI 兼容端点）：只有原生端点接受 options.num_ctx，
-    # 才能由本网关控制上下文长度（KV cache 上限），**不影响 Ollama GUI/全局配置**。实测 OpenAI
-    # 兼容端点忽略 num_ctx/options.num_ctx，会把上下文拉满模型原生 128k（deepseek-r1:14b 单份
-    # 吃掉 ~34GB）。默认 16384 对辩论场景足够，且把单份显存压到 ~12GB。
+    # 上下文长度：Responses API 仍接受 Ollama 原生 options.num_ctx（实测 0.33.3 不 400），
+    # 控制 KV cache 上限，避免把上下文拉满模型原生 128k（deepseek-r1:14b 单份吃掉 ~34GB）。
+    # 默认 16384 对辩论场景足够，且把单份显存压到 ~12GB。
     num_ctx = int(settings.get("ollama_num_ctx") or 16384)
-    ollama_body = {
-        "model": oa.get("model"),
-        "messages": _openai_messages_to_ollama(oa.get("messages")),
-        "options": {"num_ctx": num_ctx},
-        "stream": want_stream,
-    }
-    # 思考开关：生效值**显式双向透传**——False 带 think:false（不再产出 thinking 块，输出从单轮
-    # 数万 token 降到个位数），True 也带 think:true（2026-09-17 修）。
-    # 原先 True 时**不传**、假设「不传 = 模型默认 = 思考开」——实测不成立：Ollama 0.33.3 的
-    # /api/chat 不带 think 时 gemma4:26b 根本不思考（server.log 三次 /api/chat 耗时
-    # 27.7s/24.9s/24.1s；claude transcript out=447/392/402，无 thinking 块、无思考 token），
-    # 于是用户「明明勾了思考」在 claude→网关 链路静默失效（同一模型走 codex 的 /v1/responses
-    # 则思考数千 token）。True 只在模型声明支持 thinking 时显式传（见 _ollama_supports_thinking），
-    # 对不支持的模型保持旧行为（不传），避免添乱。
-    # 生效值优先级：think_override（编排层算好）> 会话级（带 /gw/<pid>/<sid> 路径）> 全局默认。
+    resp_body["options"] = {"num_ctx": num_ctx}
+    # 思考开关：生效值 False → reasoning.effort=none（不产思考块）；True 且模型支持 →
+    # reasoning.effort=low（与 codex 路径一致，Ollama 默认也思考，显式 low 更稳）。
+    # 优先级：think_override（编排层算好）> 会话级（带 /gw/<pid>/<sid> 路径）> 全局默认。
     if not _resolve_think(settings, project_path, sid, think_override):
-        ollama_body["think"] = False
-    elif await _ollama_supports_thinking(settings, oa.get("model")):
-        ollama_body["think"] = True
-    if oa.get("tools"):
-        # 真工具调用路径：把 anthropic_to_openai 过滤后的 end_discussion 工具定义透传给
-        # Ollama 原生端点（其 tools 格式与 OpenAI 一致：{type:function, function:{name,
-        # description, parameters}}）。漏传则 gemma 收不到工具定义、永不产出 tool_calls
-        # （8e0eef0 改原生 /api/chat 时把请求体重写为手工 ollama_body，漏掉 tools，回归）。
-        ollama_body["tools"] = oa["tools"]
-    if oa.get("temperature") is not None:
-        ollama_body["options"]["temperature"] = oa["temperature"]
-    if oa.get("max_tokens") is not None:
-        ollama_body["options"]["num_predict"] = oa["max_tokens"]
+        resp_body["reasoning"] = {"effort": "none"}
+    elif await _ollama_supports_thinking(settings, resp_body.get("model")):
+        resp_body["reasoning"] = {"effort": "low"}
 
     if not want_stream:
         async with httpx.AsyncClient(timeout=600) as client:
-            r = await client.post(url, json=ollama_body, headers=headers)
-            r.raise_for_status()
-            return JSONResponse(_non_stream_response_ollama(body, r.json()))
+            r = await client.post(url, json=resp_body, headers=headers)
+            if r.status_code >= 400:
+                try:
+                    em = (r.json() or {}).get("error", {}).get("message") or r.text
+                except Exception:
+                    em = r.text
+                return JSONResponse(status_code=502,
+                                    content={"error": {"type": "api_error",
+                                            "message": "Ollama gateway error: " + str(em)[:500]}})
+            return JSONResponse(_non_stream_response_responses(body, r.json()))
 
     async def gen():
         async with httpx.AsyncClient(timeout=600) as client:
-            async with client.stream("POST", url, json=ollama_body, headers=headers) as r:
+            async with client.stream("POST", url, json=resp_body, headers=headers) as r:
                 if r.status_code >= 400:
                     err = await r.aread()
                     try:
@@ -674,53 +706,41 @@ async def handle_messages(req: Request, settings: dict, project_path: str | None
                         em = err.decode("utf-8", "replace")
                     yield _sse_event({"type": "error", "error": {"type": "api_error", "message": "Ollama gateway error: " + str(em)[:500]}})
                     return
-                translator = _AnthropicTranslator(model=body.get("model", ""), est_input_tokens=_estimate_input_tokens(body))
-                # 立即发 message_start（不等 Ollama 首个 chunk）：claude 进程的 SDK 对「HTTP 200
-                # 已建立但长时间无首个 SSE 事件」有内部超时（约 60s），gemma 等本地模型冷启 /
-                # 慢 prefill 时首 chunk 可达 60s+，网关若等首 chunk 才发 message_start，claude
-                # 会误判「API Error: empty or malformed (HTTP 200)」并退出（实测复现）。
-                # 先发 message_start 让 claude 确认流已开始，Ollama 慢则由 600s 超时兜底；
-                # 若最终真空流，下方空流检测仍会产出 SSE error 事件。
-                for ev in translator._start():
+                adapter = _ResponsesStreamAdapter(model=body.get("model", ""), est_input_tokens=_estimate_input_tokens(body))
+                # 立即发 message_start（不等 Ollama 首个 chunk）：claude 进程 SDK 对「HTTP 200
+                # 已建立但长时间无首个 SSE 事件」有内部超时（约 60s），gemma 冷启/慢 prefill 时
+                # 首 chunk 可达 60s+，网关若等首 chunk 才发 message_start，claude 会误判
+                # 「API Error: empty or malformed (HTTP 200)」并退出（实测复现）。
+                # 先发 message_start 让 claude 确认流已开始；若最终真空流，下方空流检测仍会产出 SSE error。
+                for ev in adapter.start():
                     yield _sse_event(ev)
+
+                def dispatch(payload: str) -> list:
+                    try:
+                        ev = json.loads(payload)
+                    except Exception:
+                        return []
+                    return [_sse_event(a) for a in adapter.handle(ev)]
+
                 got_any = False  # 是否收到过任何内容增量（空流检测）
                 async for line in r.aiter_lines():
                     line = line.strip()
                     if not line:
                         continue
-                    # Ollama 原生 /api/chat 流式为不带 data: 前缀的纯 JSON 行（OpenAI 兼容端点
-                    # 才带 data: 前缀）。之前强制要求 data: 前缀会把原生端点整行跳过 → 空流
-                    # （8e0eef0 的测试用带 data: 前缀的假数据，掩盖了这一真 bug）。兼容两种格式。
+                    if line.startswith("event:"):
+                        continue
                     if line.startswith("data:"):
                         line = line[5:].strip()
                         if not line or line == "[DONE]":
                             continue
-                    try:
-                        chunk = json.loads(line)
-                    except Exception:
-                        continue
-                    # Ollama 原生 /api/chat：增量在 chunk["message"]（content/thinking）；
-                    # done 事件在顶层带 done/done_reason/prompt_eval_count/eval_count（无 usage 键）。
-                    if chunk.get("done"):
-                        pe = chunk.get("prompt_eval_count")
-                        ec = chunk.get("eval_count")
-                        if pe is not None or ec is not None:
-                            translator.usage = {"prompt_tokens": pe or 0, "completion_tokens": ec or 0}
-                        dr = chunk.get("done_reason")
-                        if dr and not translator.stop_reason:
-                            translator.stop_reason = _map_stop_ollama(dr)
-                        continue
-                    msg = chunk.get("message") or {}
-                    delta = {
-                        "content": msg.get("content") or "",
-                        "reasoning": msg.get("thinking") or "",
-                        "tool_calls": _ollama_tool_calls_to_openai(msg.get("tool_calls")),
-                    }
-                    if delta["content"] or delta["reasoning"] or delta["tool_calls"]:
-                        got_any = True
-                    for ev in translator.feed(delta):
-                        yield _sse_event(ev)
-                if not got_any and not (translator.usage or {}).get("completion_tokens"):
+                    # 去 data: 前缀后的负载，或 Ollama /v1/responses 原生不带前缀的纯 JSON 行。
+                    # 每个事件一行（Ollama 每行一个完整 JSON 对象），逐行解析；不跨行累积
+                    # 成单一 payload（否则多事件被拼成非法 JSON 整体解析失败 → 空流误判）。
+                    if line and line != "[DONE]":
+                        for e in dispatch(line):
+                            yield e
+                            got_any = True
+                if not got_any:
                     # HTTP 200 但空流/畸形流：claude-code 会把这种情况渲染成普通文本
                     # 「API Error: API returned an empty or malformed response ...」混进正文，
                     # 随后被编排器当正常发言喂给下一个 agent。这里主动产出 SSE error，
@@ -728,7 +748,7 @@ async def handle_messages(req: Request, settings: dict, project_path: str | None
                     yield _sse_event({"type": "error", "error": {"type": "api_error",
                         "message": "Ollama gateway error: empty or malformed stream (HTTP 200), no content received"}})
                     return
-                for ev in translator.finish():
+                for ev in adapter.finish():
                     yield _sse_event(ev)
 
     return StreamingResponse(
