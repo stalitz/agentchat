@@ -108,3 +108,52 @@ HITL 表述成「当你**需要**用户从多个方案中选择时」才调用�
 被两个 gemma 理解成「把多套方案摆出来即可」，于是双双跳过提问、直接开讲，最后按惯例收敛到
 `end_discussion`。要提高命中率，得改的是**提示词强度**（把「需要」改成显式触发条件），
 而不是工具链路。这一条属于产品决策，未改代码（本次只做留痕，不动实现）。
+
+---
+
+## 附：留痕会话的**气泡颜色**修复（2026-09-19）
+
+用户反馈：导入的会话里「两个 codex 的会话不是绿色气泡」「有个 claude 好像在和 fake 对话」。查证如下。
+
+### 根因（两件事）
+
+1. **speaker 名对不上配置 → 颜色回落成 claude 蓝。**
+   前端气泡颜色是 `cfg_agents_by_name(speaker)` **按名字**查 agent 的 `type`
+   （`frontend/index.html` `renderHistoryEntry`），查不到就回落到 `claude-code`。
+   探针会话的 speaker 是隔离实例里的名字（`H-Probe Codex` / `H-Probe Claude` / `Probe Claude` / `Probe Fake`），
+   目标项目里根本没有这些 agent ⇒ **codex 显示成蓝气泡、fake 陪练也显示成蓝的**。
+2. **「claude 和 fake 对话」不是 bug，是探针设计。**
+   `s_3100f43b` 来自下午网关复现探针，其 team 就是 `probe（claude+gemma vs fake）`
+   —— 用 fake 当陪练驱动辩论轮次（不烧 token），claude 是真跑的那个。
+   只是它被归到了「双壳(Codex+Claude)」team 下，看起来才像错配。
+
+### 修复
+
+- `probe/import_probe_sessions.py`：新增 `--speaker-map` / `--sid-speaker-map` / `--only` / `--force`。
+  导入时把 speaker 名改写成目标项目里**真实存在的 agent 名**，`agent_sessions` 键与
+  prompts/tools 侧 jsonl 的 `agent` 字段同步改名（否则工具状态标签按名匹配不上）。
+- `frontend/index.html`：名字查不到的回落从 `claude-code` 改为新增的中性灰 `unknown`
+  （历史/实时流两处一致），**不再把未知发言者染成 claude 蓝**。
+- 配置（`data/config.json`，不入 git）：新建 fake agent「Fake 陪练（调试 · 不烧 token）」+
+  team「探针Team（调试 · Claude Code + Fake 陪练）」，把 `s_3100f43b` 归进去；
+  5 条纯 claude 的网关复现会话归到「探针Team（单壳 · Claude Code 本地 gemma）」。
+
+### 验证（真数据 + 真 DOM）
+
+`verify_bubble_color.js`：拉 8777 的真实 `/api/config` 与真实会话，用 `frontend/index.html`
+的真实渲染函数渲染，断言气泡颜色类。结果全绿：
+
+| 会话 | 发言者 → 气泡类（实测） |
+|---|---|
+| s_0449ef1d / s_a3d8022f | Codex (本地 gemma) → **codex（绿 #e6f6ec）** |
+| s_a3d8022f / s_3100f43b | Claude Code (本地 gemma) → claude-code（蓝） |
+| s_54eb6e23 | Claude Code 单壳 (本地 gemma) → claude-code（蓝） |
+| s_3100f43b | Fake 陪练（调试 · 不烧 token） → **fake（橙 #fff4e6）** |
+
+回归测试：`tests/test_frontend_render.js` 新增 5 条断言（未知 speaker → unknown 灰、codex 绿、
+实时流未带 atype 不为蓝）；全量 302 例 Python + 前端 jsdom 均通过。
+
+运行：
+```bash
+NODE_PATH=<managed node workspace>/node_modules node probe/hitl-probe/verify_bubble_color.js
+```
