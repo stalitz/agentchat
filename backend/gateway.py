@@ -266,7 +266,11 @@ def anthropic_to_responses(body: dict) -> dict:
     resp: dict[str, Any] = {
         "model": oa.get("model"),
         "input": input_items,
-        "stream": bool(body.get("stream", True)),
+        # Anthropic Messages 的 stream 缺省为 **false**（缺字段=非流式）。若这里按 True 兜底，
+        # claude 的非流式回退请求（不带 stream）会被当成流式转给 Ollama，回包是 SSE、
+        # 而 handle_messages 又走 r.json() 解析 → 必错。必须与 handle_messages 的
+        # want_stream 用同一默认值（false）。
+        "stream": bool(body.get("stream", False)),
     }
     if instructions:
         resp["instructions"] = instructions
@@ -342,21 +346,36 @@ def _estimate_input_tokens(body: dict) -> int:
 
 
 class _AnthropicTranslator:
-    """把 OpenAI 流式 chunk 增量翻译为 Anthropic SSE 事件序列（可单测的纯逻辑）。"""
+    """把 OpenAI 流式 chunk 增量翻译为 Anthropic SSE 事件序列（可单测的纯逻辑）。
+
+    块序策略：**单一开块 + 顺序 index 分配**（`_open_idx` / `_next_idx`）。
+    Anthropic 流式协议要求块严格串行（start → delta… → stop 配对，任一时刻只有一个块
+    处于打开状态），而上游事件顺序**不保证「思考在前、正文在后」**：gemma4:26b 实测
+    会先吐一小段正文（分隔符 "---"），随后才进入思考（reasoning 在 Ollama 侧是
+    out-of-band 事件，网关只在 `reasoning_summary_text.done` 拿到全文），最后才吐正式
+    答案。于是真实事件序是 text → thinking → text。
+
+    因此**不能把块 index 写死**（旧实现 thinking=0 / text=1 并假设思考先到）：迟到的
+    思考会被塞进已打开的 text 块（同一 index 先 text_delta 再 thinking_delta），claude
+    SDK 判流非法、在收到该 delta 时掐断流并触发非流式回退 → 报
+    「API Error: API returned an empty or malformed response (HTTP 200)」(2026-09-18
+    抓包实证，见 probe/app-repro/raw/tap.jsonl)。改为按事件类型切块：正文 → 思考 →
+    正文 会拿到 0/1/2 三个块，各自 start/stop 配对，index 连续无空洞。
+    """
 
     def __init__(self, model: str = "", est_input_tokens: int = 0):
         self.model = model
         self.est_input_tokens = est_input_tokens
         self.started = False
-        self.text_started = False
-        self.cur_block = 0  # 当前 text 块 index：0=reasoning（思考），1=answer（正文）
         self.tool_blocks: dict[int, dict] = {}  # openai index -> {our, id, name}
         self.stop_reason = None
         self.usage: dict = {}
-        self._reasoning_acc = ""   # 累积 reasoning，用于生成 thinking 块签名
-        self._think_closed = False  # 思考块是否已收口（signature_delta + stop）
-        self._think_started = False  # 是否已开原生 thinking 块（用于 finish 区分思考/答案）
-        self._text_started = False  # 正文 text 块是否已开
+        self._reasoning_acc = ""   # 当前思考块的累积文本，用于生成 thinking 块签名
+        # —— 动态块管理：同一时刻只有一个开块，index 按 0,1,2… 顺序分配 ——
+        self._next_idx = 0
+        self._open_idx: int | None = None
+        self._open_type: str | None = None   # thinking / text / tool
+        self._open_tool: int | None = None   # 打开中的工具块对应的上游 index
 
     def _start(self) -> list[dict]:
         self.started = True
@@ -374,81 +393,83 @@ class _AnthropicTranslator:
             },
         }]
 
-    def _close_thinking(self, events: list[dict]):
-        """思考块收口：补 signature_delta 并 content_block_stop（原生格式，claude-code 原样落盘）。"""
-        if self._think_closed:
+    def _alloc(self) -> int:
+        """按顺序分配一个新的块 index（0,1,2…，无空洞）。"""
+        idx = self._next_idx
+        self._next_idx += 1
+        return idx
+
+    def _close_open(self, events: list[dict]):
+        """收口当前打开的块（thinking 需补 signature_delta）。无开块时空操作。"""
+        if self._open_idx is None:
             return
-        self._think_closed = True
-        events.append({"type": "content_block_delta", "index": 0,
-                       "delta": {"type": "signature_delta", "signature": _make_signature(self.model, self._reasoning_acc)}})
-        events.append({"type": "content_block_stop", "index": 0})
+        if self._open_type == "thinking":
+            # 原生 thinking 块收口：signature_delta + content_block_stop（claude-code 原样落盘）
+            events.append({"type": "content_block_delta", "index": self._open_idx,
+                           "delta": {"type": "signature_delta",
+                                     "signature": _make_signature(self.model, self._reasoning_acc)}})
+        events.append({"type": "content_block_stop", "index": self._open_idx})
+        self._open_idx = None
+        self._open_type = None
+        self._open_tool = None
+
+    def _open_block(self, events: list[dict], kind: str, content_block: dict) -> int:
+        """先收口当前块，再分配新 index 并 content_block_start。"""
+        self._close_open(events)
+        idx = self._alloc()
+        events.append({"type": "content_block_start", "index": idx,
+                       "content_block": content_block})
+        self._open_idx = idx
+        self._open_type = kind
+        return idx
 
     def feed(self, delta: dict) -> list[dict]:
         events: list[dict] = []
         if not self.started:
             events += self._start()
-        # 思考模型（gemma 等）：reasoning 作为原生 Anthropic `thinking` 块（index 0，带 signature），
-        # answer 作为 `text` 块（index 1）。原生 thinking 块会被 claude-code 原样落盘，原生 claude /
-        # 外部工具可直接识别「思考」与「答案」，无需哨兵。
+        # 思考模型（gemma 等）：reasoning 作为原生 Anthropic `thinking` 块（带 signature）。
+        # 已开着思考块就续写；否则（思考迟到：正文块已开）**先收口当前块再新开**——绝不把
+        # thinking_delta 写进正文块的 index（同号混排是非法流，claude 会掐断并回退）。
         reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
         if reasoning:
-            if not self.text_started:
-                self.text_started = True
-                self.cur_block = 0
-                self._think_started = True
-                events.append({"type": "content_block_start", "index": 0,
-                               "content_block": {"type": "thinking", "thinking": ""}})
-            events.append({"type": "content_block_delta", "index": 0,
+            if self._open_type != "thinking":
+                self._open_block(events, "thinking", {"type": "thinking", "thinking": ""})
+                self._reasoning_acc = ""  # 新思考块重新累积签名语料
+            events.append({"type": "content_block_delta", "index": self._open_idx,
                            "delta": {"type": "thinking_delta", "thinking": reasoning}})
             self._reasoning_acc += reasoning
         text = delta.get("content") or ""
         if text:
-            # 思考块开着（_think_started 且未收口）时，正文到来先收口思考块再开 answer 块；
-            # 必须校验 _think_started——纯 text（无 reasoning，如 gemma 对工具结果的短回复）
-            # 时 text_started/cur_block==0 也会满足旧条件，误发 signature_delta+stop 并把
-            # 后续文本切到 index 1，块序错乱 → claude 判「empty or malformed (HTTP 200)」
-            if self._think_started and not self._think_closed and self.cur_block == 0:
-                self._close_thinking(events)
-                self.cur_block = 1
-                self._text_started = True
-                events.append({"type": "content_block_start", "index": 1,
-                               "content_block": {"type": "text", "text": ""}})
-            elif not self.text_started:
-                self.text_started = True
-                self.cur_block = 0
-                self._text_started = True
-                events.append({"type": "content_block_start", "index": 0,
-                               "content_block": {"type": "text", "text": ""}})
-            events.append({"type": "content_block_delta", "index": self.cur_block,
+            # 正文：思考块（或已收口的正文块）开着时切新块。注意两种历史坑：
+            # ① 纯 text（无 reasoning，如 gemma 对工具结果的短回复）必须留在 index 0，不得
+            #    误发 signature_delta 把后续文本切走；② 正文 → 思考 → 正文 交替时，第三段
+            #    正文必须新开块，不能接着往已 stop 的块里写 delta。
+            if self._open_type != "text":
+                self._open_block(events, "text", {"type": "text", "text": ""})
+            events.append({"type": "content_block_delta", "index": self._open_idx,
                            "delta": {"type": "text_delta", "text": text}})
         for tc in delta.get("tool_calls") or []:
-            idx = tc.get("index", 0)
-            if idx not in self.tool_blocks:
-                # 开工具块前必须先收口已开的 thinking / text 块——否则块未 stop 就 start
-                # tool_use，违反 Anthropic 流式块序（块须 start→stop 配对、按序创建），
-                # claude 会把响应判为「empty or malformed (HTTP 200)」。三种场景：
-                # ① thinking 开着（先 reasoning 后直接 tool_calls，无 text）；② 正文 text 在
-                # index 1（有 thinking，正文在 answer 块）；③ **纯 text 总结 + tool_calls**
-                # （无 reasoning，正文 text 块在 index 0——「先总结发言再调用工具」的
-                # 两步表达引导下 gemma 常见，实测 s_8dac9d7c 触发 malformed）。
-                if self._think_started and not self._think_closed:
-                    self._close_thinking(events)
-                elif self._text_started:
-                    events.append({"type": "content_block_stop",
-                                   "index": 1 if self._think_started else 0})
-                    self._text_started = False  # 已中途收口，finish() 不再重复 stop
-                func = tc.get("function") or {}
-                self.tool_blocks[idx] = {
-                    "our": len(self.tool_blocks) + 2,
-                    "id": tc.get("id") or ("tool_" + str(idx)),
-                    "name": _restore_mcp_name(func.get("name", "")),
-                }
-                events.append({"type": "content_block_start", "index": self.tool_blocks[idx]["our"],
-                               "content_block": {"type": "tool_use", "id": self.tool_blocks[idx]["id"],
-                                                 "name": self.tool_blocks[idx]["name"]}})
+            key = tc.get("index", 0)
             func = tc.get("function") or {}
+            if key not in self.tool_blocks:
+                # 开工具块前必须先收口已开的 thinking / text 块（由 _open_block 完成）——
+                # 块未 stop 就 start tool_use 违反块序，claude 判 malformed。三种场景：
+                # ① thinking 开着（先 reasoning 后直接 tool_calls，无 text）；② 正文在
+                # index 1（有 thinking）；③ **纯 text 总结 + tool_calls**（无 reasoning，
+                # 「先总结发言再调用工具」两步表达引导下 gemma 常见，实测 s_8dac9d7c 触发）。
+                tid = tc.get("id") or ("tool_" + str(key))
+                tname = _restore_mcp_name(func.get("name", ""))
+                our = self._open_block(events, "tool", {"type": "tool_use", "id": tid,
+                                                        "name": tname})
+                self.tool_blocks[key] = {"our": our, "id": tid, "name": tname}
+                self._open_tool = key
+            elif not (self._open_type == "tool" and self._open_tool == key):
+                # 该工具块此前已被收口（异常顺序：工具参数流中间插入了别的块）——向已 stop
+                # 的块写 delta 是非法 SSE；`function_call_arguments.done` 会在收尾时补全，
+                # 故丢弃这段增量而不产出非法事件。
+                continue
             if func.get("arguments"):
-                events.append({"type": "content_block_delta", "index": self.tool_blocks[idx]["our"],
+                events.append({"type": "content_block_delta", "index": self.tool_blocks[key]["our"],
                                "delta": {"type": "input_json_delta", "partial_json": func["arguments"]}})
         return events
 
@@ -456,13 +477,8 @@ class _AnthropicTranslator:
         events: list[dict] = []
         if not self.started:
             events += self._start()
-        # 收尾：若思考块已开但未收口（只有思考、无答案），先收思考块
-        if self._think_started and not self._think_closed:
-            self._close_thinking(events)
-        if self._text_started:
-            events.append({"type": "content_block_stop", "index": 1 if self._think_started else 0})
-        for idx in sorted(self.tool_blocks):
-            events.append({"type": "content_block_stop", "index": self.tool_blocks[idx]["our"]})
+        # 收尾：收口唯一开着的块（thinking 补 signature_delta；已收口的块不会重复 stop）
+        self._close_open(events)
         # 只要本轮产了 tool_use 块，stop_reason 必须为 tool_use——即使 Ollama 原生端点把
         # done_reason 标成 stop（gemma4 实测：产出 tool_calls 但 done_reason="stop"）。否则
         # claude-code 会因 end_turn 而不回传工具结果，终止逻辑失效
@@ -528,10 +544,11 @@ def _non_stream_response_responses(body: dict, resp: dict) -> dict:
 class _ResponsesStreamAdapter:
     """把 Ollama /v1/responses 流式 SSE 事件翻译为 Anthropic Messages SSE 事件序列。
 
-    复用 _AnthropicTranslator（thinking index0 / text index1 / tool_use 块序、
-    signature、stop_reason=tool_use）。Ollama 实测：reasoning 仅在
-    `reasoning_summary_text.done` 给全文（delta 为空），text 在 `output_text.delta`，
-    tool 参数在 `function_call_arguments.delta`+`done`。
+    复用 _AnthropicTranslator（原生 thinking 块带 signature、块序动态分配、stop_reason
+    按是否产出 tool_use 决定）。Ollama 实测：reasoning 先在
+    `reasoning_summary_text.delta` 逐片给出（网关忽略）、末尾 `reasoning_summary_text.done`
+    给全文（网关据此产 thinking_delta）；text 在 `output_text.delta`；tool 参数在
+    `function_call_arguments.delta`+`done`。
     """
 
     def __init__(self, model: str = "", est_input_tokens: int = 0):
@@ -667,7 +684,11 @@ async def handle_messages(req: Request, settings: dict, project_path: str | None
     if auth:
         headers["Authorization"] = auth if auth.lower().startswith("bearer ") else "Bearer " + auth
 
-    want_stream = bool(body.get("stream", True))
+    # Anthropic Messages 的 stream 缺省为 false（缺字段 = 非流式）。这里旧实现按 True 兜底，
+    # 于是 claude SDK 的非流式回退请求（body 不带 stream）被当流式处理、回了 138KB SSE，
+    # claude 拿 SSE 当 JSON 解析失败 → 报「API returned an empty or malformed response
+    # (HTTP 200)」(2026-09-18 抓包实证)。缺省必须为 false。
+    want_stream = bool(body.get("stream", False))
 
     # 上下文长度：Responses API 仍接受 Ollama 原生 options.num_ctx（实测 0.33.3 不 400），
     # 控制 KV cache 上限，避免把上下文拉满模型原生 128k（deepseek-r1:14b 单份吃掉 ~34GB）。

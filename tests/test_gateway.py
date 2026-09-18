@@ -235,7 +235,63 @@ class TestStreamTranslator(unittest.TestCase):
         self.assertIn(("stop", 0), seq, "text 块必须在 tool_use 前收口")
         self.assertLess(seq.index(("stop", 0)), next(i for i, x in enumerate(seq) if x[0] == "start" and x[2] == "tool_use"),
                         "text 收口必须早于 tool_use start")
-        self.assertEqual(seq[-1], ("stop", 2), "tool_use 块正常收口")
+        tool_start = next(x for x in seq if x[0] == "start" and x[2] == "tool_use")
+        self.assertEqual(seq[-1], ("stop", tool_start[1]), "tool_use 块正常收口（index 动态分配）")
+
+    def _replay(self, evs):
+        """回放事件序列并校验 Anthropic 流式块序合法性（单一开块 / delta 落在开块上 / 配对）。"""
+        seq = []
+        open_idx = None
+        for e in evs:
+            t = e["type"]
+            if t == "content_block_start":
+                self.assertIsNone(open_idx, "同一时刻只能有一个开块（不得 start 未 stop 的块）")
+                open_idx = e["index"]
+                seq.append(("start", e["index"], e["content_block"]["type"]))
+            elif t == "content_block_delta":
+                self.assertEqual(e["index"], open_idx, "delta 必须落在当前开块上（不得跨块混排）")
+                seq.append(("delta", e["index"], e["delta"]["type"]))
+            elif t == "content_block_stop":
+                self.assertEqual(e["index"], open_idx, "stop 必须收口当前开块")
+                seq.append(("stop", e["index"]))
+                open_idx = None
+        self.assertIsNone(open_idx, "结尾不得残留未收口的块")
+        return seq
+
+    def test_late_thinking_closes_text_block_first(self):
+        # gemma4:26b 实测真实顺序：正文片段("---") → 思考 → 正文(答案)。旧实现把迟到的思考塞进
+        # 已打开的 text 块（同一 index 先 text_delta 再 thinking_delta）→ claude SDK 判流非法、
+        # 掐断流并触发非流式回退 → 报「API Error: empty or malformed response (HTTP 200)」
+        # （2026-09-18 抓包 probe/app-repro/raw/tap.jsonl）。必须切块：text(0) → thinking(1) → text(2)
+        t = gateway._AnthropicTranslator(model="gemma")
+        evs = []
+        evs += t.feed({"content": "---"})
+        evs += t.feed({"reasoning": "先想一下。"})
+        evs += t.feed({"content": "1"})
+        evs += t.finish()
+        seq = self._replay(evs)
+        self.assertEqual(seq, [
+            ("start", 0, "text"), ("delta", 0, "text_delta"), ("stop", 0),
+            ("start", 1, "thinking"), ("delta", 1, "thinking_delta"),
+            ("delta", 1, "signature_delta"), ("stop", 1),
+            ("start", 2, "text"), ("delta", 2, "text_delta"), ("stop", 2),
+        ], "正文→思考→正文 必须各自成块，不得同 index 混排")
+
+    def test_thinking_then_text_then_tool_all_get_distinct_blocks(self):
+        # 思考 → 正文 → 工具三连（辩论收尾常见）：三个块 index 连续、各自配对收口
+        t = gateway._AnthropicTranslator(model="gemma")
+        evs = []
+        evs += t.feed({"reasoning": "该收尾了"})
+        evs += t.feed({"content": "我们已达成一致。"})
+        evs += t.feed({"tool_calls": [{"index": 0, "id": "t1",
+                                       "function": {"name": "end_discussion", "arguments": "{\"reason\":\"x\"}"}}]})
+        evs += t.finish()
+        seq = self._replay(evs)
+        self.assertEqual([(x[0], x[1]) for x in seq if x[0] == "start"],
+                         [("start", 0), ("start", 1), ("start", 2)], "块 index 应连续分配")
+        self.assertEqual(seq[-1], ("stop", 2))
+        starts = [x[2] for x in seq if x[0] == "start"]
+        self.assertEqual(starts, ["thinking", "text", "tool_use"])
 
     def test_message_start_uses_estimated_input_tokens(self):
         # message_start 的 input_tokens 用请求估算值（Ollama 真实值流末才返回），避免恒为 0
@@ -408,6 +464,33 @@ class _FakeRequest:
         return self._body
 
 
+class _FakeNonStreamClient:
+    """模拟 Ollama /v1/responses **非流式** JSON 响应（claude SDK 的非流式回退走这条）。"""
+    captured: dict = {}
+    def __init__(self, *a, **k):
+        pass
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+    async def post(self, url, json=None, **kw):
+        cls = _FakeNonStreamClient
+        if "/api/show" in str(url):
+            class _Show:
+                status_code = 200
+                def json(self):
+                    return {"capabilities": ["completion", "tools", "thinking"]}
+            return _Show()
+        cls.captured = json or {}
+        class _R:
+            status_code = 200
+            def json(self):
+                return {"output": [{"type": "message", "content": [
+                            {"type": "output_text", "text": "你好"}]}],
+                        "usage": {"input_tokens": 4, "output_tokens": 2}}
+        return _R()
+
+
 class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
     def test_stream_route_wires_translation(self):
         orig = gateway.httpx.AsyncClient
@@ -437,6 +520,30 @@ class TestMessagesRoute(unittest.IsolatedAsyncioTestCase):
         # gemma 等本地模型慢 prefill 时会被误判「API Error: empty or malformed」退出。
         self.assertLess(out.index("message_start"), out.index("text_delta"),
                         "message_start 应先于内容事件发出")
+
+    def test_non_stream_request_returns_json_not_sse(self):
+        # 不带 stream 字段的请求（claude SDK 的非流式回退）必须回 application/json。
+        # 旧实现 want_stream 缺省 True → 回 138KB SSE，claude 拿 SSE 当 JSON 解析失败，
+        # 报「API returned an empty or malformed response (HTTP 200)」（抓包实证）。
+        orig = gateway.httpx.AsyncClient
+        gateway.httpx.AsyncClient = _FakeNonStreamClient
+        try:
+            async def run():
+                return await gateway.handle_messages(
+                    _FakeRequest({"model": "gemma4:26b",
+                                  "messages": [{"role": "user", "content": "hi"}]}),
+                    {"ollama_base_url": "http://x", "think": False},
+                )
+            resp = asyncio.run(run())
+        finally:
+            gateway.httpx.AsyncClient = orig
+        self.assertNotIn("text/event-stream", str(resp.media_type),
+                         "缺 stream 字段时不得按流式回 SSE")
+        body = json.loads(resp.body.decode())
+        self.assertEqual(body["content"][0]["text"], "你好")
+        # 转给 Ollama 的 body 也必须是非流式，否则 Ollama 回 SSE、r.json() 解析失败
+        self.assertFalse(_FakeNonStreamClient.captured.get("stream"),
+                         "非流式请求不得给 Ollama 带 stream=true")
 
     def test_stream_route_propagates_ollama_error(self):
         # Ollama 返回非 200 时，网关必须把错误透传为 SSE error 事件，
@@ -956,6 +1063,49 @@ class TestResponsesTranslation(unittest.TestCase):
         self.assertIn("【语言强制指令】", resp["instructions"])
         self.assertEqual(resp["input"][0], {"role": "user", "content": "hi"})
         self.assertTrue(resp["stream"])
+
+    def test_anthropic_to_responses_stream_defaults_false(self):
+        # Anthropic Messages 的 stream 缺省为 false（缺字段=非流式）。非流式回退请求不带该
+        # 字段，若这里按 True 兜底，Ollama 会回 SSE 而 handle_messages 又走 r.json() → 必错。
+        r = gateway.anthropic_to_responses({"model": "gemma4:26b", "messages": []})
+        self.assertFalse(r["stream"], "缺 stream 字段应按 Anthropic 缺省(false)处理")
+
+    def test_adapter_text_before_reasoning_switches_blocks(self):
+        # 真实 Ollama 事件序（curl 实测 probe/app-repro/raw/ollama_event_order.sse）：
+        # output_text.delta("---") → [一批 reasoning_summary_text.delta，网关忽略] →
+        # reasoning_summary_text.done("先想一下") → output_text.delta("1") → completed。
+        # 即「正文 → 思考 → 正文」，翻译器必须切块（text0 / thinking1 / text2），不得混排。
+        events = [
+            {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs1"}},
+            {"type": "response.output_text.delta", "delta": "---"},
+            {"type": "response.reasoning_summary_text.delta", "item_id": "rs1", "delta": "先"},
+            {"type": "response.reasoning_summary_text.done", "item_id": "rs1", "text": "先想一下"},
+            {"type": "response.output_text.delta", "delta": "1"},
+            {"type": "response.completed",
+             "response": {"output": [], "usage": {"input_tokens": 8, "output_tokens": 4}}},
+        ]
+        out = self._run_adapter(events)
+        seq = []
+        open_idx = None
+        for e in out:
+            if e["type"] == "content_block_start":
+                self.assertIsNone(open_idx, "同一时刻只能有一个开块")
+                open_idx = e["index"]
+                seq.append(("start", e["index"], e["content_block"]["type"]))
+            elif e["type"] == "content_block_delta":
+                self.assertEqual(e["index"], open_idx, "delta 必须落在当前开块上（不得跨块混排）")
+                seq.append(("delta", e["index"], e["delta"]["type"]))
+            elif e["type"] == "content_block_stop":
+                self.assertEqual(e["index"], open_idx)
+                seq.append(("stop", e["index"]))
+                open_idx = None
+        self.assertIsNone(open_idx, "结尾不得残留未收口的块")
+        self.assertEqual(seq, [
+            ("start", 0, "text"), ("delta", 0, "text_delta"), ("stop", 0),
+            ("start", 1, "thinking"), ("delta", 1, "thinking_delta"),
+            ("delta", 1, "signature_delta"), ("stop", 1),
+            ("start", 2, "text"), ("delta", 2, "text_delta"), ("stop", 2),
+        ], "正文→思考→正文 必须各自成块（旧实现同 index 混排使 claude 判流非法）")
 
     def test_anthropic_to_responses_tool_history(self):
         # assistant tool_use → 独立 function_call 项（去 mcp__ 前缀）；tool_result → function_call_output
