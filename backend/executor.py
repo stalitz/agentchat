@@ -797,10 +797,14 @@ class AgentRuntime:
                                 # 原先在此按「item 数」自增同一个当「明文条数」用的游标，单位也不一致。
                                 for _t in _rtexts:
                                     yield ("thinking", _t)
-                    # app-server 的 MCP 调用条目名为 mcpToolCall（驼峰），见 _is_mcp_tool_item
-                    elif _is_mcp_tool_item(it) and "end_discussion" in str(it.get("tool") or ""):
-                        yield ("tool_use", {"name": "end_discussion",
-                                             "input": _codex_parse_args(it.get("arguments"))})
+                    # app-server 的 MCP 调用条目名为 mcpToolCall（驼峰），见 _is_mcp_tool_item。
+                    # 受控工具（end_discussion / request_human_input）统一经 _guarded_mcp_tool 判定，
+                    # 其余 MCP 调用既不产文本、也不重复产 tool_use。
+                    elif _is_mcp_tool_item(it):
+                        _g = _guarded_mcp_tool(it)
+                        if _g:
+                            yield ("tool_use", {"name": _g,
+                                                 "input": _codex_parse_args(it.get("arguments"))})
                     else:
                         # codex 原生工具（命令执行 / 文件改动）：原先一律忽略 ⇒ codex 调了自带
                         # 工具也不落盘、界面空白（2026-09-16 修）。只认 completed，避免
@@ -1482,12 +1486,15 @@ def _parse_codex_line(text: str, runtime: "AgentRuntime | None"):
     # 既保证「必有」、又不会重复产事件（agent_message 也只发 completed）。
     item = ev.get("item")
     if _is_mcp_tool_item(item):
-        if ev.get("type") == "item.completed" and "end_discussion" in str(item.get("tool") or ""):
-            args = item.get("arguments") or {}
-            return [("tool_use", {
-                "name": "end_discussion",
-                "input": {"reason": str(args.get("reason", "") or "")},
-            })]
+        if ev.get("type") == "item.completed":
+            # 受控工具（end_discussion / request_human_input）经同一谓词判定，
+            # 入参整体透传（end_discussion 取 reason、request_human_input 取 question/options）。
+            g = _guarded_mcp_tool(item)
+            if g:
+                return [("tool_use", {
+                    "name": g,
+                    "input": _codex_parse_args(item.get("arguments")),
+                })]
         return []   # 其余 mcp 事件既不产文本、也不重复产 tool_use
     if ev.get("type") == "item.completed":
         # codex 原生工具（shell / 打补丁）：此前整条忽略 ⇒ 调了也不显示。只认 completed，
@@ -1922,6 +1929,31 @@ _MCP_TOOL_ITEM_TYPES = ("mcpToolCall", "mcp_tool_call")
 def _is_mcp_tool_item(item) -> bool:
     """item 是否为 codex 的 MCP 工具调用条目（兼容驼峰/下划线两种命名）。"""
     return isinstance(item, dict) and item.get("type") in _MCP_TOOL_ITEM_TYPES
+
+
+# 本 app 的「受控」MCP 工具（由 terminate_signal_mcp 提供）：两个都必须上报编排层——
+#   end_discussion      → 终止状态机收敛（两阶段共识）
+#   request_human_input → HITL 暂停整场等人
+# 历史 bug（2026-09-19）：两条 codex 通路的上报判定都只写 "end_discussion" in tool，
+# request_human_input 掉进 else 分支被 _codex_native_tool_use 判 None 吞掉 ⇒ 即使 codex
+# 真的调了，编排层也收不到、不会暂停（界面上只看到它在正文里空问）。两处判定集中在此共用，
+# 与 _is_mcp_tool_item 同理，避免再次分叉。
+_GUARDED_MCP_TOOLS = ("end_discussion", "request_human_input")
+
+
+def _guarded_mcp_tool(item) -> str | None:
+    """MCP 条目命中的受控工具**干净名**（end_discussion / request_human_input），否则 None。
+
+    codex 上报的工具名可能是干净名，也可能带 MCP 前缀（mcp__terminate-signal__xxx），故用
+    endswith 归一；产出干净名是编排层 _is_end_discussion / _is_human_input 的约定输入。
+    """
+    if not _is_mcp_tool_item(item):
+        return None
+    name = str(item.get("tool") or "")
+    for g in _GUARDED_MCP_TOOLS:
+        if name == g or name.endswith("__" + g):
+            return g
+    return None
 
 
 def _codex_parse_args(raw) -> dict:
