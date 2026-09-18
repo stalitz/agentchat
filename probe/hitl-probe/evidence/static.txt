@@ -1,0 +1,70 @@
+
+==============================================================================
+L1 · MCP 服务层（terminate_signal_mcp.py，claude 经项目 .mcp.json 拉起 / codex 经 -c mcp_servers.* 拉起）
+==============================================================================
+tools/list 返回 (2): ['end_discussion', 'request_human_input']
+  → 工具定义存在: True
+  → schema: {"name": "request_human_input", "description": "当你需要用户（人类）从多个方案中选择、或需要澄清任务/需求时才调用。调用后系统会暂停当前多 agent 讨论并等待人工介入——请勿在文本里直接反问对方 agent，因为对方会替你回答、导致结果偏离用户意图。question 写要问用户的问题；options 可列出候选项（前端渲染为可点选按钮，用户也可自行输入）。", "inputSchema": {"type": "object", "properties": {"question": {"type": "string", "description": "要问用户的问题"}, "options": {"type": "array", "items": {"type": "string"}, "description": "可选候选项，前端渲染为可点选按钮"}}, "required": ["question"]}}
+tools/call 回执: 【工具回执】你的 request_human_input 调用已收到（问题：用哪套方案？）。系统将暂停并等待人工介入；人工回答将作为后续用户输入，你无需自行猜测答案。
+  → isError=False
+【L1 结论】MCP server 提供并正常回执 request_human_input: True
+
+==============================================================================
+L2 · claude 路径：网关工具转发（Anthropic tools → Ollama /v1/responses tools）
+==============================================================================
+转发给本地模型的工具名: ['end_discussion', 'request_human_input', 'Bash', 'Read']
+  → request_human_input 转发: True
+  → end_discussion 转发:      True
+  → claude 内置工具放行:       True
+  → 交互型/第三方 MCP 已剥:    True
+  → 干净名（去 mcp__ 前缀）:   True
+【L2 结论】本地模型能看到 request_human_input: True
+
+==============================================================================
+L2b · 回程名还原：模型以干净名调用 → 是否还原成 claude 注册的 MCP 原名
+==============================================================================
+  request_human_input                 → mcp__terminate-signal__request_human_input
+  anthropic:request_human_input       → mcp__terminate-signal__request_human_input
+  end_discussion                      → mcp__terminate-signal__end_discussion
+  Bash                                → Bash
+  Read                                → Read
+【L2b 结论】受控工具名还原正确（内置工具不被加前缀）: True
+
+==============================================================================
+L3 · codex 上报：MCP 调用是否被转成 tool_use 事件给编排层（HITL 状态机唯一的输入）
+==============================================================================
+app-server 实时 item/completed type=mcpToolCall    → tool_use=[]
+app-server 实时 item/completed type=mcp_tool_call  → tool_use=[]
+exec/rollout _parse_codex_line type=mcpToolCall    → tool_use=[]
+exec/rollout _parse_codex_line type=mcp_tool_call  → tool_use=[]
+对照组 end_discussion(app-server)                   → tool_use=[('tool_use', {'name': 'end_discussion', 'input': {'reason': '一致'}})]
+
+  → end_discussion 能被上报: True（对照组，正常）
+  → request_human_input 能被上报: False
+  ⚠️ 同一分支只放行 end_discussion：codex 调了 request_human_input 也会被吞掉，
+     编排层收不到 tool_use ⇒ 不会暂停、前端也不会弹人工介入。这是**真的断了**，不是模型不调。
+
+==============================================================================
+L4 · 编排层： EVENT 到了之后能否被识别为人工介入（含文本 json 兜底）
+==============================================================================
+  _is_human_input('request_human_input') = True   [干净名]
+  _is_human_input('mcp__terminate-signal__request_human_input') = True   [MCP 原名]
+  _is_human_input('anthropic:request_human_input') = True   [anthropic: 变体]
+  文本 json 兜底 _extract_text_tool_call → {'name': 'request_human_input', 'input': {'question': '你选哪套？', 'options': ['A', 'B']}}
+【L4 结论】编排层能识别 request_human_input（含文本兜底）: True
+
+==============================================================================
+L5 · 提示词注入：真实会话发给 agent 的 prompt 里是否带了 HITL 指令
+==============================================================================
+  s_317d5554.jsonl: 共 6 条 prompt，含 request_human_input 指令 6 条
+【L5 结论】每轮都注入 HITL 指令: True
+
+==============================================================================
+总表
+==============================================================================
+  ✅  L1 MCP server 提供工具 + 正常回执
+  ✅  L2 网关把工具转发给本地模型（claude 路径）
+  ✅  L2b 回程名还原（干净名 → MCP 原名）
+  ❌  L3 codex 把该 MCP 调用上报编排层
+  ✅  L4 编排层识别（含文本 json 兜底）
+  ✅  L5 每轮 prompt 注入 HITL 指令

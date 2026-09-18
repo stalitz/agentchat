@@ -1,0 +1,77 @@
+{
+ "projects": {
+  "pr_hitl": {
+   "id": "pr_hitl",
+   "name": "hitl-probe",
+   "path": "/Users/stalitz/www/agent-chat/probe/hitl-probe/work",
+   "team_ids": [
+    "tm_hitl",
+    "tm_hitl_c",
+    "tm_hitl_x"
+   ]
+  }
+ },
+ "teams": {
+  "tm_hitl": {
+   "id": "tm_hitl",
+   "name": "HITL 探针（双壳 · 本地 gemma）",
+   "agent_ids": [
+    "ag_hitl_codex",
+    "ag_hitl_claude"
+   ]
+  },
+  "tm_hitl_c": {
+   "id": "tm_hitl_c",
+   "name": "HITL 单壳 · claude+gemma",
+   "agent_ids": [
+    "ag_hitl_claude"
+   ]
+  },
+  "tm_hitl_x": {
+   "id": "tm_hitl_x",
+   "name": "HITL 单壳 · codex+gemma",
+   "agent_ids": [
+    "ag_hitl_codex"
+   ]
+  }
+ },
+ "agents": {
+  "ag_hitl_codex": {
+   "id": "ag_hitl_codex",
+   "name": "H-Probe Codex",
+   "type": "codex",
+   "role": "探针用 codex：直连本机 Ollama 跑 gemma（免费）。",
+   "model": "gemma4:26b",
+   "cli_args": "",
+   "fake_terminate_round": 0,
+   "base_url": "http://localhost:11434",
+   "api_key": null,
+   "think": false
+  },
+  "ag_hitl_claude": {
+   "id": "ag_hitl_claude",
+   "name": "H-Probe Claude",
+   "type": "claude-code",
+   "role": "探针用 claude：经本 app 内置网关接本机 gemma。",
+   "model": "gemma4:26b",
+   "cli_args": "",
+   "fake_terminate_round": 0,
+   "base_url": "http://127.0.0.1:8790",
+   "api_key": null,
+   "think": false
+  }
+ },
+ "settings": {
+  "default_timeout": 300,
+  "default_max_rounds": 2,
+  "default_model": "deepseek-v4-flash",
+  "default_model_codex": "deepseek-v4-flash",
+  "ollama_base_url": "http://localhost:11434",
+  "ollama_num_ctx": 16384,
+  "think": true,
+  "claude_max_output_tokens": 64000,
+  "prompt_templates": {
+   "debate": {}
+  }
+ }
+}

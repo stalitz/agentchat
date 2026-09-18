@@ -1,0 +1,31 @@
+—— H-Probe Claude 正文末 600 字 ——
+ Bounds):** 模拟起跳腿的蹬伸轨迹。
+3.  **速度训练 (15 min):** 短距离冲刺 (20-30m) 3-5 次。
+4.  **拉伸 (10 min):** 重点放松足底筋膜与小腿。
+
+#### **课型 D：综合实战/回顾日 (Full Jump / Review)**
+*重点：将所有要素整合，进行小规模实战测试。*
+*   **内容：** 包含 A/B/C 课型的精华，并尝试在较低高度进行完整的全过程跳跃，观察在疲劳状态下动作是否变形。
+
+---
+
+### 💡 训练建议
+*   **频率安排建议：** 
+    *   **方案 1 (每周 3 次):** A $\rightarrow$ B $\rightarrow$ C (力量 $\rightarrow$ 技术 $\rightarrow$ 弹跳)。
+    *   **方案 2 (每周 4 次):** A $\rightarrow$ B $\rightarrow$ C $\rightarrow$ D (增加一个综合日)。
+*   **进阶原则：** 始终遵循“**技术先行，力量跟进**”。如果当天技术动作变形严重，应减少力量负荷，避免错误的肌肉记忆。
+
+**您觉得这个框架是否符合您的需求？或者您希望我针对其中某一个特定的环节（例如：专门针对“起跳点不稳定”或“助跑节奏乱”）进行更深度的专项练习设计？**
+
+—— H-Probe Claude 思考末 600 字 ——
+ke adding more strength or more technique).
+
+Wait, I should check if I should use `request_human_input` to ask about "injuries" or "specific focus" (e.g. approach vs take-off). Actually, a good way to continue the "conversation" is to provide the plan and then ask for feedback.
+
+Let's draft the plan content.
+Session A: Power & Strength (Weights + Core).
+Session B: Technical Drills (Approach, Take-off mechanics).
+Sessionenc C: Plyometrics & Speed (Elasticity, Reactive strength).
+Session D: Full Jump / Review (Putting it all together).
+
+I'll write the response in Simplified Chinese as requested.

@@ -1,0 +1,2 @@
+{"type": "turn_start", "agent": "H-Probe Codex", "role": "探针用 codex：直连本机 Ollama 跑 gemma（免费）。", "atype": "codex", "sid": "s_0449ef1d"}
+{"type": "turn_end", "agent": "H-Probe Codex", "sid": "s_0449ef1d"}
