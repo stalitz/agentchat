@@ -182,6 +182,10 @@ class AgentRuntime:
         # 回合内「rollout 工具兜底」状态（见 _codex_rollout_tool_events）：命令被 codex 沙盒
         # 拦下时 app-server 一个 item 都不发，只能回合内轮询 rollout 补上。
         self._as_rollout_line = 0      # 已扫到 rollout 的第几行（回合开始时按现状取快照）
+        # 回合开始时 rollout 行数的另一份快照，专供「正文兜底」用（见 _codex_rollout_msg_after）。
+        # 不能复用 _as_rollout_line：它在回合内会被工具兜底不断推进到文件末尾，
+        # 兜底时再用它就扫不到本轮的 assistant 正文了。
+        self._as_msg_line = 0
         self._as_tool_call_seen: set[str] = set()   # 已产出 tool_use 的 call_id（实时 + 兜底共用）
         self._as_tool_out_seen: set[str] = set()    # 已产出 tool_result 的 call_id（同上）
         self._as_stderr_tail = []      # app-server stderr 尾部（最多 _AS_STDERR_TAIL 行）：断流诊断用
@@ -641,6 +645,61 @@ class AgentRuntime:
         self._as_rollout_line = idx + 1
         return out
 
+    def _codex_rollout_msg_after(self, after_line: int):
+        """取 rollout 第 after_line 行之后**本轮新增**的 assistant 正文。
+
+        返回 (found, text)：found=False 表示还没扫到本轮正文（可能尚未落盘）。
+
+        为什么需要：codex 有时只把正文的**开头几个字符**走 `item/agentMessage/delta`，
+        其余在回合末才整块写进 rollout —— 实测 2026-09-19 v7（会话 s_9df8d0e4）：
+        回复轮实时流只收到 `'---\\n'`（4 字），而 rollout 里是 **512 字完整方案**
+        （预算/猫抓布/采光三层照明）。后果是这条发言落盘几乎为空，对方 agent 收到的
+        「其他 agent 的发言」是空的 ⇒ **结论永远传不过去**（用户口径③直接被卡住）。
+        只扫 after_line 之后的行：rollout 跨轮累积，否则会把历史发言当本轮正文重放。
+        """
+        if not self.cli_session_id:
+            return False, ""
+        try:
+            p = _codex_transcript_path(self.cli_session_id)
+        except Exception:
+            return False, ""
+        if not p:
+            return False, ""
+        best = ""
+        found = False
+        idx = -1
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    idx += 1
+                    if idx < after_line:
+                        continue
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        o = json.loads(ln)
+                    except json.JSONDecodeError:
+                        continue
+                    pl = o.get("payload") if isinstance(o, dict) else None
+                    if not isinstance(pl, dict) or pl.get("type") != "message":
+                        continue
+                    if pl.get("role") != "assistant":
+                        continue
+                    t = ""
+                    for k in ("text", "content"):
+                        v = pl.get(k)
+                        if isinstance(v, str):
+                            t = v
+                        elif isinstance(v, list):
+                            t = "".join(x.get("text", "") for x in v if isinstance(x, dict))
+                    found = True
+                    if len(t) > len(best):
+                        best = t
+        except OSError:
+            return False, ""
+        return found, best
+
     def _codex_new_reasoning(self, seen: int) -> list[str]:
         """返回 rollout 里第 seen 条之后新增的 reasoning 文本；读不到就返回空（绝不影响主流程）。"""
         if not self.cli_session_id:
@@ -708,7 +767,10 @@ class AgentRuntime:
         # 回合内工具兜底的起始游标：同样按 rollout 现状取（历史回合的命令不得重放），
         # 具体见 _codex_rollout_tool_events。
         self._as_rollout_line = self._codex_rollout_lines()
+        self._as_msg_line = self._as_rollout_line
         got_reasoning = False
+        # 本轮已产出的正文（delta 累计）：用于回合末与 rollout 对账、只补**缺失的尾巴**。
+        _agent_text = ""
         # 本回合已由「增量」吐过的 reasoning item id：item/completed 时据此跳过，
         # 否则同一段思考会被吐两遍（先增量流式、再整条完成通知）。
         _delta_reasoning_ids: set[str] = set()
@@ -765,6 +827,7 @@ class AgentRuntime:
                 elif m == "item/agentMessage/delta":
                     d = (o.get("params") or {}).get("delta") or ""
                     if d:
+                        _agent_text += d
                         yield ("text", d)
                 elif m == "item/reasoning/textDelta":
                     d = (o.get("params") or {}).get("delta") or ""
@@ -784,7 +847,18 @@ class AgentRuntime:
                         yield ("thinking", d)
                 elif m == "item/completed":
                     it = (o.get("params") or {}).get("item") or {}
-                    if str(it.get("type") or "") == "reasoning":
+                    _itt = str(it.get("type") or "")
+                    if _itt in ("agentMessage", "agent_message"):
+                        # 正文也可能整块随 item/completed 到达（而不是走 delta）：
+                        # 原实现只认 delta ⇒ 这类正文被静默丢弃，落盘成空发言
+                        # （v7 实测：512 字方案只落了 4 字）。只补「比已产出部分多出来的尾巴」，
+                        # 增量与整块谁先到都不会重复。
+                        _t = str(it.get("text") or "")
+                        if len(_t) > len(_agent_text) and _t.startswith(_agent_text):
+                            _tail = _t[len(_agent_text):]
+                            _agent_text = _t
+                            yield ("text", _tail)
+                    elif _itt == "reasoning":
                         # codex 原生「思考」item（协议 ThreadItem 的 reasoning 变体，
                         # 明文在 summary[]/content[]）：**必须按位实时产出**。
                         # 原先整类忽略 ⇒ 思考只能靠回合末的 rollout 兜底补，而兜底是一次性
@@ -839,6 +913,20 @@ class AgentRuntime:
                     return
                 elif m == "turn/completed":
                     self._as_turn_id = None
+                    # 回合末正文对账：codex 常见「只吐了开头几个字符就结束」（v7：4 字 vs
+                    # rollout 512 字）⇒ 补上缺失的尾巴。最多等 3×0.15s 让 rollout 落盘
+                    # （turn/completed 与 rollout 写入存在竞态）；扫到正文即停，正常轮无额外延迟。
+                    for _try in range(3):
+                        _ok, _full = self._codex_rollout_msg_after(self._as_msg_line)
+                        if _ok:
+                            if len(_full) > len(_agent_text) and _full.startswith(_agent_text):
+                                _tail = _full[len(_agent_text):]
+                                if _tail:
+                                    _agent_text = _full
+                                    yield ("text", _tail)
+                            break
+                        if _try < 2:
+                            await asyncio.sleep(0.15)
                     break
                 # 其余通知（thread/status/changed、tokenUsage、mcpServer/* 等）忽略
         finally:

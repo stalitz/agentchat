@@ -700,5 +700,65 @@ class TestToolPlan(unittest.TestCase):
                          [("tool_use", {"name": "end_discussion", "input": {"reason": "达成共识"}})])
 
 
+class TestCodexRolloutMsgFallback(unittest.TestCase):
+    """codex 正文兜底 `_codex_rollout_msg_after`：取本轮新增的 assistant 正文。
+
+    背景（2026-09-19 v7 实测 s_9df8d0e4）：codex 回复轮实时流只吐了 `'---\\n'`（4 字），
+    而 rollout 里是 512 字完整方案 ⇒ 落盘几乎为空、对方 agent 收到空转述，结论传不过去。
+    兜底只补「比已产出内容多出来的尾巴」，且只扫回合开始游标之后的行（不重放历史）。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="agentchat_rollout_")
+        self.path = os.path.join(self.dir, "rollout.jsonl")
+        self.rt = executor.AgentRuntime(models.AgentConfig(name="C", type="codex"), "sess-x")
+        self._orig = executor._codex_transcript_path
+        executor._codex_transcript_path = lambda sid: self.path
+
+    def tearDown(self):
+        executor._codex_transcript_path = self._orig
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, rows):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _msg(role, text):
+        return {"type": "response_item",
+                "payload": {"type": "message", "role": role, "text": text}}
+
+    def test_returns_assistant_text_after_cursor(self):
+        self._write([self._msg("user", "议题"),
+                     self._msg("assistant", "完整方案 512 字")])
+        found, text = self.rt._codex_rollout_msg_after(0)
+        self.assertTrue(found)
+        self.assertEqual(text, "完整方案 512 字")
+
+    def test_skips_history_before_cursor(self):
+        # 游标在第 2 行之后 ⇒ 第 1 行的历史发言不得被当本轮正文重放
+        self._write([self._msg("assistant", "上一轮的发言"),
+                     self._msg("user", "本轮问题")])
+        found, text = self.rt._codex_rollout_msg_after(1)
+        self.assertFalse(found, "游标之后没有 assistant 正文 ⇒ found=False（不补）")
+        self.assertEqual(text, "")
+
+    def test_longest_of_multiple_assistant_messages(self):
+        # codex 自驱续跑会产生多条 assistant message，取最长那条（正式结论）
+        self._write([self._msg("assistant", "---\n"),
+                     self._msg("assistant", "---\n完整方案与结论")])
+        found, text = self.rt._codex_rollout_msg_after(0)
+        self.assertTrue(found)
+        self.assertEqual(text, "---\n完整方案与结论")
+
+    def test_no_session_id_returns_not_found(self):
+        rt = executor.AgentRuntime(models.AgentConfig(name="C", type="codex"), None)
+        self.assertEqual(rt._codex_rollout_msg_after(0), (False, ""),
+                         "没有 cli_session_id 时绝不能误补（返回未找到）")
+
+
 if __name__ == "__main__":
     unittest.main()

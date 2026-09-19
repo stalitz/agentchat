@@ -396,7 +396,12 @@ class TestHitlReplyPrompt(unittest.TestCase):
         self.assertEqual(n, 2, "同一次发言里的多个提问都要收进队列")
         self.assertEqual([q["question"] for q in s._human_input_queue], ["Q1", "Q2"])
 
-    def test_pause_asks_each_question_and_returns_all_answers(self):
+    def test_pause_asks_one_question_only(self):
+        """一问一答的来回：一次只问一个，答完即返回；其余问题留在队列等下一轮。
+
+        旧实现把同批发问连续问完再拼成「1) … 2) …」一次灌回，模型看到的是
+        「用户一下发了两个回复」，来回结构丢失（用户口径 2026-09-19）。
+        """
         a = models.AgentConfig(name="A", type="codex")
         s = self._session([a])
         s._collect_human_input_questions([
@@ -409,15 +414,12 @@ class TestHitlReplyPrompt(unittest.TestCase):
             self.assertTrue(await _wait_until(lambda: s._human_input_request is not None))
             self.assertEqual(s._human_input_request["question"], "Q1")
             s.provide_human_input("答1")
-            self.assertTrue(await _wait_until(
-                lambda: (s._human_input_request or {}).get("question") == "Q2"),
-                "回答第一个后应继续问第二个（不限次数）")
-            s.provide_human_input("答2")
             return await task
 
-        answers = asyncio.run(drive())
-        self.assertEqual(answers, ["答1", "答2"])
-        self.assertEqual(s._human_input_queue, [], "问完队列应清空")
+        answer = asyncio.run(drive())
+        self.assertEqual(answer, "答1", "一次只返回这一问的回答")
+        self.assertEqual([q["question"] for q in s._human_input_queue], ["Q2"],
+                         "第二个问题留在队列，由调用方答完这一轮后再问（一问一答来回）")
         self.assertIsNone(s._human_input_request)
 
     def test_others_since_last_excludes_interim(self):
@@ -504,6 +506,54 @@ class TestChatMultiAskEndToEnd(unittest.TestCase):
         self.assertEqual(len(saved_a), 3)
         self.assertTrue(saved_a[1].get("interim"), "interim 应持久化（刷新后仍可见标注）")
         self.assertFalse(saved_a[2].get("interim"))
+
+
+class TestChatOneAskOneReplyLoop(unittest.TestCase):
+    """同一次发言里连问两次：必须拆成「问→答→再说一轮→再问→再答」的来回。
+
+    用户口径（2026-09-19）：agent 与用户的交互是**一问一答**，不是 agent 问多次、
+    用户一次回多个。旧实现把两次提问攒着连续问完、回答拼成「1) … 2) …」一次灌回，
+    提示词里就成了「用户一下发了两个回复」。
+    """
+
+    def setUp(self):
+        self.proj = "/tmp/agentchat_test_oneask_" + str(id(self))
+        self.sid = store.create_session(self.proj, "一问一答来回测试")["id"]
+
+    def test_two_questions_in_one_turn_are_asked_one_by_one(self):
+        a = models.AgentConfig(name="A", type="codex")
+        s = orch.Session(self.proj, self.sid, [a], 4, Recorder(), timeout=300)
+        rt = _ScriptedRuntime([
+            # 一次发言里连问两次
+            [("text", "先确认两件事。"),
+             _ask("Q1 预算？"), _ask("Q2 时段？"), ("done", "")],
+            [("text", "收到预算。"), ("done", "")],
+            [("text", "结论：按预算与时段执行。"), ("done", "")],
+        ])
+        s.runtimes[a.name] = rt
+
+        asked: list[str] = []
+
+        async def drive():
+            task = asyncio.create_task(s._chat_turn("做方案"))
+            for ans in ("答1-预算", "答2-时段"):
+                ok = await _wait_until(lambda: s._human_input_request is not None)
+                self.assertTrue(ok, "应逐个暂停等人（一次只问一个）")
+                asked.append(s._human_input_request["question"])
+                s.provide_human_input(ans)
+                # 等这一问被消费、队列里还有问题才会再弹下一次
+                await _wait_until(lambda: s._human_input_request is None)
+            await task
+
+        asyncio.run(drive())
+
+        self.assertEqual(asked, ["Q1 预算？", "Q2 时段？"], "两次提问都要问到，但逐个问")
+        self.assertEqual(len(rt.prompts), 3, "起问一轮 + 每条回答各续跑一轮")
+        # 关键：回复轮 prompt 每次只带**这一条**回答，不是两条一起灌
+        self.assertIn("答1-预算", rt.prompts[1])
+        self.assertNotIn("答2-时段", rt.prompts[1], "第一条回复里不该出现第二条回答")
+        self.assertIn("答2-时段", rt.prompts[2])
+        self.assertNotIn("1) 答1", "\n".join(rt.prompts), "不应再拼成编号列表一次灌回")
 
 
 class TestDebateMultiAskHandoff(unittest.TestCase):

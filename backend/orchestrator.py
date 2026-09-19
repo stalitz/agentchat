@@ -49,10 +49,11 @@ def _is_human_input(name) -> bool:
 
 
 def _join_answers(answers: list) -> str:
-    """把同一次发布内收集到的多条人工回答拼成续跑 delta。
+    """把多条人工回答拼成一段文本。
 
-    单条原样返回（保持旧行为与既有测试口径不变）；多条按序号列出，便于模型分辨
-    「哪个回答对应哪个问题」。
+    注：HITL 续跑**不再**用它拼「多条回答一次灌给 agent」（2026-09-19 用户口径：
+    交互必须是一问一答的来回——agent 问一次、用户答一次、agent 再说一轮，
+    不能把两次提问攒成「用户一下发了两个回复」）。本函数现只用于落盘/日志场景。
     """
     answers = [a for a in (answers or []) if (a or "").strip()]
     if not answers:
@@ -350,30 +351,31 @@ class Session:
         self._human_input_answer = text
         self.human_input_event.set()
 
-    async def _pause_for_human_input(self, agent) -> list[str]:
-        """检测到 request_human_input 后：把待问问题逐个推给前端、阻塞等回答、落盘回答。
+    async def _pause_for_human_input(self, agent) -> str:
+        """问**一个**问题并阻塞等该问题的回答，返回这条回答（无回答返回 ""）。
 
-        同一次发言内 agent 可多次调用工具（不限次数）⇒ 队列里的问题连续问完，返回全部回答
-        （调用方用它拼续跑 delta）。被停止/中止则提前退出，剩余问题作废（会话已不再等人）。
+        为什么一次只问一个（2026-09-19 用户口径）：agent 与用户的交互必须是
+        **一问一答的来回**——agent 问一次 → 用户答一次 → agent 据此再说一轮（这一轮里
+        它可以再问下一个问题）。旧实现把同一次发言里的多个提问**连续问完**再把回答拼
+        成「1) … 2) …」一次灌回去，模型看到的就成了「用户一下发了两个回复」，
+        来回结构丢失。调用方在每次拿到回答后跑一轮，剩余问题留在队列里等下一次循环，
+        次数仍然不限（只要 agent 调工具就走回复）。
         """
         self._hitl_asked = True   # 已问过：后续轮次不再注入「先问后答」强指令
-        answers: list[str] = []
-        while self._human_input_queue:
-            if self.stop_event.is_set() or self._abort_requested:
-                break
-            self._human_input_request = self._human_input_queue.pop(0)
-            req = self._human_input_request or {}
-            await self._emit(type="human_input_required", agent=agent.name,
-                             question=req.get("question", ""), options=req.get("options") or [])
-            await self.human_input_event.wait()
-            self.human_input_event.clear()
-            answer = (self._human_input_answer or "").strip()
-            self._human_input_answer = None
-            if answer:
-                await self._record_human(answer, "人工回答")
-                answers.append(answer)
+        if not self._human_input_queue:
+            return ""
+        self._human_input_request = self._human_input_queue.pop(0)
+        req = self._human_input_request or {}
+        await self._emit(type="human_input_required", agent=agent.name,
+                         question=req.get("question", ""), options=req.get("options") or [])
+        await self.human_input_event.wait()
+        self.human_input_event.clear()
+        answer = (self._human_input_answer or "").strip()
+        self._human_input_answer = None
         self._human_input_request = None
-        return answers
+        if answer:
+            await self._record_human(answer, "人工回答")
+        return answer
 
     # ---------------- prompt ----------------
     def _render_slot(self, slot: str, **kw) -> str:
@@ -766,10 +768,11 @@ class Session:
                         "question": str(req.get("question") or ""),
                         "options": [],
                     })
+                # 一次只问一个（一问一答来回）；队列里剩余的问题**保留**——由调用方在
+                # 本轮结束后逐个问、每次答完再跑一轮（旧实现在此 clear，把同批其余提问丢了）。
                 try:
                     await self._pause_for_human_input(agent)
                 finally:
-                    self._human_input_queue.clear()
                     self._human_input_request = None
                     self._human_input_answer = None
                 continue
@@ -1025,12 +1028,13 @@ class Session:
         # while 支持连续多次提问（不限次数：每次续跑都可能再问一次，问题经 _pause_for_human_input
         # 逐个问完）；被停止/中止则退出。
         while self._human_input_queue:
-            answers = await self._pause_for_human_input(self.agents[0])
+            # 一问一答的来回：一次只问一个问题、拿到回答后立即让同一 agent 续跑一轮
+            # （这一轮里它可以再问下一个问题 ⇒ 循环继续，次数不限）。
+            answer = await self._pause_for_human_input(self.agents[0])
             if self.stop_event.is_set() or self._abort_requested:
                 break
             # hitl_reply=True → 走轻量提示词（只带回答 + 续问/收尾引导，不重灌整轮指令）
-            await self._run_turn(self.agents[0], len(self.history),
-                                 _join_answers(answers), hitl_reply=True)
+            await self._run_turn(self.agents[0], len(self.history), answer, hitl_reply=True)
         # 失败时 _run_turn 已落 system 错误消息并广播 error；单 agent 本轮即结束，无需额外处理
         await self._emit(type="run_end", mode="chat", aborted=self._abort_requested)
 
@@ -1084,13 +1088,14 @@ class Session:
             # （不限次数：只要 agent 再调工具就走回复；同轮多次调用的问题由 _pause_for_human_input
             # 逐个问完）。须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获。
             while self._human_input_queue:
-                answers = await self._pause_for_human_input(current)
+                # 一问一答的来回（同上）：一次只问一个、答完立即续跑一轮，round_i 不变。
+                answer = await self._pause_for_human_input(current)
                 if self.stop_event.is_set() or self._abort_requested:
                     break
                 # hitl_reply=True → 走轻量提示词（只带回答 + 续问/收尾引导，不重灌整轮指令）；
                 # 该轮若又发起提问，落盘时标 interim（交互过程，不转述给对方）。
                 full, errors = await self._run_turn(
-                    current, round_i, _join_answers(answers), hitl_reply=True)
+                    current, round_i, answer, hitl_reply=True)
 
             # 发言被中止：整场停下（不推进 round_i、不喂给下一位），等「继续」由同一 agent 重说。
             # 中止 ≠ 停止：停止是「跑完当前发言不再开下一轮」，中止是当场作废这次发言。
