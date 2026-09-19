@@ -152,3 +152,46 @@ end_discussion 走得通 ⇒ request_human_input 只需放开上报过滤。
   需再跑一次端到端确认修完是否真能调通。
 - codex 内建通道 `item/tool/requestUserInput` 目前被 `_as_autoanswer` 静默空应答
   （`{"answers": {}}`）；该通道模型侧总是可见，可考虑接进 HITL，但涉及 app-server 应答时序，未改。
+
+## 11. 2026-09-19 修订：不限次数提问 + 回复轮轻量提示词 + 交互过程不转述
+
+### 11.1 触发（用户四条口径）
+
+| # | 用户判断 | 核实结论 |
+|---|---|---|
+| ① | 同一轮 agent 应支持多次提问、用户多次回复，不限次数 | **成立**（旧实现同一次发言只取最后一个 `request_human_input` / codex 只取 `questions[0]`，其余静默丢弃） |
+| ② | 回复时不需要带每轮那种完整提示词 | **成立**（用户回答走 `_build_prompt` 整轮注入，一句回答被 ~2000 字包住，含两段「用代码块代替工具调用」兜底说明） |
+| ③ | 交给对方只需最后一次结论，不带与用户的来回交互 | **部分成立**（human 消息本就被 `_others_since_last` 排除；但 agent 在 HITL 中的**中间发言**仍会原样转述） |
+| ④ | 是 HITL 交互让 claude 以为需要 `<tool_code>`，且原样喂回强化 | **修订后成立**（原「纯随机 + 单 agent 自我模仿」的结论不完整：codex rollout 逐行可见 claude 的记号被当作「对方发言」喂给 codex、codex 照抄、又被喂回 claude 的**跨 agent 传染回路**） |
+
+### 11.2 改动
+
+1. **待问队列（不限次数）**——`Session._human_input_queue` + `_collect_human_input_questions()`；
+   `_pause_for_human_input()` 逐个问完并返回回答列表；`_join_answers()` 拼 delta。
+2. **回复轮轻量提示词**——`_run_turn(hitl_reply=True)` → `_build_hitl_reply_prompt()`，
+   只含「身份 + `用户回复：<answer>` + `hitl_followup_chat/debate`」；
+   引导语＝「还有问题继续调工具问（不限次数）；没问题了把这几轮问答归纳成完整结论／方案写进正式发言正文」，
+   并说明「对方 agent 只能看到你的发言正文，看不到问答过程」。
+3. **交互过程不转述（`interim`）**——回复轮中「又发起提问」的发言标 `interim`，
+   `_others_since_last()` / `_format_conclusion()` 过滤；前端灰化 + 「交互过程（未转述给其他 agent）」角标。
+4. **不清理 `<tool_code>`**——用户口径「不要找不到问题的原因就把问题先干掉」，保留以便暴露真问题。
+   传染回路本身已由 ③ 部分缓解（这些条不再转述给对方），但**不做文本清洗**。
+
+### 11.3 语义边界（有意为之）
+
+- **起问那条发言不算 `interim`**：它含该 agent 对议题的正式观点（对话双方都需要），且只转述一次。
+  被过滤的只是「回复用户之后又问了一次」的那些中间条——它们才是「来回交互过程」。
+- **收尾那条发言不算 `interim`**：它承载归纳出的结论，必须转述给对方。
+- 判据是「本轮是否为回复轮（`hitl_reply`）且**又**发起提问」，在落盘时计算（`_run_turn` 内），
+  **不从 messages 事后推导**。
+
+### 11.4 测试
+
+- `test_hitl.py::TestHitlReplyPrompt`：轻量提示词不含轮次门槛/共识终止/完整 HITL 规则、含回答原文与续问引导；
+  debate 版说明「对方只看得到发言正文」；同轮多提问全收（旧实现只取最后一个）；队列逐个问完返回全部回答；
+  `interim` 不进对方 delta、不作结论来源。
+- `test_hitl.py::TestChatMultiAskEndToEnd`：chat 连续两问两答 → 第三次给结论；
+  回复轮 prompt 无整轮指令、起问轮仍是完整提示词；落盘 `interim` 标记正确（起问 false / 中间 true / 收尾 false）。
+- `test_hitl.py::TestDebateMultiAskHandoff`：debate 端到端——轮到 B 时其 prompt 含 A 的起问观点与结论，
+  **不含**交互过程发言、**不含**用户回答原文。
+- `test_frontend_render.js`：历史 `interim` 打标 + 角标文案；实时 `turn_end.interim` 与历史渲染一致。
