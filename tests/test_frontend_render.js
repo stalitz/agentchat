@@ -533,6 +533,18 @@ setTimeout(async () => {
     var bubbles = doc.querySelectorAll('#chat .bubble.interrupted');
     check(bubbles.length === 1, '被中止的发言气泡应带 interrupted 样式类');
     check((bubbles[0].textContent || '').indexOf('已中止') >= 0, '被中止的气泡应显示「已中止」标记');
+    // HITL 交互过程发言（interim）：内容可见，但标注「未转述给其他 agent」（对方只拿最后结论）
+    dom.window.renderHistoryEntry({ speaker: 'g1', content: '又问了一次', interim: true, blocks: [] });
+    var im = doc.querySelectorAll('#chat .bubble.interim');
+    check(im.length === 1, '交互过程发言气泡应带 interim 样式类（历史渲染）');
+    check((im[0].textContent || '').indexOf('未转述') >= 0, '交互过程气泡应标明未转述给对方 agent');
+    // 实时流：turn_end.interim 与历史渲染走同一标记，刷新前后一致
+    dom.window.chat.innerHTML = '';
+    dom.window.curSid = 's_test';
+    dom.window.handleEvent({ type: 'turn_start', agent: 'g1', sid: 's_test' });
+    dom.window.handleEvent({ type: 'token', agent: 'g1', text: '实时又问了一次', sid: 's_test' });
+    dom.window.handleEvent({ type: 'turn_end', agent: 'g1', interim: true, sid: 's_test' });
+    check(doc.querySelectorAll('#chat .bubble.interim').length === 1, '实时 turn_end.interim 也应打标（与历史一致）');
     dom.window.pendingBySid = {};
 
     // ---- 多会话并行：其他会话在跑时当前会话按钮不受影响；其他会话事件不渲染到当前聊天区 ----

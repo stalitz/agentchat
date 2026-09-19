@@ -312,5 +312,243 @@ class TestOrchestratorNativeHumanInput(unittest.TestCase):
         self.assertIn("每周4次", full, "用户回答续跑后的发言应进入本轮正文")
 
 
+class _ScriptedRuntime:
+    """按调用次序吐不同事件序列（替代 AgentRuntime），并留存每次拿到的 prompt。"""
+
+    def __init__(self, scripts):
+        self._scripts = list(scripts)
+        self.prompts = []
+        self.cli_session_id = None
+
+    def run(self, prompt, project_path, timeout, meta=None):
+        self.prompts.append(prompt)
+        script = self._scripts.pop(0) if self._scripts else [("done", "")]
+        async def gen():
+            for ev in script:
+                yield ev
+        return gen()
+
+
+async def _wait_until(pred, tries=800, delay=0.005):
+    for _ in range(tries):
+        if pred():
+            return True
+        await asyncio.sleep(delay)
+    return False
+
+
+def _ask(q, name="request_human_input", options=None):
+    return ("tool_use", {"name": name, "input": {"question": q, "options": options or []}})
+
+
+class TestHitlReplyPrompt(unittest.TestCase):
+    """HITL「回复轮」轻量提示词：只带回答 + 续问/收尾引导，不重灌整轮指令。
+
+    用户口径（2026-09-19）：回复时不需要带每轮那种完整提示词，只需告诉 agent
+    「还有问题可以继续调工具问；没问题了就总结这几次交互得出完整结论，交给另一个 agent 发言」。
+    """
+
+    def setUp(self):
+        self.proj = "/tmp/agentchat_test_hitl_reply_" + str(id(self))
+        self.sid = store.create_session(self.proj, "HITL 回复轮测试")["id"]
+
+    def _session(self, agents):
+        return orch.Session(self.proj, self.sid, agents, 6, Recorder(), timeout=300)
+
+    def test_chat_reply_prompt_is_light_and_guiding(self):
+        a = models.AgentConfig(name="A", type="codex")
+        s = self._session([a])
+        p = s._build_hitl_reply_prompt(a, "每周 3-4 次")
+        self.assertIn("每周 3-4 次", p, "必须带上用户回答原文")
+        self.assertIn("request_human_input", p, "要告知还能继续调工具问（不限次数）")
+        self.assertIn("归纳", p, "要引导把几轮问答归纳成结论")
+        self.assertNotIn("轮次门槛", p, "回复轮不重灌轮次门槛")
+        self.assertNotIn("共识终止", p, "回复轮不重灌终止规则")
+        self.assertNotIn("禁止用正文反问", p, "回复轮不重灌完整 HITL 规则")
+        self.assertNotIn("end_discussion", p, "chat 回复轮不该出现终止指令")
+
+    def test_debate_reply_prompt_tells_peer_sees_only_your_words(self):
+        a1 = models.AgentConfig(name="A", type="codex")
+        a2 = models.AgentConfig(name="B", type="codex")
+        s = self._session([a1, a2])
+        p = s._build_hitl_reply_prompt(a1, "每周 3-4 次")
+        self.assertIn("对方 agent", p, "要说明「对方只看得到你的发言正文，看不到问答过程」")
+        self.assertIn("归纳", p)
+        self.assertNotIn("轮次门槛", p)
+        self.assertNotIn("共识终止", p)
+
+    def test_join_answers_single_and_multi(self):
+        from backend.orchestrator import _join_answers
+        self.assertEqual(_join_answers([]), "")
+        self.assertEqual(_join_answers(["甲"]), "甲", "单条保持原样（不改变旧行为）")
+        self.assertEqual(_join_answers(["甲", "乙"]), "1) 甲\n2) 乙")
+        self.assertEqual(_join_answers(["", "  ", "甲"]), "甲")
+
+    def test_collect_all_questions_in_one_turn(self):
+        # 旧实现 reversed+break 只取最后一个 → 同轮多个提问被丢弃；现改为全收
+        a = models.AgentConfig(name="A", type="codex")
+        s = self._session([a])
+        n = s._collect_human_input_questions([
+            {"name": "request_human_input", "input": {"question": "Q1", "options": ["a"]}},
+            {"name": "mcp__terminate-signal__end_discussion", "input": {"reason": "x"}},
+            {"name": "mcp__terminate-signal__request_human_input", "input": {"question": "Q2"}},
+        ])
+        self.assertEqual(n, 2, "同一次发言里的多个提问都要收进队列")
+        self.assertEqual([q["question"] for q in s._human_input_queue], ["Q1", "Q2"])
+
+    def test_pause_asks_each_question_and_returns_all_answers(self):
+        a = models.AgentConfig(name="A", type="codex")
+        s = self._session([a])
+        s._collect_human_input_questions([
+            {"name": "request_human_input", "input": {"question": "Q1"}},
+            {"name": "request_human_input", "input": {"question": "Q2"}},
+        ])
+
+        async def drive():
+            task = asyncio.create_task(s._pause_for_human_input(a))
+            self.assertTrue(await _wait_until(lambda: s._human_input_request is not None))
+            self.assertEqual(s._human_input_request["question"], "Q1")
+            s.provide_human_input("答1")
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("question") == "Q2"),
+                "回答第一个后应继续问第二个（不限次数）")
+            s.provide_human_input("答2")
+            return await task
+
+        answers = asyncio.run(drive())
+        self.assertEqual(answers, ["答1", "答2"])
+        self.assertEqual(s._human_input_queue, [], "问完队列应清空")
+        self.assertIsNone(s._human_input_request)
+
+    def test_others_since_last_excludes_interim(self):
+        # 对方只应看到「起问发言 + 最后结论」，看不到与用户的来回交互过程
+        a1 = models.AgentConfig(name="A", type="codex")
+        a2 = models.AgentConfig(name="B", type="codex")
+        s = self._session([a1, a2])
+        s.history = [
+            {"speaker": "human", "role": "任务", "content": "议题"},
+            {"speaker": "A", "role": "r", "content": "起问 + 观点"},
+            {"speaker": "A", "role": "r", "content": "又问了一次", "interim": True},
+            {"speaker": "A", "role": "r", "content": "结论：按每周4次"},
+        ]
+        others = s._others_since_last(a2, round_i=1)
+        self.assertEqual([m["content"] for m in others],
+                         ["起问 + 观点", "结论：按每周4次"],
+                         "interim 的交互过程发言不应转述给对方 agent")
+
+    def test_format_conclusion_skips_interim(self):
+        a1 = models.AgentConfig(name="A", type="codex")
+        a2 = models.AgentConfig(name="B", type="codex")
+        s = self._session([a1, a2])
+        s.history = [
+            {"speaker": "A", "role": "r", "content": "结论正文"},
+            {"speaker": "A", "role": "r", "content": "又问了一次", "interim": True},
+        ]
+        self.assertEqual(s._format_conclusion(), "结论正文",
+                         "交互过程发言不能当结论来源")
+
+
+class TestChatMultiAskEndToEnd(unittest.TestCase):
+    """chat 模式端到端：agent 连续两轮问用户（不限次数）→ 每次回复走轻量提示词 → 收尾给结论。"""
+
+    def setUp(self):
+        self.proj = "/tmp/agentchat_test_multiask_" + str(id(self))
+        self.sid = store.create_session(self.proj, "多次提问测试")["id"]
+
+    def test_two_asks_then_conclusion(self):
+        a = models.AgentConfig(name="A", type="codex")
+        s = orch.Session(self.proj, self.sid, [a], 4, Recorder(), timeout=300)
+        rt = _ScriptedRuntime([
+            [("text", "先问频率。"),
+             _ask("每周几次？", options=["2", "4"]), ("done", "")],
+            [("text", "再问时段。"),
+             _ask("偏好时段？", name="mcp__terminate-signal__request_human_input"), ("done", "")],
+            [("text", "结论：每周 4 次、早上训练。"), ("done", "")],
+        ])
+        s.runtimes[a.name] = rt
+
+        async def drive():
+            task = asyncio.create_task(s._chat_turn("设计训练计划"))
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("question") == "每周几次？"))
+            s.provide_human_input("每周 4 次")
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("question") == "偏好时段？"),
+                "第一次回答后 agent 再问一次，应再次暂停（不限次数）")
+            s.provide_human_input("早上")
+            await task
+
+        asyncio.run(drive())
+
+        # 1) 三次调用：起问 / 回复后续问 / 回复后收尾
+        self.assertEqual(len(rt.prompts), 3)
+        # 2) 回复轮 prompt 是轻量的（无轮次门槛/终止规则），且带用户回答与续问引导
+        for p, ans in ((rt.prompts[1], "每周 4 次"), (rt.prompts[2], "早上")):
+            self.assertIn(ans, p)
+            self.assertIn("request_human_input", p)
+            self.assertNotIn("轮次门槛", p, "回复轮不重灌整轮提示词")
+            self.assertNotIn("共识终止", p, "回复轮不重灌整轮提示词")
+        # 3) 起问轮（非回复轮）仍是完整提示词（含完整 HITL 规则），证明只对回复轮瘦身
+        self.assertIn("禁止用正文反问", rt.prompts[0])
+
+        msgs = [m for m in s.history if m.get("speaker") == "A"]
+        self.assertEqual(len(msgs), 3)
+        self.assertFalse(msgs[0].get("interim"), "起问发言是正式发言，不算交互过程")
+        self.assertTrue(msgs[1].get("interim"), "回复后又问的那条 = 交互过程，不转述给对方")
+        self.assertFalse(msgs[2].get("interim"), "收尾结论必须转述给对方")
+        # 4) 落盘的 interim 标记可被 _others_since_last 识别（chat 无对方，这里直接断言字段）
+        self.assertIn("结论", msgs[2]["content"])
+
+
+class TestDebateMultiAskHandoff(unittest.TestCase):
+    """debate 端到端：A 连续两次提问后才给结论；交给 B 的只有「起问发言 + 结论」。
+
+    这是需求第三条的直接验证——对方 agent 不需要知道 A 与用户之间的来回交互过程，
+    连用户回答原文也不进对方 delta（human 消息本就被 _others_since_last 排除）。
+    """
+
+    def setUp(self):
+        self.proj = "/tmp/agentchat_test_multiask_debate_" + str(id(self))
+        self.sid = store.create_session(self.proj, "辩论多次提问测试")["id"]
+
+    def test_peer_sees_only_start_and_conclusion(self):
+        a1 = models.AgentConfig(name="A", type="codex")
+        a2 = models.AgentConfig(name="B", type="codex")
+        s = orch.Session(self.proj, self.sid, [a1, a2], 1, Recorder(), timeout=300)
+        rt_a = _ScriptedRuntime([
+            [("text", "观点甲：先问用户频率。"), _ask("每周几次？"), ("done", "")],
+            [("text", "过程中：还想确认时段。"), _ask("偏好时段？"), ("done", "")],
+            [("text", "结论：按答A与答B执行。"), ("done", "")],
+        ])
+        rt_b = _ScriptedRuntime([[("text", "B 收到结论。"), ("done", "")]])
+        s.runtimes[a1.name] = rt_a
+        s.runtimes[a2.name] = rt_b
+
+        async def drive():
+            task = asyncio.create_task(s._debate("设计训练计划"))
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("question") == "每周几次？"))
+            s.provide_human_input("答A-每周四次")
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("question") == "偏好时段？"))
+            s.provide_human_input("答B-早上")
+            await task
+
+        asyncio.run(drive())
+
+        # A 的三次发言：起问 / 交互过程（又问一次） / 结论
+        msgs_a = [m for m in s.history if m.get("speaker") == "A"]
+        self.assertEqual(len(msgs_a), 3)
+        self.assertTrue(msgs_a[1].get("interim"), "又问一次的那条应标为交互过程")
+        # 轮到 B 时（round_i 由 0 增到 1），它拿到的 delta 里应有 A 的观点与结论
+        b_prompt = rt_b.prompts[0]
+        self.assertIn("观点甲", b_prompt)
+        self.assertIn("结论：按答A与答B执行。", b_prompt)
+        # …但不含 A 与用户的来回交互过程，也不含用户回答原文
+        self.assertNotIn("过程中：还想确认时段。", b_prompt, "交互过程发言不应转述给对方")
+        self.assertNotIn("答A-每周四次", b_prompt, "用户回答不应进对方 delta")
+        self.assertNotIn("答B-早上", b_prompt, "用户回答不应进对方 delta")
+
+
 if __name__ == "__main__":
     unittest.main()

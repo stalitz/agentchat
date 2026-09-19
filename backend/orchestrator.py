@@ -48,6 +48,20 @@ def _is_human_input(name) -> bool:
     return isinstance(name, str) and "request_human_input" in name
 
 
+def _join_answers(answers: list) -> str:
+    """把同一次发布内收集到的多条人工回答拼成续跑 delta。
+
+    单条原样返回（保持旧行为与既有测试口径不变）；多条按序号列出，便于模型分辨
+    「哪个回答对应哪个问题」。
+    """
+    answers = [a for a in (answers or []) if (a or "").strip()]
+    if not answers:
+        return ""
+    if len(answers) == 1:
+        return answers[0]
+    return "\n".join(f"{i + 1}) {a}" for i, a in enumerate(answers))
+
+
 def _codex_answers_from_questions(questions, answer_text):
     """把前端纯文本回答映射成 codex requestUserInput 期望的 answers map。
 
@@ -217,8 +231,13 @@ class Session:
         # HITL 人工介入：agent 调 request_human_input 时编排层暂停整场、等用户回答。
         # human_input_event 初始未置位（await 即阻塞），provide_human_input 置位并存入回答。
         self.human_input_event = asyncio.Event()
-        self._human_input_request = None   # {question}：待用户回答的问题
-        self._human_input_answer = None    # str：用户回答
+        self._human_input_request = None   # {question, options}：**当前正在问**用户的问题
+        self._human_input_answer = None    # str：用户对当前问题的回答
+        # 待问队列（2026-09-19）：同一次发言内 agent 可多次调用 request_human_input，
+        # 旧实现只取最后一个（reversed+break）/ 只取 codex questions[0]，其余提问被丢弃。
+        # 改为全部收进队列，由 _pause_for_human_input 逐个问完 —— 「只要 agent 调用工具，
+        # 就走回复」，次数不限（同轮多次调工具 → 连续多次问；跨发言再问 → 下一轮继续）。
+        self._human_input_queue: list[dict] = []
         # 本场是否已向用户提过问：用于抑制「先问后答」强指令重复注入（问过一次即不再要求）。
         self._hitl_asked = False
         # 本场议题（debate 由 _debate 写入 / resume 时从历史回填；chat 不用）。
@@ -331,17 +350,30 @@ class Session:
         self._human_input_answer = text
         self.human_input_event.set()
 
-    async def _pause_for_human_input(self, agent):
-        """检测到 request_human_input 后：广播问题给前端、阻塞等用户回答、落盘回答。"""
+    async def _pause_for_human_input(self, agent) -> list[str]:
+        """检测到 request_human_input 后：把待问问题逐个推给前端、阻塞等回答、落盘回答。
+
+        同一次发言内 agent 可多次调用工具（不限次数）⇒ 队列里的问题连续问完，返回全部回答
+        （调用方用它拼续跑 delta）。被停止/中止则提前退出，剩余问题作废（会话已不再等人）。
+        """
         self._hitl_asked = True   # 已问过：后续轮次不再注入「先问后答」强指令
-        req = self._human_input_request or {}
-        await self._emit(type="human_input_required", agent=agent.name,
-                         question=req.get("question", ""), options=req.get("options") or [])
-        await self.human_input_event.wait()
-        self.human_input_event.clear()
-        answer = (self._human_input_answer or "").strip()
-        if answer:
-            await self._record_human(answer, "人工回答")
+        answers: list[str] = []
+        while self._human_input_queue:
+            if self.stop_event.is_set() or self._abort_requested:
+                break
+            self._human_input_request = self._human_input_queue.pop(0)
+            req = self._human_input_request or {}
+            await self._emit(type="human_input_required", agent=agent.name,
+                             question=req.get("question", ""), options=req.get("options") or [])
+            await self.human_input_event.wait()
+            self.human_input_event.clear()
+            answer = (self._human_input_answer or "").strip()
+            self._human_input_answer = None
+            if answer:
+                await self._record_human(answer, "人工回答")
+                answers.append(answer)
+        self._human_input_request = None
+        return answers
 
     # ---------------- prompt ----------------
     def _render_slot(self, slot: str, **kw) -> str:
@@ -371,6 +403,11 @@ class Session:
             if m.get("speaker") not in (agent.name, "system", "human")
             # 被中止的发言已作废：不喂给其他 agent（用户口径：作废但仍落盘可见）
             and not m.get("interrupted")
+            # HITL 交互过程发言（interim）：agent 与用户的来回问答（续跑中又发起提问的那些条）
+            # 是**人机交互过程**，不是给对方的观点。用户口径（2026-09-19）：只把最后归纳出的结论
+            # 带过去，不带与用户的来回交互 —— 否则对方要读一串「我又问了用户什么」，
+            # 且这些条里夹带的工具决策文本（如 gemma 自造的 `<tool_code>`）会在 agent 间互相传染。
+            and not m.get("interim")
         ]
 
     def _is_opening_turn(self, agent: AgentConfig, round_i: int) -> bool:
@@ -544,6 +581,45 @@ class Session:
             parts.append(self._render_slot("hitl_opening", task=(self._initial_task or "")[:120]))
         return "\n\n".join(parts)
 
+    def _build_hitl_reply_prompt(self, agent: AgentConfig, answer: str) -> str:
+        """HITL「回复轮」专用轻量提示词（2026-09-19 用户口径）。
+
+        用户回答经 request_human_input 交回时，只注入「回答 + 续问/收尾引导」，
+        **不复用** `_build_prompt` 的整轮提示词。理由：
+        - 用户回答本质是**一次工具交互的回执**，不是新一轮议题，不需要共识终止 / 轮次门槛 /
+          调性 / 完整 HITL 规则这些「轮到该 agent 正式发言」才需要的指令；
+        - 旧行为把一句回答用 ~2000 字包住（含两段「用代码块代替工具调用」的兜底格式说明），
+          每答一次就重灌一次工具指令 —— 把模型反复置于「表达工具决策」的语境，
+          正是 gemma 自造 `<tool_code>` 的滋生土壤；
+        - 引导语要求「没问题了就把这几轮问答归纳成结论写进正式发言正文」，因为对方 agent
+          看不到问答过程（human 已被 _others_since_last 排除、中间过程发言标 interim 也不再转述）。
+        """
+        parts = []
+        if agent.role:
+            parts.append(f"你是：{agent.role}。")
+        parts.append(f"用户回复：\n{answer}")
+        parts.append(self._render_slot(
+            "hitl_followup_chat" if self.mode == "chat" else "hitl_followup_debate"))
+        return "\n\n".join(parts)
+
+    def _collect_human_input_questions(self, tool_uses: list) -> int:
+        """把本轮**全部** request_human_input 调用收进待问队列，返回收进的问题数。
+
+        旧实现 `for tu in reversed(tool_uses): ... break` 只取最后一个，同一次发言里
+        多次调用会被丢弃（用户口径：不限次数，只要 agent 调用工具就走回复）。
+        """
+        n = 0
+        for tu in tool_uses:
+            if not (isinstance(tu, dict) and _is_human_input(tu.get("name"))):
+                continue
+            inp = tu.get("input") or {}
+            self._human_input_queue.append({
+                "question": str(inp.get("question", "") or ""),
+                "options": inp.get("options") or [],
+            })
+            n += 1
+        return n
+
     # ---------------- 单轮执行（两种模式共用） ----------------
     async def _record_human(self, text: str, role: str):
         entry = {"round": len(self.history), "speaker": "human", "role": role, "content": text}
@@ -570,13 +646,18 @@ class Session:
         跳过被中止（interrupted）的发言：那半截内容已作废，不能当结论。
         """
         for m in reversed(self.history):
-            if m.get("speaker") not in ("system", "human") and not m.get("interrupted"):
+            if m.get("speaker") not in ("system", "human") and not m.get("interrupted") \
+                    and not m.get("interim"):
                 text = "\n".join(l for l in m["content"].splitlines() if l.strip() != "TERMINATE")
                 return text.strip()
         return ""
 
-    async def _run_turn(self, agent: AgentConfig, round_i: int, inject: str | None) -> tuple[str, list[str]]:
+    async def _run_turn(self, agent: AgentConfig, round_i: int, inject: str | None,
+                        hitl_reply: bool = False) -> tuple[str, list[str]]:
         """执行单轮，返回 (full, errors)。
+
+        hitl_reply=True：本轮的 inject 是**人工介入回答**（HITL 回复轮）——
+        走轻量提示词（只注入回答 + 续问/收尾引导，不重灌整轮指令，见 _build_hitl_reply_prompt）。
 
         errors 非空 = 本轮执行失败（agent 没有产出有效回答）：
         - 不把任何内容当作 agent 发言落盘（错误文本/空响应会被误读为正常回答，
@@ -586,7 +667,8 @@ class Session:
         # 首轮（round_i==0 且 debate 模式）标记 first_turn 仅用于记录/排查；
         # 共识判定交由提示词（见 _build_prompt）引导，不再下发明示「不可讨论就 TERMINATE」指令。
         first_turn = round_i == 0 and not self.single
-        prompt = self._build_prompt(agent, inject, round_i)
+        prompt = (self._build_hitl_reply_prompt(agent, inject or "")
+                  if hitl_reply else self._build_prompt(agent, inject, round_i))
         # 记录本轮完整提示词（含首轮判定指令），便于排查与查看
         try:
             store.append_prompt_log(self.project_path, self.session_id, {
@@ -668,19 +750,26 @@ class Session:
                 # 原生 HITL 通道（codex requestUserInput）：codex 那轮已在 executor 立即回
                 # result 结束（不阻塞），此处仅真暂停整场等人；用户回答经 1:1 续接作为
                 # 下一次 prompt 续发 codex（不在本分支回 result 解锁，否则 codex 会卡死等）。
-                # 与 MCP request_human_input（tool_use）共用 _human_input_request 标记与
-                # 暂停 UI，生命周期不重叠：native 在 _run_turn 返回前已清空，不会触发
-                # chat while / debate if 的二次 pause。
+                # 与 MCP request_human_input（tool_use）共用待问队列与暂停 UI，生命周期不重叠：
+                # native 在 _run_turn 返回前已把队列清空，不会触发调用方的二次 pause。
+                # 旧实现只取 questions[0]（codex 原生支持一次问多个，其余被丢弃）→ 改为全部入队逐个问。
                 req = text or {}
-                questions = req.get("questions") or []
-                q0 = questions[0] if questions else {}
+                questions = [q for q in (req.get("questions") or []) if isinstance(q, dict)]
+                if questions:
+                    for q in questions:
+                        self._human_input_queue.append({
+                            "question": str(q.get("question") or req.get("question") or ""),
+                            "options": list(q.get("options") or []),
+                        })
+                else:
+                    self._human_input_queue.append({
+                        "question": str(req.get("question") or ""),
+                        "options": [],
+                    })
                 try:
-                    self._human_input_request = {
-                        "question": str(q0.get("question") or req.get("question") or ""),
-                        "options": list(q0.get("options") or []),
-                    }
                     await self._pause_for_human_input(agent)
                 finally:
+                    self._human_input_queue.clear()
                     self._human_input_request = None
                     self._human_input_answer = None
                 continue
@@ -707,26 +796,25 @@ class Session:
                 agent, round_i, content=full,
                 thinking="\n\n".join(thinking_parts).strip(), blocks=blocks)
             return "", []
-        await self._emit(type="turn_end", agent=agent.name)
         # 兜底：模型未拿到工具 schema（deepseek 走云端直连）时会把 end_discussion 调用
         # 写成文本 json（prompt 指令约定）。解析后并入 tool_uses，与真 tool_use 块等价，
         # 否则 deepseek 的 json 不被识别、终止状态机永不收敛、只能靠轮次上限强停。
+        # （解析与提问收集都放在 turn_end 广播之前：interim 标记依赖最终 tool_uses，
+        #   而该标记决定这条发言是否属于「HITL 交互过程」、要不要转述给对方 agent。）
         text_tool = _extract_text_tool_call(full)
         if text_tool:
             if tool_use_ts is None:
                 tool_use_ts = _now_str()   # 文本表达无独立时间戳，以解析时刻近似
             tool_uses.append(text_tool)
-        # request_human_input（HITL 人工介入）：记录待问问题，_debate/_chat_turn 据此暂停整场等人。
-        # 取最后一个调用（避免多调用时取错）；不中止本轮——发言正常落盘，由调用方续跑。
-        if not self._human_input_request:
-            for tu in reversed(tool_uses):
-                if isinstance(tu, dict) and _is_human_input(tu.get("name")):
-                    inp = tu.get("input") or {}
-                    self._human_input_request = {
-                        "question": str(inp.get("question", "") or ""),
-                        "options": inp.get("options") or [],
-                    }
-                    break
+        # request_human_input（HITL 人工介入）：把本轮**全部**提问收进待问队列，
+        # _debate/_chat_turn 据此暂停整场等人；不中止本轮——发言正常落盘，由调用方续跑。
+        asked = self._collect_human_input_questions(tool_uses)
+        # HITL 交互过程发言（interim）：本轮是「回复用户回答」的一次续跑（hitl_reply），
+        # 且 agent 又问了一次 ⇒ 这条属于「人与 agent 的来回交互过程」，**不转述给对方 agent**
+        # （用户口径 2026-09-19：只把最后归纳出的结论带过去，不带来回交互的发言）。
+        # 续跑中不再提问的那条（收尾发言）不算 interim，它承载结论、必须转述。
+        interim = bool(hitl_reply and asked)
+        await self._emit(type="turn_end", agent=agent.name, interim=interim)
         # end_discussion 终止状态机（编排层权威判定）——必须先于 errors 检查：
         # 工具由网关注入、claude 侧无对应实现，模型调用后 claude 会因「未知工具」报错退出；
         # 若先查 errors 会把工具轮误判为失败而中止。工具轮的错误应忽略（意图已被捕获）。
@@ -828,6 +916,10 @@ class Session:
             "tool_results": tool_results,
             "blocks": blocks,
         }
+        if interim:
+            # HITL 交互过程发言：落盘/显示可见（用户能看到 agent 又问了一次），
+            # 但不作为其他 agent 的上下文（_others_since_last 过滤），也不作结论来源。
+            entry["interim"] = True
         # 纯工具轮（仅工具调用/失败、无正文无思考）：意图与状态已入工具日志，但工具调用
         # 与失败结果须保留为可折叠子块可见，故仍落盘（不造假「未输出结论」占位）。
         if full or thinking_text or tool_calls or tool_results or tool_plans:
@@ -930,15 +1022,15 @@ class Session:
                 await self._record_human(text, "用户")
             await self._run_turn(self.agents[0], len(self.history), text or None)
         # HITL 人工介入（chat 模式）：agent 调 request_human_input → 暂停等人 → 同 agent 续跑。
-        # while 支持连续多次提问；被停止/中止则退出。
-        while self._human_input_request:
-            await self._pause_for_human_input(self.agents[0])
+        # while 支持连续多次提问（不限次数：每次续跑都可能再问一次，问题经 _pause_for_human_input
+        # 逐个问完）；被停止/中止则退出。
+        while self._human_input_queue:
+            answers = await self._pause_for_human_input(self.agents[0])
             if self.stop_event.is_set() or self._abort_requested:
                 break
-            answer = self._human_input_answer or ""
-            self._human_input_request = None
-            self._human_input_answer = None
-            await self._run_turn(self.agents[0], len(self.history), answer)
+            # hitl_reply=True → 走轻量提示词（只带回答 + 续问/收尾引导，不重灌整轮指令）
+            await self._run_turn(self.agents[0], len(self.history),
+                                 _join_answers(answers), hitl_reply=True)
         # 失败时 _run_turn 已落 system 错误消息并广播 error；单 agent 本轮即结束，无需额外处理
         await self._emit(type="run_end", mode="chat", aborted=self._abort_requested)
 
@@ -987,21 +1079,22 @@ class Session:
             full, errors = await self._run_turn(current, round_i, pending_inject)
             pending_inject = None
 
-            # HITL 人工介入：agent 调 request_human_input → 暂停整场等人，
-            # 回答作为下一条 delta 由「发起提问的 agent」续跑（round_i 不增，不消耗额外轮次）。
-            # 须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获不应中止。
-            if self._human_input_request:
-                await self._pause_for_human_input(current)
+            # HITL 人工介入：agent 调 request_human_input → 暂停整场等人，回答由「发起提问的 agent」
+            # 续跑（round_i 不增，不消耗额外轮次）。内层 while 支持同一次发言内连续多次提问
+            # （不限次数：只要 agent 再调工具就走回复；同轮多次调用的问题由 _pause_for_human_input
+            # 逐个问完）。须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获。
+            while self._human_input_queue:
+                answers = await self._pause_for_human_input(current)
                 if self.stop_event.is_set() or self._abort_requested:
                     break
-                pending_inject = self._human_input_answer or ""
-                self._human_input_request = None
-                self._human_input_answer = None
-                continue  # 同 agent 续跑（round_i 保持不变）
+                # hitl_reply=True → 走轻量提示词（只带回答 + 续问/收尾引导，不重灌整轮指令）；
+                # 该轮若又发起提问，落盘时标 interim（交互过程，不转述给对方）。
+                full, errors = await self._run_turn(
+                    current, round_i, _join_answers(answers), hitl_reply=True)
 
             # 发言被中止：整场停下（不推进 round_i、不喂给下一位），等「继续」由同一 agent 重说。
             # 中止 ≠ 停止：停止是「跑完当前发言不再开下一轮」，中止是当场作废这次发言。
-            if self._abort_requested:
+            if self._abort_requested or self.stop_event.is_set():
                 break
 
             # agent 执行失败（API 错误 / 空响应 / resume 异常）：不把报错信息当议题继续讨论，

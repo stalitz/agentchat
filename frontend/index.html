@@ -193,6 +193,14 @@
     margin-left:8px; padding:1px 7px; border-radius:10px; font-size:10px; font-weight:500;
     background:#f6d9d4; color:#a5301f; border:1px solid #e8b3a9;
   }
+  /* HITL 交互过程发言：agent 与用户的来回问答（续跑中又发起了一次提问）。内容保留可见
+     （用户能看到它又问了一次什么），但不转述给对方 agent（对方只拿最后归纳出的结论），
+     故灰化 + 角标区分，与「已中止」的作废语义不同（这条是有效的，只是不对外转述）。 */
+  .bubble.interim { opacity:.72; }
+  .bubble.interim .interim-tag {
+    margin-left:8px; padding:1px 7px; border-radius:10px; font-size:10px; font-weight:500;
+    background:#e8e4f6; color:#5a4b9c; border:1px solid #cfc7ea;
+  }
   /* 对话模式（单 agent）：轮次 / 暂停继续停止 / 人工介入 均不适用，隐藏以免误点 */
   body.chat-mode #roundRow, body.chat-mode #injectRow, body.chat-mode .debate-only { display:none !important; }
   #modeTag { padding:1px 7px; border-radius:10px; background:#eef1f5; }
@@ -663,6 +671,8 @@ function handleEvent(ev) {
         // 被中止：给当前气泡打「已中止」标记（内容保留可见，仅灰化）——
         // 与刷新后 renderHistoryEntry 走 interrupted 标记的渲染保持一致
         if (ev.interrupted) markInterrupted(cur);
+        // HITL 交互过程发言：与用户的来回问答（又问了一次），可见但不转述给对方 agent
+        else if (ev.interim) markInterim(cur);
       }
       curTurnAgent = null; cur = null; curAnswer = null; break;
   }
@@ -1606,6 +1616,21 @@ function markInterrupted(bodyEl) {
     who.appendChild(tag);
   }
 }
+// 给气泡打「交互过程」标记：这是 agent 与用户的来回问答（HITL 续跑中又发起了一次提问）。
+// 内容保留可见（用户能看到它又问了一次什么），但**不转述给对方 agent**——
+// 用户口径：只把最后归纳出的结论带过去，不带来回交互的发言（见 orchestrator._others_since_last）。
+function markInterim(bodyEl) {
+  if (!bodyEl || !bodyEl.closest) return;
+  var b = bodyEl.closest('.bubble');
+  if (!b) return;
+  b.classList.add('interim');
+  var who = b.querySelector('.who');
+  if (who && !who.querySelector('.interim-tag')) {
+    var tag = document.createElement('span'); tag.className = 'interim-tag';
+    tag.textContent = '交互过程（未转述给其他 agent）';
+    who.appendChild(tag);
+  }
+}
 function makeThinkingBlock(name, text, atype, open_) {
   var det = document.createElement('details'); det.className = 'turn-block thinking' + (atype ? ' ' + atype : '');
   if (open_ !== false) det.open = true;
@@ -1679,6 +1704,7 @@ function renderHistoryEntry(h) {
   // 否则导入/改名过的历史会话会被染成 claude 蓝，看上去像 claude 在说话。
   var type = cfg_agents_by_name(h.speaker) || 'unknown';
   var body = openTurn(h.speaker, type, h.ts, !!h.interrupted);
+  if (h.interim) markInterim(body);   // 刷新后与实时流（turn_end.interim）渲染保持一致
   // 时间线渲染：优先按后端产出的有序 blocks（思考/正文/工具调用/工具结果 按发生顺序），
   // 旧消息无 blocks 时回退到固定顺序（思考 → 工具调用 → 工具结果 → 正文）。
   var blocks = h.blocks;
