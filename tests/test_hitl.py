@@ -498,6 +498,12 @@ class TestChatMultiAskEndToEnd(unittest.TestCase):
         self.assertFalse(msgs[2].get("interim"), "收尾结论必须转述给对方")
         # 4) 落盘的 interim 标记可被 _others_since_last 识别（chat 无对方，这里直接断言字段）
         self.assertIn("结论", msgs[2]["content"])
+        # 5) 持久化回读：interim 必须随消息落盘（刷新后前端才能继续灰化标注）
+        saved = store.read_session(self.proj, self.sid) or {}
+        saved_a = [m for m in (saved.get("messages") or []) if m.get("speaker") == "A"]
+        self.assertEqual(len(saved_a), 3)
+        self.assertTrue(saved_a[1].get("interim"), "interim 应持久化（刷新后仍可见标注）")
+        self.assertFalse(saved_a[2].get("interim"))
 
 
 class TestDebateMultiAskHandoff(unittest.TestCase):
