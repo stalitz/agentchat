@@ -66,6 +66,12 @@ async def main() -> int:
                           json={"title": "probe：HITL 人工介入", "team_id": TEAM})
         r.raise_for_status()
         sid = (r.json().get("session") or {}).get("id")
+        # 等价 UI 勾选「思考」：会话级开启 think（覆盖全局默认，确保探针跑带思考）
+        try:
+            await hc.post(f"/api/session/{PROJ}/{sid}/think", json={"think": True})
+            echo("think = on (会话级)")
+        except Exception as e:
+            echo(f"think 开启失败（非致命）：{e}")
     echo(f"session = {sid}")
 
     hitl_seen: list[dict] = []
