@@ -103,7 +103,7 @@ def _extract_text_tool_call(full: str) -> dict | None:
 
         ```json
         {"tool": "end_discussion", "reason": "..."}
-        {"tool": "request_human_input", "question": "...", "options": ["A", "B"]}
+        {"tool": "request_human_input", "question": "..."}
         ```
 
     编排层解析后并入 tool_uses，让终止/人工介入状态机对两种表达（真 tool_use 块 / 文本 json）
@@ -217,7 +217,7 @@ class Session:
         # HITL 人工介入：agent 调 request_human_input 时编排层暂停整场、等用户回答。
         # human_input_event 初始未置位（await 即阻塞），provide_human_input 置位并存入回答。
         self.human_input_event = asyncio.Event()
-        self._human_input_request = None   # {question, options}：待用户回答的问题
+        self._human_input_request = None   # {question}：待用户回答的问题
         self._human_input_answer = None    # str：用户回答
         # 本场是否已向用户提过问：用于抑制「先问后答」强指令重复注入（问过一次即不再要求）。
         self._hitl_asked = False

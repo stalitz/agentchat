@@ -405,8 +405,7 @@
           <span id="hitlAgent" class="hitl-agent"></span>
         </div>
         <div id="hitlQuestion" class="hitl-q"></div>
-        <div id="hitlOptions" class="hitl-opts"></div>
-        <textarea id="hitlAnswer" rows="2" placeholder="在此输入你的回答（也可先点选上方选项，再补充）"></textarea>
+        <textarea id="hitlAnswer" rows="2" placeholder="在此输入你的回答，按 Enter 提交"></textarea>
         <div class="hitl-foot">
           <span class="hint">讨论已暂停，等待你的回答后继续</span>
           <button class="primary" onclick="submitHumanInput()" style="border-radius:16px; padding:6px 16px; font-weight:600;">提交回答</button>
@@ -1222,20 +1221,6 @@ function doInject() {
 function showHitlPanel(ev) {
   document.getElementById('hitlAgent').textContent = ev.agent ? ('· ' + ev.agent) : '';
   document.getElementById('hitlQuestion').textContent = ev.question || '(无具体问题，请自由回复)';
-  var opts = ev.options || [];
-  var box = document.getElementById('hitlOptions');
-  box.innerHTML = '';
-  opts.forEach(function (o) {
-    var b = document.createElement('button');
-    b.className = 'hitl-opt';
-    b.textContent = o;
-    b.onclick = function () {
-      var ta = document.getElementById('hitlAnswer');
-      ta.value = o;
-      ta.focus();
-    };
-    box.appendChild(b);
-  });
   document.getElementById('hitlAnswer').value = '';
   document.getElementById('hitlPanel').style.display = 'block';
   document.getElementById('hitlAnswer').focus();

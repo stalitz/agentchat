@@ -37,18 +37,13 @@ TOOL2_NAME = "request_human_input"
 TOOL2_DESC = (
     "当你需要用户（人类）从多个方案中选择、或需要澄清任务/需求时才调用。"
     "调用后系统会暂停当前多 agent 讨论并等待人工介入——请勿在文本里直接反问对方 agent，"
-    "因为对方会替你回答、导致结果偏离用户意图。question 写要问用户的问题；"
-    "options 可列出候选项（前端渲染为可点选按钮，用户也可自行输入）。"
+    "因为对方会替你回答、导致结果偏离用户意图。question 写要问用户的问题，"
+    "用户会用自然语言自由回复，无需你提供候选项。"
 )
 TOOL2_SCHEMA = {
     "type": "object",
     "properties": {
         "question": {"type": "string", "description": "要问用户的问题"},
-        "options": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "可选候选项，前端渲染为可点选按钮",
-        },
     },
     "required": ["question"],
 }

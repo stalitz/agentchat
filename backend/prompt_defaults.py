@@ -98,8 +98,7 @@ PROMPT_TEMPLATES_DEBATE: dict[str, str] = {
         "调用方式：工具在你的 tools 列表里（名称可能是 `request_human_input` 或带前缀如 "
         "`mcp__terminate-signal__request_human_input`），**看得到工具就必须调用工具**；"
         "**仅当**工具列表里确实没有它时，才输出下面这种多行 json 代码块（禁止压缩成一行）：\n"
-        '```json\n{\n  "tool": "request_human_input",\n  "question": "你要问我的问题",\n'
-        '  "options": ["选项A", "选项B"]\n}\n```\n'
+        '```json\n{\n  "tool": "request_human_input",\n  "question": "你要问我的问题"\n}\n```\n'
         "调用后系统会**暂停**并把我的回答交回给你，你再据此继续——所以调用后"
         "不要继续往下替我假设，也不要输出「等你回复」之类的待命文字。\n"
         "**禁止用正文反问代替工具调用**：正文里的问题不会触发暂停，我只会看到一段没有提问能力的文字。"
@@ -113,8 +112,7 @@ PROMPT_TEMPLATES_DEBATE: dict[str, str] = {
         "调用方式：工具在你的 tools 列表里（名称可能是 `request_human_input` 或带前缀如 "
         "`mcp__terminate-signal__request_human_input`），**看得到工具就必须调用工具**；"
         "**仅当**工具列表里确实没有它时，才输出下面这种多行 json 代码块（禁止压缩成一行）：\n"
-        '```json\n{\n  "tool": "request_human_input",\n  "question": "要问用户的问题",\n'
-        '  "options": ["选项A", "选项B"]\n}\n```\n'
+        '```json\n{\n  "tool": "request_human_input",\n  "question": "要问用户的问题"\n}\n```\n'
         "调用后系统会**暂停整场**等用户回答，再把回答交回给你，你据此继续（不额外消耗轮次）——"
         "所以调用后不要继续替用户做决定，也不要输出「等你回复」之类的待命文字。\n"
         "**禁止用正文反问代替工具调用**：本场是多人辩论，你写在正文里的问题会被**对方 agent** "
@@ -124,7 +122,7 @@ PROMPT_TEMPLATES_DEBATE: dict[str, str] = {
     # 议题明显要用户拍板、且本场尚未问过时，追加给首个发言者的强指令（带 <task> 占位符）。
     "hitl_opening": (
         "【本场必须先问后答】本场议题明显需要用户拍板（<task>）。请你**先调用 request_human_input 工具**"
-        "向用户问清那个决定性选择（给出 2-4 个具体选项，问题要短、要能被一句话回答），"
+        "向用户问清那个决定性选择（问题要清晰、能被一句话回答，用户会自行用自然语言回复），"
         "**拿到回答后再**给出你的方案或立场。\n"
         "不要先自行假设条件输出一整套方案——那等于替用户做决定，用户真正想要的「按我的情况选一套」不会发生。"
     ),
