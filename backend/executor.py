@@ -746,6 +746,10 @@ class AgentRuntime:
                 if o.get("_tool_use") is not None:
                     yield ("tool_use", o["_tool_use"])
                     continue
+                if o.get("_human_input") is not None:
+                    # 原生 HITL 通道：codex 阻塞等 result，编排层据此暂停等人、回包解锁。
+                    yield ("human_input", o["_human_input"])
+                    continue
                 # turn/start 的应答：记录 turn id（turn/interrupt 必需参数）。
                 # 应答与通知共用一个队列，必须在此消费掉，否则会被当成未知通知忽略。
                 if o.get("id") == rid and isinstance(o.get("result"), dict):
@@ -985,6 +989,22 @@ class AgentRuntime:
                                               "input": _codex_parse_args(it.get("arguments"))}})
                         except Exception:
                             pass
+                # 原生 HITL 通道 item/tool/requestUserInput：codex 阻塞式 ServerRequest，
+                # 不再就地空应答（旧 _as_autoanswer 会回 {"answers":{}} 假确认），而是转交
+                # 编排层走 human_input_required 真暂停等人；人回答后由编排层回 result 解锁
+                # （见 _run_codex_appserver 生成器与 _as_respond_human_input）。
+                if o.get("method") == "item/tool/requestUserInput":
+                    try:
+                        params = o.get("params") or {}
+                        await self._as_queue.put({
+                            "_human_input": {
+                                "rid": o.get("id"),
+                                "questions": params.get("questions", []),
+                            }
+                        })
+                    except Exception:
+                        pass
+                    continue
                 # 需客户端应答的 ServerRequest（审批类）：就地自动批准，不进队列
                 if "method" in o and "id" in o and isinstance(o.get("id"), (str, int)):
                     if self._as_autoanswer(o["method"], o["id"], o.get("params") or {}):
@@ -1064,9 +1084,9 @@ class AgentRuntime:
         if method == "mcpServer/elicitation/request":
             self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"action": "accept"}})
             return True
-        if method == "item/tool/requestUserInput":
-            self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"answers": {}}})
-            return True
+        # 注意：item/tool/requestUserInput 已不再在此自动空应答——旧逻辑回
+        # {"answers":{}} 是静默假确认（不真等用户）。现改由 _as_read_loop 转交编排层
+        # 走 human_input_required 真暂停，人回答后由 _as_respond_human_input 回 result 解锁。
         if method == "item/permissions/requestApproval":
             # 回授请求中声明的权限 profile（scope=session），等效放行本回合权限申请
             self._as_send({"jsonrpc": "2.0", "id": rid,
@@ -1089,6 +1109,17 @@ class AgentRuntime:
                 (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
         except Exception:
             pass
+
+    def _as_respond_human_input(self, rid, answers):
+        """HITL 原生通道：向 codex 回 requestUserInput 的 result，解锁其阻塞的 ServerRequest。
+
+        answers 结构 {questionId: answer_text}（codex 文档标准）；空则回 {"answers": {}}。
+        与 MCP request_human_input 不同：原生通道的答案必须回**同一条 app-server 流的
+        result** 才解锁，不能当续跑 prompt 喂回（否则 codex 会卡死等 result）。
+        """
+        if rid is None:
+            return
+        self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"answers": answers or {}}})
 
 
     def _next_id(self):

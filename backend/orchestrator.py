@@ -48,6 +48,23 @@ def _is_human_input(name) -> bool:
     return isinstance(name, str) and "request_human_input" in name
 
 
+def _codex_answers_from_questions(questions, answer_text):
+    """把前端纯文本回答映射成 codex requestUserInput 期望的 answers map。
+
+    codex 文档：questions 每项含 questionId（唯一键），回包 answers 以 questionId 为键。
+    多问时（罕见）统一映射到同一回答文本；无 questionId 则按 index 兜底。
+    空 questions 返回 {}（codex 接受空 answers，仅丢失本次回答）。
+    """
+    ans = {}
+    for i, q in enumerate(questions or []):
+        if not isinstance(q, dict):
+            continue
+        qid = q.get("questionId") or q.get("id") or q.get("question") or str(i)
+        ans[qid] = answer_text
+    return ans
+
+
+
 # 「议题明显要用户拍板」的措辞：命中且本场尚未问过用户时，首个发言者必须先问后答（hitl_opening）。
 # 背景（2026-09-19 实测）：议题写成「请给多套方案让我选」时，两个 gemma 都理解成「把方案摆出来
 # 即可」，各自假设条件直接开讲，用户要的「按我的情况选一套」反而没发生。命中词表刻意放宽：
@@ -641,6 +658,27 @@ class Session:
                 if is_err:
                     tool_use_errors.append(content)
                 await self._emit(type="tool_result", agent=agent.name, is_error=is_err, content=content)
+            elif kind == "human_input":
+                # 原生 HITL 通道（codex requestUserInput）：codex 本轮阻塞等 result，
+                # 在此真暂停等人、人回答后回包解锁 codex（而非当续跑 prompt）。
+                # 与 MCP request_human_input（tool_use，回合结束后续跑）走不同路径，
+                # 共用 _human_input_request 标记但生命周期不重叠：native 在 _run_turn
+                # 返回前已清空，不会触发 chat while / debate if 的二次 pause。
+                req = text or {}
+                questions = req.get("questions") or []
+                q0 = questions[0] if questions else {}
+                try:
+                    self._human_input_request = {
+                        "question": str(q0.get("question") or req.get("question") or ""),
+                        "options": list(q0.get("options") or []),
+                    }
+                    await self._pause_for_human_input(agent)
+                    ans = _codex_answers_from_questions(questions, self._human_input_answer or "")
+                    runtime._as_respond_human_input(req.get("rid"), ans)
+                finally:
+                    self._human_input_request = None
+                    self._human_input_answer = None
+                continue
             # done: 忽略
         # 流已结束 → 本轮不再是「在途」，看门狗不应再硬停（硬停会误杀已闲置的 app-server 长连接）
         self._turn_in_flight = False

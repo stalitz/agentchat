@@ -84,10 +84,16 @@ class TestAppServerAutoApprove(unittest.TestCase):
         out = self._captured(rt, "mcpServer/elicitation/request")
         self.assertEqual(out["result"]["action"], "accept")
 
-    def test_user_input_empty(self):
+    def test_user_input_no_longer_autoanswered(self):
+        # 原生 HITL 通道 item/tool/requestUserInput 已不再自动空应答：
+        # 旧逻辑回 {"answers": {}} 是静默假确认（不真等用户）。现改由读循环
+        # 转交编排层走 human_input_required 真暂停，人回答后回 result 解锁。
         rt = _rt(); rt._appserver_proc = _FakeProc()
-        out = self._captured(rt, "item/tool/requestUserInput")
-        self.assertEqual(out["result"]["answers"], {})
+        before = len(rt._appserver_proc.stdin.writes)
+        handled = rt._as_autoanswer("item/tool/requestUserInput", 7, {})
+        self.assertFalse(handled, "requestUserInput 不应再由 _as_autoanswer 自动应答")
+        self.assertEqual(len(rt._appserver_proc.stdin.writes), before,
+                         "不得向 codex 回空应答帧（假确认）")
 
     def test_permissions_echo(self):
         rt = _rt(); rt._appserver_proc = _FakeProc()
