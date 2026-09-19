@@ -38,8 +38,8 @@ TOTAL_WAIT = float(os.environ.get("PROBE_TOTAL_WAIT", "420"))
 ANSWER = os.environ.get("PROBE_ANSWER", "每周 3-4 次，每次 60-90 分钟。")
 TASK = os.environ.get("PROBE_TASK", (
     "我们要一起设计一个跳高训练计划。第一步：请你调用 request_human_input 工具向用户（人）提问，"
-    "问题写在 question 里：'你现在每周能保证几次训练？'，候选项 options 填 "
-    "['1-2 次','3-4 次','5 次以上']。记住：必须在工具里问，不要在正文里问对方 agent。"
+    "问题写在 question 里：'你现在每周能保证几次训练？'。记住：必须在工具里问，不要在正文里问对方 agent；"
+    "用户会用自然语言自由回复，你无需在工具里提供候选项。"
 ))
 
 
@@ -73,7 +73,7 @@ async def main() -> int:
     answered = False
     finished = False
 
-    async with websockets.connect(URL, max_size=None, ping_interval=20) as ws:
+    async with websockets.connect(URL, max_size=None, ping_interval=0, ping_timeout=600) as ws:
         await ws.send(json.dumps({"action": "start", "project_id": PROJ, "team_id": TEAM,
                                   "session_id": sid, "max_rounds": int(os.environ.get("PROBE_ROUNDS", "2")),
                                   "task": TASK}, ensure_ascii=False))
