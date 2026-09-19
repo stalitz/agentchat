@@ -122,5 +122,16 @@ turn（`---\n` + thinking）结束即 break，codex 自驱续跑的第二段正�
 
 ## 待办
 
-1. 修 Codex 回复轮正文丢失（`turn/completed` 后不立即 break / 或从 rollout 兜底补正文）——**未动代码，等用户定**。
+1. ~~修 Codex 回复轮正文丢失~~ —— **2026-09-20 已修**（commit a820acb）：`executor._run_codex_appserver`
+   新增 `item/completed` 的 `agentMessage` 分支（整块正文只补尾巴）+ `turn/completed` 前的
+   `_codex_rollout_msg_after()` rollout 正文对账（独立游标 `self._as_msg_line`，最多等 3×0.15s
+   应对落盘竞态）。单测 `TestCodexRolloutMsgFallback`（4 例）。**待真跑复验**。
 2. `interim` 分支需一场「回答后再次追问」的会话才能覆盖。
+
+## 追加：一问一答来回（2026-09-20 用户指出）
+
+用户看了 v7 提示词后指出：「是 agent 问一次、用户回复一次，不是 agent 问多次、用户回复多次」——
+本场 Codex 一轮内两次提问被**连续问完**、两条回答拼成 `1) … 2) …` 一次灌回，
+提示词里表现为「用户一下发了两个回复」，来回结构丢失。**成立，已修**（同 commit）：
+`_pause_for_human_input()` 改为一次只问一个、返回单条回答，调用方每条回答后立即跑一轮。
+另修掉 codex 原生分支 `finally` 里 `_human_input_queue.clear()` 丢弃同批其余提问的问题。
