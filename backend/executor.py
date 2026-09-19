@@ -977,25 +977,30 @@ class AgentRuntime:
                 except Exception:
                     continue
                 # 动态工具调用（含 end_discussion / request_human_input 经 client 路由的罕见情况）：
-                # 先捕获为 _tool_use 供编排层识别，再由其默认 item/tool/call 空成功应答让 codex 本轮结束。
+                # 捕获为 _tool_use 供编排层识别（pause / 投票），并**立即回 result 让 codex 本轮
+                # 结束（不阻塞）**——HITL 工具带中断语义（_hitl_tool_result），告知 codex「本轮
+                # 已中止、等用户下次回复」。正规 MCP 调用走 mcpToolCall（item/completed），其 result
+                # 由 terminate_signal_mcp.py 回（同样带中断语义）；本分支覆盖 client 路由的罕见路径。
                 if o.get("method") == "item/tool/call":
                     it = o.get("params") or {}
-                    tool = str(it.get("tool") or "")
-                    if "end_discussion" in tool or "request_human_input" in tool:
-                        base = tool.split("__")[-1] if "__" in tool else tool
+                    base = _guarded_mcp_tool(it)
+                    if base:
                         try:
                             await self._as_queue.put(
                                 {"_tool_use": {"name": base,
                                               "input": _codex_parse_args(it.get("arguments"))}})
                         except Exception:
                             pass
-                # 原生 HITL 通道 item/tool/requestUserInput：codex 阻塞式 ServerRequest，
-                # 不再就地空应答（旧 _as_autoanswer 会回 {"answers":{}} 假确认），而是转交
-                # 编排层走 human_input_required 真暂停等人；人回答后由编排层回 result 解锁
-                # （见 _run_codex_appserver 生成器与 _as_respond_human_input）。
+                        self._as_send({"jsonrpc": "2.0", "id": o.get("id"),
+                                      "result": _hitl_tool_result(base)})
+                        continue
+                # 原生 HITL 通道 item/tool/requestUserInput：codex 内建 ask-user（Default 模式被门禁
+                # 时也可能发）——**兜底转 request_human_input 语义**：立即回空 result 让 codex 本轮
+                # 结束（不卡），同时转交编排层走 human_input_required 真暂停；用户回答经 1:1 续接
+                # 作为下一次 prompt 续发 codex（而非回 result 解锁，否则 codex 会阻塞等人）。
                 if o.get("method") == "item/tool/requestUserInput":
+                    params = o.get("params") or {}
                     try:
-                        params = o.get("params") or {}
                         await self._as_queue.put({
                             "_human_input": {
                                 "rid": o.get("id"),
@@ -1004,6 +1009,8 @@ class AgentRuntime:
                         })
                     except Exception:
                         pass
+                    # 立即回空 result（codex 那轮结束，不卡）；真正的「用户回答」经续接续发，不走 result。
+                    self._as_send({"jsonrpc": "2.0", "id": o.get("id"), "result": {"answers": {}}})
                     continue
                 # 需客户端应答的 ServerRequest（审批类）：就地自动批准，不进队列
                 if "method" in o and "id" in o and isinstance(o.get("id"), (str, int)):
@@ -1093,7 +1100,8 @@ class AgentRuntime:
                            "result": {"permissions": params.get("permissions", {}), "scope": "session"}})
             return True
         if method == "item/tool/call":
-            # 未注册的动态工具：返回空成功，避免阻塞（end_discussion 已在读循环捕获投票）
+            # 未注册的动态工具：返回空成功，避免阻塞。受控工具（end_discussion /
+            # request_human_input）已在读循环捕获并回 _hitl_tool_result，不会落到这里。
             self._as_send({"jsonrpc": "2.0", "id": rid,
                            "result": {"contentItems": [], "success": True}})
             return True
@@ -1110,17 +1118,10 @@ class AgentRuntime:
         except Exception:
             pass
 
-    def _as_respond_human_input(self, rid, answers):
-        """HITL 原生通道：向 codex 回 requestUserInput 的 result，解锁其阻塞的 ServerRequest。
-
-        answers 结构 {questionId: answer_text}（codex 文档标准）；空则回 {"answers": {}}。
-        与 MCP request_human_input 不同：原生通道的答案必须回**同一条 app-server 流的
-        result** 才解锁，不能当续跑 prompt 喂回（否则 codex 会卡死等 result）。
-        """
-        if rid is None:
-            return
-        self._as_send({"jsonrpc": "2.0", "id": rid, "result": {"answers": answers or {}}})
-
+    # 注：request_human_input 的回包逻辑已迁移——受控工具（含 request_human_input /
+    # end_discussion）的 result 由读循环经 _hitl_tool_result 立即回（codex 那轮结束、不阻塞），
+    # 原生 requestUserInput 通道同样立即回空 result 不卡 codex；人工回答经 1:1 续接续发，
+    # 不再由 _as_respond_human_input 回 result 解锁（那会让 codex 卡死等人）。
 
     def _next_id(self):
         self._as_req_id += 1
@@ -1985,6 +1986,23 @@ def _guarded_mcp_tool(item) -> str | None:
         if name == g or name.endswith("__" + g):
             return g
     return None
+
+
+def _hitl_tool_result(base: str) -> dict:
+    """受控 MCP 工具调用后回给 codex 的 tool_result（item/tool/call 动态路由的罕见路径）。
+
+    - request_human_input：带**中断语义**，明确告诉 codex「本轮已中止、等待用户下次回复」，
+      与 terminate_signal_mcp.py 的 request_human_input handler 回执保持一致（该 handler 负责
+      mcpToolCall 常规路径）。codex 收到后本轮结束、不阻塞；用户回答经 1:1 续接作为下一次
+      输入续跑。
+    - 其余（end_discussion 等）：正常成功确认。
+    """
+    if base == "request_human_input":
+        return {"contentItems": [{"type": "text", "text": (
+            "【工具回执】你的 request_human_input 调用已收到。"
+            "系统将暂停并等待人工介入；人工回答将作为后续用户输入，你无需自行猜测答案。")}],
+            "success": True}
+    return {"contentItems": [], "success": True}
 
 
 def _codex_parse_args(raw) -> dict:

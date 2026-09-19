@@ -659,11 +659,12 @@ class Session:
                     tool_use_errors.append(content)
                 await self._emit(type="tool_result", agent=agent.name, is_error=is_err, content=content)
             elif kind == "human_input":
-                # 原生 HITL 通道（codex requestUserInput）：codex 本轮阻塞等 result，
-                # 在此真暂停等人、人回答后回包解锁 codex（而非当续跑 prompt）。
-                # 与 MCP request_human_input（tool_use，回合结束后续跑）走不同路径，
-                # 共用 _human_input_request 标记但生命周期不重叠：native 在 _run_turn
-                # 返回前已清空，不会触发 chat while / debate if 的二次 pause。
+                # 原生 HITL 通道（codex requestUserInput）：codex 那轮已在 executor 立即回
+                # result 结束（不阻塞），此处仅真暂停整场等人；用户回答经 1:1 续接作为
+                # 下一次 prompt 续发 codex（不在本分支回 result 解锁，否则 codex 会卡死等）。
+                # 与 MCP request_human_input（tool_use）共用 _human_input_request 标记与
+                # 暂停 UI，生命周期不重叠：native 在 _run_turn 返回前已清空，不会触发
+                # chat while / debate if 的二次 pause。
                 req = text or {}
                 questions = req.get("questions") or []
                 q0 = questions[0] if questions else {}
@@ -673,8 +674,6 @@ class Session:
                         "options": list(q0.get("options") or []),
                     }
                     await self._pause_for_human_input(agent)
-                    ans = _codex_answers_from_questions(questions, self._human_input_answer or "")
-                    runtime._as_respond_human_input(req.get("rid"), ans)
                 finally:
                     self._human_input_request = None
                     self._human_input_answer = None

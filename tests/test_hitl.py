@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from tests.base import models, orch, store  # noqa: E402
-from backend.executor import _guarded_mcp_tool, _parse_codex_line, AgentRuntime  # noqa: E402
+from backend.executor import _guarded_mcp_tool, _parse_codex_line, AgentRuntime, _hitl_tool_result  # noqa: E402
 from backend.orchestrator import _task_needs_human_choice, _codex_answers_from_questions  # noqa: E402
 
 
@@ -187,11 +187,15 @@ class _FakeProc:
 
 
 class TestNativeCodexHumanInput(unittest.TestCase):
-    """原生通道 item/tool/requestUserInput：不再静默空应答，转交编排层真暂停等人。"""
+    """原生通道 item/tool/requestUserInput：兜底转 request_human_input 语义，且不卡 codex。
 
-    def test_read_loop_forwards_to_queue_not_autoanswer(self):
-        # 读循环遇到 requestUserInput，应 put {"_human_input":...} 进队列，
-        # 且不向 codex 回空应答（旧 bug：_as_autoanswer 回 {"answers":{}} 假确认）。
+    关键不变量（用户纠正 2026-09-19）：requestUserInput 只是 codex 自发中断的**兜底**——
+    转成与真 request_human_input 同语义的暂停；但 codex 那轮必须立即结束（回 result），
+    不能阻塞等人。用户回答经 1:1 续接作为下一次 prompt 续发 codex。
+    """
+
+    def test_read_loop_immediately_acks_and_forwards(self):
+        # 读循环遇到 requestUserInput：立即回空 result（codex 那轮结束、不卡）+ 转交 _human_input。
         rt = AgentRuntime(models.AgentConfig(name="A", type="codex"), None)
         rt._appserver_proc = _FakeProc([
             json.dumps({"jsonrpc": "2.0", "method": "item/tool/requestUserInput",
@@ -203,7 +207,6 @@ class TestNativeCodexHumanInput(unittest.TestCase):
         async def run():
             await rt._as_read_loop()
         asyncio.run(run())
-        # 队列应收到 _human_input 与 EOF（顺序不重要，取全部）
         got = []
         while True:
             try:
@@ -211,23 +214,23 @@ class TestNativeCodexHumanInput(unittest.TestCase):
             except asyncio.QueueEmpty:
                 break
         human = next((g for g in got if g.get("_human_input")), None)
-        self.assertIsNotNone(human, "应将 requestUserInput 转交为 _human_input 事件")
+        self.assertIsNotNone(human, "应将 requestUserInput 转交为 _human_input 事件（兜底）")
         self.assertEqual(human["_human_input"]["rid"], "x1")
         self.assertEqual(human["_human_input"]["questions"][0]["questionId"], "q1")
-        self.assertTrue(any(g.get("_eof") for g in got), "EOF 仍应正常到达")
-        # 关键：读循环不得自动回空应答，否则 codex 会被假确认糊弄过去
-        self.assertEqual(rt._appserver_proc.stdin.writes, [],
-                         "requestUserInput 不应被自动空应答")
-
-    def test_respond_writes_result_frame(self):
-        # 人回答后，编排层应回 JSON-RPC result 解锁 codex 阻塞的 ServerRequest。
-        rt = AgentRuntime(models.AgentConfig(name="A", type="codex"), None)
-        rt._appserver_proc = _FakeProc([])
-        rt._as_respond_human_input("x1", {"q1": "每周4次"})
-        self.assertEqual(len(rt._appserver_proc.stdin.writes), 1)
+        # 关键：立即回空 result，codex 那轮结束、不卡——而非阻塞等人回答
+        self.assertEqual(len(rt._appserver_proc.stdin.writes), 1, "应向 codex 立即回 1 帧 result")
         frame = json.loads(rt._appserver_proc.stdin.writes[0].decode().strip())
         self.assertEqual(frame["id"], "x1")
-        self.assertEqual(frame["result"], {"answers": {"q1": "每周4次"}})
+        self.assertEqual(frame["result"], {"answers": {}})
+
+    def test_hitl_tool_result_has_interrupt_semantics(self):
+        # 受控工具回包：request_human_input 必须带中断语义（告知 codex「本轮已中止、等下次」）。
+        r = _hitl_tool_result("request_human_input")
+        self.assertTrue(r["success"])
+        self.assertIn("暂停并等待人工介入", r["contentItems"][0]["text"])
+        self.assertIn("后续用户输入", r["contentItems"][0]["text"])
+        # 其余受控工具（end_discussion）正常成功、无中断语义
+        self.assertEqual(_hitl_tool_result("end_discussion"), {"contentItems": [], "success": True})
 
 
 class TestCodexAnswersMapping(unittest.TestCase):
@@ -253,22 +256,19 @@ class TestCodexAnswersMapping(unittest.TestCase):
 
 
 class _FakeRuntime:
-    """替代 AgentRuntime：run() 吐构造好的事件序列，记录 _as_respond_human_input 调用。"""
+    """替代 AgentRuntime：run() 吐构造好的事件序列。"""
     def __init__(self, events):
         self._events = events
-        self.respond_calls = []
         self.cli_session_id = None
     def run(self, prompt, project_path, timeout, meta=None):
         async def gen():
             for ev in self._events:
                 yield ev
         return gen()
-    def _as_respond_human_input(self, rid, answers):
-        self.respond_calls.append((rid, answers))
 
 
 class TestOrchestratorNativeHumanInput(unittest.TestCase):
-    """编排层 _run_turn：收到 human_input 事件 → 广播暂停 → 人回答 → 回包解锁 → 续跑。"""
+    """编排层 _run_turn：收到 human_input 事件 → 广播暂停 → 用户回答后续发（不回 result 解锁）。"""
 
     def setUp(self):
         self.proj = "/tmp/agentchat_test_native_orch_" + str(id(self))
@@ -277,7 +277,7 @@ class TestOrchestratorNativeHumanInput(unittest.TestCase):
     def _session(self, agents):
         return orch.Session(self.proj, self.sid, agents, 4, Recorder(), timeout=300)
 
-    def test_native_channel_pauses_and_unlocks(self):
+    def test_native_channel_pauses_without_blocking_codex(self):
         a = models.AgentConfig(name="A", type="codex")
         s = self._session([a])
         rt = _FakeRuntime([
@@ -290,7 +290,6 @@ class TestOrchestratorNativeHumanInput(unittest.TestCase):
 
         async def drive():
             task = asyncio.create_task(s._run_turn(a, 0, "设计训练计划"))
-            # 等编排层进入暂停（_human_input_request 已设、事件已广播、正在 await）
             for _ in range(400):
                 if s._human_input_request:
                     break
@@ -306,12 +305,11 @@ class TestOrchestratorNativeHumanInput(unittest.TestCase):
             return await task
 
         full, errors = asyncio.run(drive())
-        # 回包解锁 codex（原生通道答案走 result，而非续跑 prompt）
-        self.assertEqual(rt.respond_calls, [("q1", {"q1": "每周4次"})],
-                         "应回 JSON-RPC result 解锁 codex")
+        # 关键不变量：原生通道不再回 result 解锁 codex（_FakeRuntime 已无 _as_respond_human_input
+        # 即证明——若编排层仍调用会 AttributeError）。用户回答经 1:1 续接作为下次 prompt 续发。
         self.assertIsNone(s._human_input_request, "处理后应清空标记")
         self.assertEqual(errors, [])
-        self.assertIn("每周4次", full, "codex 解锁后续跑的回答应进入本轮正文")
+        self.assertIn("每周4次", full, "用户回答续跑后的发言应进入本轮正文")
 
 
 if __name__ == "__main__":

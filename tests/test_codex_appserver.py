@@ -53,9 +53,16 @@ class _FakeStdin:
 
 
 class _FakeProc:
-    def __init__(self):
+    def __init__(self, lines=None):
+        self._lines = list(lines or [])
+        self.stdout = self
+        self.stderr = None
         self.stdin = _FakeStdin()
         self.returncode = None
+    async def readline(self):
+        if self._lines:
+            return (self._lines.pop(0) + "\n").encode()
+        return b""
 
 
 def _rt(**kw):
@@ -84,16 +91,35 @@ class TestAppServerAutoApprove(unittest.TestCase):
         out = self._captured(rt, "mcpServer/elicitation/request")
         self.assertEqual(out["result"]["action"], "accept")
 
-    def test_user_input_no_longer_autoanswered(self):
-        # 原生 HITL 通道 item/tool/requestUserInput 已不再自动空应答：
-        # 旧逻辑回 {"answers": {}} 是静默假确认（不真等用户）。现改由读循环
-        # 转交编排层走 human_input_required 真暂停，人回答后回 result 解锁。
-        rt = _rt(); rt._appserver_proc = _FakeProc()
-        before = len(rt._appserver_proc.stdin.writes)
-        handled = rt._as_autoanswer("item/tool/requestUserInput", 7, {})
-        self.assertFalse(handled, "requestUserInput 不应再由 _as_autoanswer 自动应答")
-        self.assertEqual(len(rt._appserver_proc.stdin.writes), before,
-                         "不得向 codex 回空应答帧（假确认）")
+    def test_user_input_immediately_ack_and_forward(self):
+        # 原生 HITL 通道 item/tool/requestUserInput（codex 内建 ask-user）兜底转
+        # request_human_input 语义：读循环**立即回空 result**让 codex 本轮结束（不卡），
+        # 同时把请求转交编排层走 human_input_required 真暂停——用户回答经 1:1 续接续发，
+        # 而非回 result 解锁（否则 codex 会阻塞等人）。
+        rt = _rt()
+        rt._appserver_proc = _FakeProc([
+            json.dumps({"jsonrpc": "2.0", "method": "item/tool/requestUserInput",
+                        "id": 7, "params": {"questions": [
+                            {"questionId": "q1", "question": "每周几次？",
+                             "options": ["2次", "4次"]}]}}),
+        ])
+        rt._as_queue = asyncio.Queue()
+        async def run():
+            await rt._as_read_loop()
+        asyncio.run(run())
+        # 立即回空 result（codex 那轮结束，不卡）
+        self.assertEqual(len(rt._appserver_proc.stdin.writes), 1, "应向 codex 立即回 1 帧 result")
+        frame = json.loads(rt._appserver_proc.stdin.writes[0].decode().strip())
+        self.assertEqual(frame["id"], 7)
+        self.assertEqual(frame["result"], {"answers": {}})
+        # 同时转交 HITL 给编排层（requestUserInput → request_human_input 语义兜底）
+        got = []
+        while True:
+            try:
+                got.append(rt._as_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        self.assertTrue(any(g.get("_human_input") for g in got), "应转交 _human_input 给编排层")
 
     def test_permissions_echo(self):
         rt = _rt(); rt._appserver_proc = _FakeProc()
