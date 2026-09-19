@@ -166,8 +166,12 @@ end_discussion 走得通 ⇒ request_human_input 只需放开上报过滤。
 
 ### 11.2 改动
 
-1. **待问队列（不限次数）**——`Session._human_input_queue` + `_collect_human_input_questions()`；
-   `_pause_for_human_input()` 逐个问完并返回回答列表；`_join_answers()` 拼 delta。
+1. **待问队列 + 一问一答来回（不限次数）**——`Session._human_input_queue` + `_collect_human_input_questions()`；
+   `_pause_for_human_input()` **一次只 pop 一个问题**，返回**这一条回答**；调用方拿到后立刻跑一轮，
+   该轮里 agent 可再问下一个 ⇒ 循环继续，次数仍不限。
+   **修订（2026-09-19 晚，用户口径）**：初版把同批提问连续问完、回答拼成「1) … 2) …」一次灌回，
+   提示词表现为「用户一下发了两个回复」——来回结构丢失。正确语义是 **agent 问一次、用户答一次、agent 再一轮**。
+   `_join_answers()` 因此退出续跑路径；codex 原生分支原先在 `finally` 里 `clear()` 队列（同批其余提问被丢）已改为保留。
 2. **回复轮轻量提示词**——`_run_turn(hitl_reply=True)` → `_build_hitl_reply_prompt()`，
    只含「身份 + `用户回复：<answer>` + `hitl_followup_chat/debate`」；
    引导语＝「还有问题继续调工具问（不限次数）；没问题了把这几轮问答归纳成完整结论／方案写进正式发言正文」，
@@ -195,3 +199,20 @@ end_discussion 走得通 ⇒ request_human_input 只需放开上报过滤。
 - `test_hitl.py::TestDebateMultiAskHandoff`：debate 端到端——轮到 B 时其 prompt 含 A 的起问观点与结论，
   **不含**交互过程发言、**不含**用户回答原文。
 - `test_frontend_render.js`：历史 `interim` 打标 + 角标文案；实时 `turn_end.interim` 与历史渲染一致。
+- `test_hitl.py::TestChatOneAskOneReplyLoop`（2026-09-19 晚新增）：同一次发言连问两次 → 逐个问、
+  每条回复的 prompt 只含**自己那一条**回答（不含另一条、也不拼编号列表），验证来回结构。
+
+## 12. 2026-09-20：codex 结论被吞（v7 留痕暴露，已修）
+
+v7 端到端（隔离实例 8790，会话 `s_9df8d0e4`，议题「20㎡ 朝北客厅软装」）跑出四条 HITL 提问，
+但落盘后 Codex 回复轮只有 `'---\n'`（4 字），而 rollout 里是 **512 字完整方案** ⇒ 交给 Claude 的
+「其他 agent 的发言」为空，**结论永远传不过去**。
+
+- **成因**：app-server 通路正文只认 `item/agentMessage/delta`；codex 常在回合末才整块落 rollout，
+  `turn/completed → break` 一到就退出，整块 item（若到达）也没有对应分支接管 ⇒ 正文丢失。
+  用户判断「你发给 claude 的话时把 codex 的方案给吞了，这是 bug」——**成立**。
+- **修复**：见 开发文档「codex 正文兜底：结论不再被吞」小节（`executor._run_codex_appserver`：
+  `item/completed` 的 `agentMessage` 分支 + `turn/completed` 前 rollout 正文对账）。
+- **与 ④ 的关系**：这条丢失**不是** `<tool_code>` 清洗问题（从未做清洗），是实时流到落盘的缺口；
+  修完才能真实验证 FR20.1 规则 3 在 codex 侧是否成立。
+- 留痕：`probe/hitl-probe/evidence/hitl_v7_multiround_20260920.md`。
