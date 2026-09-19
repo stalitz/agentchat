@@ -655,5 +655,50 @@ class TestInterrupt(unittest.TestCase):
         self.assertEqual(len(killed), 1)
 
 
+class TestToolPlan(unittest.TestCase):
+    """claude <tool_code> 规划块：comment-only 按原生工具面板样式透出为 tool_plan，
+    不裸 XML、不静默丢弃；有 name 的真实工具调用由 assistant tool_use 给出，跳过避免重复。"""
+
+    def _rt(self):
+        return executor.AgentRuntime(models.AgentConfig(name="G", type="claude-code"))
+
+    def test_classify_text_extracts_comment_only_tool_code(self):
+        # 纯 comment-only 块（无前后正文）→ 仅 tool_plan，不残留裸 XML
+        rt = self._rt()
+        out = executor._classify_text(
+            rt, "<tool_code> // 无需工具调用，继续完善训练计划的设计逻辑。 </tool_code>")
+        self.assertEqual(
+            out, [("tool_plan", {"content": "// 无需工具调用，继续完善训练计划的设计逻辑。"})])
+
+    def test_classify_text_tool_code_with_surrounding_text(self):
+        # 规划块夹在正文之间：规划块抽 tool_plan，正文照常作为 text 落盘（不吞）
+        rt = self._rt()
+        out = executor._classify_text(
+            rt, "先这样。 <tool_code> // 无需工具调用 </tool_code> 然后再说。")
+        self.assertIn(("tool_plan", {"content": "// 无需工具调用"}), out)
+        self.assertTrue(
+            any(k == "text" and "先这样" in t and "然后再说" in t for k, t in out),
+            "夹在中间的规划块不应吞掉前后正文")
+
+    def test_parse_claude_line_tool_code_comment_only(self):
+        # SDK 的 tool_code 消息，comment-only（name 空）→ tool_plan
+        line = json.dumps({"type": "tool_code", "name": "", "input": "// 无需工具调用"})
+        self.assertEqual(executor._parse_claude_line(line),
+                         [("tool_plan", {"content": "// 无需工具调用"})])
+
+    def test_parse_claude_line_tool_code_with_name_skipped(self):
+        # 有 name 的真实工具调用：最终 assistant 会以 tool_use 给出，tool_code 块跳过避免重复
+        line = json.dumps({"type": "tool_code", "name": "Edit", "input": {"file_path": "x.py"}})
+        self.assertEqual(executor._parse_claude_line(line), [],
+                         "有 name 的工具调用应由 assistant tool_use 给出，tool_code 块应跳过")
+
+    def test_parse_claude_line_assistant_tool_use_unaffected(self):
+        # tool_plan 分支不影响既有 assistant tool_use 透传
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "end_discussion", "input": {"reason": "达成共识"}}]}})
+        self.assertEqual(executor._parse_claude_line(line),
+                         [("tool_use", {"name": "end_discussion", "input": {"reason": "达成共识"}})])
+
+
 if __name__ == "__main__":
     unittest.main()

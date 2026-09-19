@@ -1367,34 +1367,59 @@ def _classify_text(runtime: "AgentRuntime | None", text: str) -> list:
     """
     if not text:
         return []
-    out = []
-    ti = text.find(THINK_SENT)
-    ai = text.find(ANSW_SENT)
+    # 1) 抽取 <tool_code>...</tool_code> 规划块（comment-only 或裸工具意图）作为 tool_plan 事件，
+    #    不进正文、不裸 XML。原生 Claude Code 把 <tool_code> 渲染为工具面板，这里对齐——否则这类块
+    #    被静默丢弃（尤其 gemma 模仿 claude 写 `// 无需工具调用` 注释时），用户看不到模型的工具决策。
+    parts: list[str] = []
+    out: list = []
+    i = 0
+    while True:
+        s = text.find("<tool_code>", i)
+        if s == -1:
+            parts.append(text[i:])
+            break
+        e = text.find("</tool_code>", s)
+        if e == -1:
+            parts.append(text[i:])
+            break
+        pre = text[i:s]
+        if pre:
+            parts.append(pre)
+        inner = text[s + len("<tool_code>"):e].strip()
+        if inner:
+            out.append(("tool_plan", {"content": inner}))
+        i = e + len("</tool_code>")
+    cleaned = "".join(parts)
+    if not cleaned:
+        return out
+    # 2) 哨兵切分（作用在 cleaned 上）
+    ti = cleaned.find(THINK_SENT)
+    ai = cleaned.find(ANSW_SENT)
     if ti == -1 and ai == -1:
         # 无哨兵：续接段或默认答案
         if runtime is not None and runtime._section == "think":
-            out.append(("thinking", text))
+            out.append(("thinking", cleaned))
         else:
             if runtime is not None:
                 runtime._section = "ans"
-            out.append(("text", text))
+            out.append(("text", cleaned))
         return out
     if ti == -1:
         # 只有 ANSW（非思考模型：answer 块被 claude 拆/合并，哨兵前的内容也是答案）→ 去哨兵整段当答案
-        cleaned = text[:ai] + text[ai + len(ANSW_SENT):]
+        c2 = cleaned[:ai] + cleaned[ai + len(ANSW_SENT):]
         if runtime is not None:
             runtime._section = "ans"
-        if cleaned:
-            out.append(("text", cleaned))
+        if c2:
+            out.append(("text", c2))
         return out
     # 有 THINK 哨兵
     if runtime is not None:
         runtime._section = "think"
-    think_text = text[ti + len(THINK_SENT): ai if (ai != -1 and ai > ti) else len(text)]
+    think_text = cleaned[ti + len(THINK_SENT): ai if (ai != -1 and ai > ti) else len(cleaned)]
     if think_text:
         out.append(("thinking", think_text))
     if ai != -1 and ai > ti:
-        ans_text = text[ai + len(ANSW_SENT):]
+        ans_text = cleaned[ai + len(ANSW_SENT):]
         if runtime is not None:
             runtime._section = "ans"
         if ans_text:
@@ -1461,6 +1486,17 @@ def _parse_claude_line(text: str, runtime: "AgentRuntime | None" = None):
                 }))
         if out:
             return out
+    # tool_code SDK 消息：claude-code 把模型写的 <tool_code> 块解析为此类。
+    # 有 name（真实工具调用）→ 最终 assistant 消息会以 tool_use 项给出，这里跳过避免重复；
+    # 无 name（comment-only 规划块，如 `// 无需工具调用`）→ 作为 tool_plan 透出，
+    # 让前端按原生工具面板样式渲染（否则这类块被静默丢弃，用户看不到模型的工具决策）。
+    if t == "tool_code":
+        nm = ev.get("name") or ""
+        if not nm:
+            inp = ev.get("input")
+            content = inp if isinstance(inp, str) else (json.dumps(inp, ensure_ascii=False) if inp else "")
+            return [("tool_plan", {"content": content})]
+        return []
     # user 事件：可能是 tool_result（工具执行失败后的结果回传）。claude-code 把失败结果
     # 以 user.message.content[].{type:tool_result, is_error:true} 发出，必须透传给编排层，
     # 否则「No such tool available」这类错误会被完全吞掉。

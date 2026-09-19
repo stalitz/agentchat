@@ -175,6 +175,8 @@
   .turn-block.tool-result .err-tag { color:#fff; background:#c0392b; border-radius:4px; padding:0 5px; font-size:10px; margin-left:2px; }
   .turn-block.tool-result:not(.err) { border-left-color:#5bbd86; }
   .turn-block.tool-result:not(.err) > summary { color:#2f9e63; }
+  .turn-block.tool-plan { border-left-color:#c9a14a; background:#fdfaf0; }
+  .turn-block.tool-plan > summary { color:#9a7b22; }
   .who { font-size:11px; color:var(--muted); margin-bottom:3px; }
   .who .ts { margin-left:8px; color:#c6c6d2; font-size:10px; font-weight:400; }
   #composer { border-top:1px solid var(--line); padding:10px 14px; background:var(--panel); height:var(--composer-h); overflow:auto; }
@@ -637,6 +639,10 @@ function handleEvent(ev) {
       curTurnAgent = ev.agent || curTurnAgent;
       appendToolResult(ev.is_error, ev.content, agentNameColor[ev.agent] || 'unknown');
       break;
+    case 'tool_plan':
+      curTurnAgent = ev.agent || curTurnAgent;
+      appendToolPlan(ev.content, agentNameColor[ev.agent] || 'unknown');
+      break;
     case 'turn_end':
       hideLoading();  // 防御：确保加载占位被撤（内容流正常时已在 thinking/token 撤掉）
       // 只有思考、无正文时也要建气泡（承载思考子块）
@@ -723,6 +729,15 @@ function appendToolResult(isError, content, atype) {
   hideLoading();
   if (!cur) openTurn(curTurnAgent || 'Agent', atype);
   cur.appendChild(makeToolResultBlock({ is_error: !!isError, content: content }, null));
+  curThinking = null; curThinkingBody = null; curThinkingCnt = 0; curAnswer = null;
+  scrollChatBottom();
+}
+// 工具规划块（claude <tool_code> comment-only，如 `// 无需工具调用`）：对齐原生 Claude Code
+// 的工具面板样式，但用琥珀色区分「规划中、未执行」与已执行的 tool_use。
+function appendToolPlan(content, atype) {
+  hideLoading();
+  if (!cur) openTurn(curTurnAgent || 'Agent', atype);
+  cur.appendChild(makeToolPlanBlock({ content: content || '' }));
   curThinking = null; curThinkingBody = null; curThinkingCnt = 0; curAnswer = null;
   scrollChatBottom();
 }
@@ -1635,6 +1650,15 @@ function makeToolResultBlock(tr, statusLabel) {
   det.appendChild(sum); det.appendChild(body);
   return det;
 }
+function makeToolPlanBlock(tp) {
+  var det = document.createElement('details'); det.className = 'turn-block tool-plan'; det.open = true;
+  var sum = document.createElement('summary');
+  sum.innerHTML = '📝 工具规划 <code>tool_code</code>';
+  var body = document.createElement('div'); body.className = 'turn-block-body';
+  body.innerHTML = '<pre>' + esc((tp.content || '').replace(/^\/\/\s?/, '// ')) + '</pre>';
+  det.appendChild(sum); det.appendChild(body);
+  return det;
+}
 // 终止工具结果按工具日志 action 翻译成中文状态（供气泡内工具结果块展示）
 function toolStatusCnFor(speaker, round) {
   if (!curToolLog || !curToolLog.length) return null;
@@ -1677,6 +1701,9 @@ function renderHistoryEntry(h) {
         // 终止工具：首个结果块带中文状态标注（被拒/提议终止/对方确认·终止）
         body.appendChild(makeToolResultBlock(b, firstResult ? endStatus : null));
         firstResult = false;
+      } else if (b.type === 'tool_plan') {
+        // claude <tool_code> 规划块：对齐原生工具面板（琥珀色，区别于已执行的 tool_use）
+        body.appendChild(makeToolPlanBlock(b));
       }
     });
     return;

@@ -658,6 +658,12 @@ class Session:
                 if is_err:
                     tool_use_errors.append(content)
                 await self._emit(type="tool_result", agent=agent.name, is_error=is_err, content=content)
+            elif kind == "tool_plan":
+                # claude 的 <tool_code> 规划块（comment-only，如 `// 无需工具调用`）：原生 Claude Code
+                # 渲染为工具面板，这里对齐——作为独立时间线块，区别于已执行的 tool_use。
+                content = text.get("content", "") if isinstance(text, dict) else str(text)
+                _push_block("tool_plan", content=content)
+                await self._emit(type="tool_plan", agent=agent.name, content=content)
             elif kind == "human_input":
                 # 原生 HITL 通道（codex requestUserInput）：codex 那轮已在 executor 立即回
                 # result 结束（不阻塞），此处仅真暂停整场等人；用户回答经 1:1 续接作为
@@ -804,12 +810,14 @@ class Session:
         tool_calls = [tu for tu in tool_uses if isinstance(tu, dict)]
         # 工具结果（成功 + 失败）按时间线已从流式 blocks 收集；同时保留 legacy 字段兼容旧渲染
         tool_results = [b for b in blocks if b["type"] == "tool_result"]
+        # <tool_code> 规划块：纯规划轮（无正文/思考/工具调用）也应落盘可见，不判空轮跳过
+        tool_plans = [b for b in blocks if b["type"] == "tool_plan"]
         # 思考随答案一起落盘（刷新后仍可见）；正文只存 answer，不拿 thinking 回填，
         # 避免历史/实时把整段思考重复渲染到结论气泡。
         # 空轮判定：无正文、无思考、且无任何工具调用/工具结果 → 本地模型偶发空响应，
         # 不落空 agent 发言（避免刷新后一串空气泡）；仅广播提示，不持久化。
         # 纯工具轮（仅 tool_calls / tool_results）则保留为气泡，工具调用与失败可见。
-        if not full and not thinking_text and not tool_calls and not tool_results:
+        if not full and not thinking_text and not tool_calls and not tool_results and not tool_plans:
             await self._emit(type="system", msg=f"{agent.name} 本轮未输出可显示内容，已跳过。")
             return "", errors
         entry = {
@@ -822,7 +830,7 @@ class Session:
         }
         # 纯工具轮（仅工具调用/失败、无正文无思考）：意图与状态已入工具日志，但工具调用
         # 与失败结果须保留为可折叠子块可见，故仍落盘（不造假「未输出结论」占位）。
-        if full or thinking_text or tool_calls or tool_results:
+        if full or thinking_text or tool_calls or tool_results or tool_plans:
             self.history.append(entry)
             store.append_message(self.project_path, self.session_id, entry)
             # 落盘一条**有效**发言即视为「待续接」已被兑现：清除待续接标记。
