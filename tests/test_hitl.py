@@ -377,30 +377,30 @@ class TestHitlReplyPrompt(unittest.TestCase):
         self.assertNotIn("轮次门槛", p)
         self.assertNotIn("共识终止", p)
 
-    def test_join_answers_single_and_multi(self):
-        from backend.orchestrator import _join_answers
-        self.assertEqual(_join_answers([]), "")
-        self.assertEqual(_join_answers(["甲"]), "甲", "单条保持原样（不改变旧行为）")
-        self.assertEqual(_join_answers(["甲", "乙"]), "1) 甲\n2) 乙")
-        self.assertEqual(_join_answers(["", "  ", "甲"]), "甲")
-
-    def test_collect_all_questions_in_one_turn(self):
-        # 旧实现 reversed+break 只取最后一个 → 同轮多个提问被丢弃；现改为全收
+    def test_collect_single_question_per_turn(self):
+        """一次发言只留**一个**待问问题（没有队列，用户口径 2026-09-20）。"""
         a = models.AgentConfig(name="A", type="codex")
         s = self._session([a])
         n = s._collect_human_input_questions([
             {"name": "request_human_input", "input": {"question": "Q1", "options": ["a"]}},
             {"name": "mcp__terminate-signal__end_discussion", "input": {"reason": "x"}},
+        ])
+        self.assertEqual(n, 1, "一次发言里的一次提问")
+        self.assertEqual(s._human_input_request["question"], "Q1")
+        self.assertEqual(s._human_input_request["options"], ["a"])
+        self.assertFalse(hasattr(s, "_human_input_queue"), "不应再有队列")
+        # 极端情况：真的出现多次调用 → 取最后一个（覆盖），绝不排队
+        s._collect_human_input_questions([
+            {"name": "request_human_input", "input": {"question": "Q1"}},
             {"name": "mcp__terminate-signal__request_human_input", "input": {"question": "Q2"}},
         ])
-        self.assertEqual(n, 2, "同一次发言里的多个提问都要收进队列")
-        self.assertEqual([q["question"] for q in s._human_input_queue], ["Q1", "Q2"])
+        self.assertEqual(s._human_input_request["question"], "Q2", "多次调用取最后一个，不排队")
 
     def test_pause_asks_one_question_only(self):
-        """一问一答的来回：一次只问一个，答完即返回；其余问题留在队列等下一轮。
+        """一问一答的来回：问掉当前这一个问题、答完即返回并清空，不残留下一个问题。
 
-        旧实现把同批发问连续问完再拼成「1) … 2) …」一次灌回，模型看到的是
-        「用户一下发了两个回复」，来回结构丢失（用户口径 2026-09-19）。
+        后续提问必须由 agent「答完后再说一轮」时重新发起 —— 每次提问都是独立发言
+        （用户口径 2026-09-20：没有队列，也不需要）。
         """
         a = models.AgentConfig(name="A", type="codex")
         s = self._session([a])
@@ -412,15 +412,13 @@ class TestHitlReplyPrompt(unittest.TestCase):
         async def drive():
             task = asyncio.create_task(s._pause_for_human_input(a))
             self.assertTrue(await _wait_until(lambda: s._human_input_request is not None))
-            self.assertEqual(s._human_input_request["question"], "Q1")
+            self.assertEqual(s._human_input_request["question"], "Q2")
             s.provide_human_input("答1")
             return await task
 
         answer = asyncio.run(drive())
         self.assertEqual(answer, "答1", "一次只返回这一问的回答")
-        self.assertEqual([q["question"] for q in s._human_input_queue], ["Q2"],
-                         "第二个问题留在队列，由调用方答完这一轮后再问（一问一答来回）")
-        self.assertIsNone(s._human_input_request)
+        self.assertIsNone(s._human_input_request, "答完即清空：不会有遗留问题在下一轮突然冒出来")
 
     def test_others_since_last_excludes_interim(self):
         # 对方只应看到「起问发言 + 最后结论」，看不到与用户的来回交互过程
@@ -509,25 +507,26 @@ class TestChatMultiAskEndToEnd(unittest.TestCase):
 
 
 class TestChatOneAskOneReplyLoop(unittest.TestCase):
-    """同一次发言里连问两次：必须拆成「问→答→再说一轮→再问→再答」的来回。
+    """一问一答的来回：每次提问都是**独立的一次发言**，没有队列（用户口径 2026-09-20）。
 
-    用户口径（2026-09-19）：agent 与用户的交互是**一问一答**，不是 agent 问多次、
-    用户一次回多个。旧实现把两次提问攒着连续问完、回答拼成「1) … 2) …」一次灌回，
-    提示词里就成了「用户一下发了两个回复」。
+    agent 说一轮 → 问一个问题 → 本次发言结束 → 用户答 → agent **再说一轮**（新发言），
+    由它根据回答决定再问一次还是给结论。次数不限，但绝不存在「同一次发言问多次、
+    把回答攒成 1) … 2) … 一次灌回」。
     """
 
     def setUp(self):
         self.proj = "/tmp/agentchat_test_oneask_" + str(id(self))
         self.sid = store.create_session(self.proj, "一问一答来回测试")["id"]
 
-    def test_two_questions_in_one_turn_are_asked_one_by_one(self):
+    def test_each_turn_asks_once_then_speaks_again(self):
         a = models.AgentConfig(name="A", type="codex")
         s = orch.Session(self.proj, self.sid, [a], 4, Recorder(), timeout=300)
         rt = _ScriptedRuntime([
-            # 一次发言里连问两次
-            [("text", "先确认两件事。"),
-             _ask("Q1 预算？"), _ask("Q2 时段？"), ("done", "")],
-            [("text", "收到预算。"), ("done", "")],
+            # 第 1 次发言：只问一个（预算）
+            [("text", "先确认预算。"), _ask("Q1 预算？"), ("done", "")],
+            # 第 2 次发言：拿到预算后再问一个（时段）
+            [("text", "收到预算，再确认时段。"), _ask("Q2 时段？"), ("done", "")],
+            # 第 3 次发言：不再问，给结论
             [("text", "结论：按预算与时段执行。"), ("done", "")],
         ])
         s.runtimes[a.name] = rt
@@ -538,22 +537,49 @@ class TestChatOneAskOneReplyLoop(unittest.TestCase):
             task = asyncio.create_task(s._chat_turn("做方案"))
             for ans in ("答1-预算", "答2-时段"):
                 ok = await _wait_until(lambda: s._human_input_request is not None)
-                self.assertTrue(ok, "应逐个暂停等人（一次只问一个）")
+                self.assertTrue(ok, "每次提问都应暂停等人")
                 asked.append(s._human_input_request["question"])
                 s.provide_human_input(ans)
-                # 等这一问被消费、队列里还有问题才会再弹下一次
                 await _wait_until(lambda: s._human_input_request is None)
             await task
 
         asyncio.run(drive())
 
-        self.assertEqual(asked, ["Q1 预算？", "Q2 时段？"], "两次提问都要问到，但逐个问")
+        self.assertEqual(asked, ["Q1 预算？", "Q2 时段？"], "两次提问都问到：一次发言问一个")
         self.assertEqual(len(rt.prompts), 3, "起问一轮 + 每条回答各续跑一轮")
         # 关键：回复轮 prompt 每次只带**这一条**回答，不是两条一起灌
         self.assertIn("答1-预算", rt.prompts[1])
         self.assertNotIn("答2-时段", rt.prompts[1], "第一条回复里不该出现第二条回答")
         self.assertIn("答2-时段", rt.prompts[2])
-        self.assertNotIn("1) 答1", "\n".join(rt.prompts), "不应再拼成编号列表一次灌回")
+        self.assertNotIn("1) 答1", "\n".join(rt.prompts), "不应拼成编号列表一次灌回")
+
+    def test_duplicate_asks_in_one_turn_keep_only_last(self):
+        """极端情况：某次发言真出现两次提问 → 只问最后一个，绝不排队到下一轮。
+
+        排队会让「上一轮遗留的问题」在下一轮突然冒出来问，破坏一问一答的来回结构。
+        """
+        a = models.AgentConfig(name="A", type="codex")
+        s = orch.Session(self.proj, self.sid, [a], 4, Recorder(), timeout=300)
+        rt = _ScriptedRuntime([
+            [("text", "一次说了两个问题（异常）。"),
+             _ask("Q1"), _ask("Q2"), ("done", "")],
+            [("text", "结论：收尾。"), ("done", "")],
+        ])
+        s.runtimes[a.name] = rt
+
+        asked: list[str] = []
+
+        async def drive():
+            task = asyncio.create_task(s._chat_turn("做方案"))
+            ok = await _wait_until(lambda: s._human_input_request is not None)
+            self.assertTrue(ok)
+            asked.append(s._human_input_request["question"])
+            s.provide_human_input("答")
+            await task
+
+        asyncio.run(drive())
+        self.assertEqual(asked, ["Q2"], "只问最后一个，Q1 不排队下次再问")
+        self.assertEqual(len(rt.prompts), 2)
 
 
 class TestDebateMultiAskHandoff(unittest.TestCase):

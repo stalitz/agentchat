@@ -48,21 +48,6 @@ def _is_human_input(name) -> bool:
     return isinstance(name, str) and "request_human_input" in name
 
 
-def _join_answers(answers: list) -> str:
-    """把多条人工回答拼成一段文本。
-
-    注：HITL 续跑**不再**用它拼「多条回答一次灌给 agent」（2026-09-19 用户口径：
-    交互必须是一问一答的来回——agent 问一次、用户答一次、agent 再说一轮，
-    不能把两次提问攒成「用户一下发了两个回复」）。本函数现只用于落盘/日志场景。
-    """
-    answers = [a for a in (answers or []) if (a or "").strip()]
-    if not answers:
-        return ""
-    if len(answers) == 1:
-        return answers[0]
-    return "\n".join(f"{i + 1}) {a}" for i, a in enumerate(answers))
-
-
 def _codex_answers_from_questions(questions, answer_text):
     """把前端纯文本回答映射成 codex requestUserInput 期望的 answers map。
 
@@ -232,13 +217,12 @@ class Session:
         # HITL 人工介入：agent 调 request_human_input 时编排层暂停整场、等用户回答。
         # human_input_event 初始未置位（await 即阻塞），provide_human_input 置位并存入回答。
         self.human_input_event = asyncio.Event()
-        self._human_input_request = None   # {question, options}：**当前正在问**用户的问题
+        # {question, options}：唯一的一个「待问 / 正在问」的问题（**没有队列**）。
+        # 语义（用户口径 2026-09-20）：一次发言里 agent 最多调一次 request_human_input，
+        # 调了本次发言就结束；用户回答后 agent **再说一轮**（那是一次新的发言），
+        # 由它根据回答决定是再问一次、还是给出结论。来回次数不限，但每次提问都是独立发言。
+        self._human_input_request = None
         self._human_input_answer = None    # str：用户对当前问题的回答
-        # 待问队列（2026-09-19）：同一次发言内 agent 可多次调用 request_human_input，
-        # 旧实现只取最后一个（reversed+break）/ 只取 codex questions[0]，其余提问被丢弃。
-        # 改为全部收进队列，由 _pause_for_human_input 逐个问完 —— 「只要 agent 调用工具，
-        # 就走回复」，次数不限（同轮多次调工具 → 连续多次问；跨发言再问 → 下一轮继续）。
-        self._human_input_queue: list[dict] = []
         # 本场是否已向用户提过问：用于抑制「先问后答」强指令重复注入（问过一次即不再要求）。
         self._hitl_asked = False
         # 本场议题（debate 由 _debate 写入 / resume 时从历史回填；chat 不用）。
@@ -352,19 +336,14 @@ class Session:
         self.human_input_event.set()
 
     async def _pause_for_human_input(self, agent) -> str:
-        """问**一个**问题并阻塞等该问题的回答，返回这条回答（无回答返回 ""）。
+        """问掉当前这**一个**待问问题并阻塞等回答，返回这条回答（无待问返回 ""）。
 
-        为什么一次只问一个（2026-09-19 用户口径）：agent 与用户的交互必须是
-        **一问一答的来回**——agent 问一次 → 用户答一次 → agent 据此再说一轮（这一轮里
-        它可以再问下一个问题）。旧实现把同一次发言里的多个提问**连续问完**再把回答拼
-        成「1) … 2) …」一次灌回去，模型看到的就成了「用户一下发了两个回复」，
-        来回结构丢失。调用方在每次拿到回答后跑一轮，剩余问题留在队列里等下一次循环，
-        次数仍然不限（只要 agent 调工具就走回复）。
+        没有队列（用户口径 2026-09-20）：一次发言只可能产生一个问题，问完即清空；
+        用户答完后由调用方让同一 agent **再跑一轮新发言**，它自行决定再问还是收尾。
         """
         self._hitl_asked = True   # 已问过：后续轮次不再注入「先问后答」强指令
-        if not self._human_input_queue:
+        if not self._human_input_request:
             return ""
-        self._human_input_request = self._human_input_queue.pop(0)
         req = self._human_input_request or {}
         await self._emit(type="human_input_required", agent=agent.name,
                          question=req.get("question", ""), options=req.get("options") or [])
@@ -605,22 +584,23 @@ class Session:
         return "\n\n".join(parts)
 
     def _collect_human_input_questions(self, tool_uses: list) -> int:
-        """把本轮**全部** request_human_input 调用收进待问队列，返回收进的问题数。
+        """记下本轮 request_human_input 的那个问题，返回是否提问（0/1）。
 
-        旧实现 `for tu in reversed(tool_uses): ... break` 只取最后一个，同一次发言里
-        多次调用会被丢弃（用户口径：不限次数，只要 agent 调用工具就走回复）。
+        一次发言只会调一次（用户口径 2026-09-20），故只保留**唯一**一个待问问题：
+        万一某次真的出现多次调用，取最后一个（覆盖），绝不排队——排队会让「上一轮
+        遗留的问题」在下一轮突然冒出来问，破坏一问一答的来回结构。
         """
         n = 0
         for tu in tool_uses:
             if not (isinstance(tu, dict) and _is_human_input(tu.get("name"))):
                 continue
             inp = tu.get("input") or {}
-            self._human_input_queue.append({
+            self._human_input_request = {
                 "question": str(inp.get("question", "") or ""),
                 "options": inp.get("options") or [],
-            })
+            }
             n += 1
-        return n
+        return 1 if n else 0
 
     # ---------------- 单轮执行（两种模式共用） ----------------
     async def _record_human(self, text: str, role: str):
@@ -752,24 +732,22 @@ class Session:
                 # 原生 HITL 通道（codex requestUserInput）：codex 那轮已在 executor 立即回
                 # result 结束（不阻塞），此处仅真暂停整场等人；用户回答经 1:1 续接作为
                 # 下一次 prompt 续发 codex（不在本分支回 result 解锁，否则 codex 会卡死等）。
-                # 与 MCP request_human_input（tool_use）共用待问队列与暂停 UI，生命周期不重叠：
-                # native 在 _run_turn 返回前已把队列清空，不会触发调用方的二次 pause。
-                # 旧实现只取 questions[0]（codex 原生支持一次问多个，其余被丢弃）→ 改为全部入队逐个问。
+                # 与 MCP request_human_input（tool_use）共用同一个待问问题位与暂停 UI，
+                # 生命周期不重叠：native 在 _run_turn 返回前已清空，不会触发调用方的二次 pause。
+                # 同样**只取一个**（一问一答来回；不排队，见 _collect_human_input_questions）。
                 req = text or {}
                 questions = [q for q in (req.get("questions") or []) if isinstance(q, dict)]
                 if questions:
-                    for q in questions:
-                        self._human_input_queue.append({
-                            "question": str(q.get("question") or req.get("question") or ""),
-                            "options": list(q.get("options") or []),
-                        })
+                    q = questions[0]
+                    self._human_input_request = {
+                        "question": str(q.get("question") or req.get("question") or ""),
+                        "options": list(q.get("options") or []),
+                    }
                 else:
-                    self._human_input_queue.append({
+                    self._human_input_request = {
                         "question": str(req.get("question") or ""),
                         "options": [],
-                    })
-                # 一次只问一个（一问一答来回）；队列里剩余的问题**保留**——由调用方在
-                # 本轮结束后逐个问、每次答完再跑一轮（旧实现在此 clear，把同批其余提问丢了）。
+                    }
                 try:
                     await self._pause_for_human_input(agent)
                 finally:
@@ -1024,12 +1002,10 @@ class Session:
             if text:
                 await self._record_human(text, "用户")
             await self._run_turn(self.agents[0], len(self.history), text or None)
-        # HITL 人工介入（chat 模式）：agent 调 request_human_input → 暂停等人 → 同 agent 续跑。
-        # while 支持连续多次提问（不限次数：每次续跑都可能再问一次，问题经 _pause_for_human_input
-        # 逐个问完）；被停止/中止则退出。
-        while self._human_input_queue:
-            # 一问一答的来回：一次只问一个问题、拿到回答后立即让同一 agent 续跑一轮
-            # （这一轮里它可以再问下一个问题 ⇒ 循环继续，次数不限）。
+        # HITL 人工介入（chat 模式）：agent 调 request_human_input → 本次发言结束、暂停等人
+        # → 用户答完后同一 agent **再说一轮**（新发言），由它决定再问还是收尾 ⇒ while 次数不限。
+        while self._human_input_request:
+            # 一问一答的来回：问掉当前这一个问题、拿到回答后立即让同一 agent 说下一轮。
             answer = await self._pause_for_human_input(self.agents[0])
             if self.stop_event.is_set() or self._abort_requested:
                 break
@@ -1083,12 +1059,12 @@ class Session:
             full, errors = await self._run_turn(current, round_i, pending_inject)
             pending_inject = None
 
-            # HITL 人工介入：agent 调 request_human_input → 暂停整场等人，回答由「发起提问的 agent」
-            # 续跑（round_i 不增，不消耗额外轮次）。内层 while 支持同一次发言内连续多次提问
-            # （不限次数：只要 agent 再调工具就走回复；同轮多次调用的问题由 _pause_for_human_input
-            # 逐个问完）。须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获。
-            while self._human_input_queue:
-                # 一问一答的来回（同上）：一次只问一个、答完立即续跑一轮，round_i 不变。
+            # HITL 人工介入：agent 调 request_human_input → 本次发言结束、暂停整场等人，
+            # 回答由「发起提问的 agent」再说一轮（round_i 不增，不消耗额外轮次）。
+            # 内层 while = 一问一答的来回：答完立即再跑一轮新发言，若它又提问则继续，次数不限。
+            # 须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获。
+            while self._human_input_request:
+                # 一问一答的来回（同上）：问掉当前这一个问题、答完立即再说一轮，round_i 不变。
                 answer = await self._pause_for_human_input(current)
                 if self.stop_event.is_set() or self._abort_requested:
                     break
