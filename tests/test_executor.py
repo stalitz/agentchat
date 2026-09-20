@@ -760,5 +760,40 @@ class TestCodexRolloutMsgFallback(unittest.TestCase):
                          "没有 cli_session_id 时绝不能误补（返回未找到）")
 
 
+class TestLongLineReading(unittest.IsolatedAsyncioTestCase):
+    """CLI stdout 单行超过 StreamReader limit（默认 64KiB）不得打崩整场会话。
+
+    真实现象（v10 探针 16:53:42）：claude 一轮 transcript 涨到 437KB，stdout 出现超长单帧
+    JSON ⇒ `readline()` 抛 LimitOverrunError ⇒ 冒到编排层写「执行出错，会话中止：
+    Separator is not found, and chunk exceed the limit」⇒ 整场提前结束。
+    修复两层：① 子进程创建时把 limit 抬到 32MiB；② `_readline_resilient` 分片救回超长行。
+    """
+
+    async def test_readline_resilient_degrades_without_crashing(self):
+        # 故意用极小的 limit，逼出 LimitOverrunError。
+        # 注意：CPython 的 readline 超限时会**先清空缓冲区**再抛异常 ⇒ 该行不可恢复，
+        # 只能降级「跳过这一行」，但**必须做到不抛、且后续行能继续读**。
+        reader = asyncio.StreamReader(limit=128)
+        reader.feed_data(b"x" * 5000 + b"\n")
+        reader.feed_data(b"next-line\n")
+        reader.feed_eof()
+        line = await executor._readline_resilient(reader)
+        self.assertTrue(line.strip() == b"", "超限行降级为空，不抛异常")
+        self.assertEqual(await executor._readline_resilient(reader), b"next-line\n",
+                         "降级后下一行必须能继续正常读取（流未被破坏）")
+
+    async def test_stream_subprocess_handles_300kb_single_line(self):
+        # 端到端：真子进程吐一行 300KB（远超旧上限 64KiB）
+        code = "import sys; sys.stdout.write('y'*300000); sys.stdout.write('\\n')"
+        out = []
+        async for kind, payload in executor._stream_subprocess(
+                [os.sys.executable, "-c", code], "/tmp", 30, "none"):
+            out.append((kind, payload))
+        self.assertNotIn("error", [k for k, _ in out], "超长单行不得报错")
+        texts = [p for k, p in out if k == "text"]
+        self.assertTrue(texts, "应收到这行内容")
+        self.assertEqual(len(texts[0].strip()), 300000, "不得被截断")
+
+
 if __name__ == "__main__":
     unittest.main()

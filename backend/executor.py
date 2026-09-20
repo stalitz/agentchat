@@ -188,6 +188,10 @@ class AgentRuntime:
         self._as_msg_line = 0
         self._as_tool_call_seen: set[str] = set()   # 已产出 tool_use 的 call_id（实时 + 兜底共用）
         self._as_tool_out_seen: set[str] = set()    # 已产出 tool_result 的 call_id（同上）
+        # 受控 MCP 工具（end_discussion / ask_human_input）已产出 tool_use 的 item id。
+        # 与上面两个集合分开：语义不同（受控工具不进 rollout 兜底），但去重目的相同——
+        # 见 _as_iter_events 里 item/completed 的 mcpToolCall 分支。
+        self._as_guarded_seen: set[str] = set()
         self._as_stderr_tail = []      # app-server stderr 尾部（最多 _AS_STDERR_TAIL 行）：断流诊断用
         self._as_returncode = None     # app-server 退出码（读循环 EOF 时记录）
 
@@ -881,8 +885,16 @@ class AgentRuntime:
                     elif _is_mcp_tool_item(it):
                         _g = _guarded_mcp_tool(it)
                         if _g:
-                            yield ("tool_use", {"name": _g,
-                                                 "input": _codex_parse_args(it.get("arguments"))})
+                            # 按 item id 去重（原缺失 ⇒ 同一条目重复上报会多记一次调用；
+                            # 原生工具分支早已按 call_id 去重，此处对齐）。
+                            # v10 实测：codex 一轮里 ask_human_input 落了 3 条工具调用
+                            # （其中一条与前一条逐字相同），部分来自这里的重复上报。
+                            _gid = str(it.get("id") or it.get("call_id") or "")
+                            if not _gid or _gid not in self._as_guarded_seen:
+                                if _gid:
+                                    self._as_guarded_seen.add(_gid)
+                                yield ("tool_use", {"name": _g,
+                                                     "input": _codex_parse_args(it.get("arguments"))})
                     else:
                         # codex 原生工具（命令执行 / 文件改动）：原先一律忽略 ⇒ codex 调了自带
                         # 工具也不落盘、界面空白（2026-09-16 修）。只认 completed，避免
@@ -977,6 +989,9 @@ class AgentRuntime:
                 *cmd, cwd=cwd,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # 单行上限抬到 32MiB（见 _CLI_STREAM_LIMIT）：抬限 + _readline_resilient 双保险，
+                # 单行超长不再把整场会话打崩。
+                limit=_CLI_STREAM_LIMIT,
                 # 自成进程组：codex 是「node 壳 → 原生 app-server 子进程」两层，
                 # 回收时须整组杀（见 _kill_proc_group），否则原生子进程会孤儿化。
                 start_new_session=True,
@@ -1057,7 +1072,7 @@ class AgentRuntime:
         stdout = proc.stdout
         try:
             while True:
-                line = await stdout.readline()
+                line = await _readline_resilient(stdout)
                 if not line:
                     break
                 try:
@@ -1073,6 +1088,15 @@ class AgentRuntime:
                     it = o.get("params") or {}
                     base = _guarded_mcp_tool(it)
                     if base:
+                        # 与 mcpToolCall（item/completed）分支共用同一去重集合：两条路径若针对
+                        # 同一 id 都上报，只记一次工具调用（v10 实测一轮内重复计调用的根因之一）。
+                        _sid = str(it.get("id") or it.get("call_id") or "")
+                        if _sid and _sid in self._as_guarded_seen:
+                            self._as_send({"jsonrpc": "2.0", "id": o.get("id"),
+                                          "result": _hitl_tool_result(base)})
+                            continue
+                        if _sid:
+                            self._as_guarded_seen.add(_sid)
                         try:
                             await self._as_queue.put(
                                 {"_tool_use": {"name": base,
@@ -1133,7 +1157,7 @@ class AgentRuntime:
             return
         try:
             while True:
-                chunk = await proc.stderr.readline()
+                chunk = await _readline_resilient(proc.stderr)
                 if not chunk:
                     break
                 try:
@@ -1307,6 +1331,32 @@ def _is_claude_turn_end(text: str) -> bool:
     return isinstance(ev, dict) and ev.get("type") == "result"
 
 
+# CLI stdout/stderr 的单行缓冲上限。
+# asyncio StreamReader 默认 64KiB，而 claude CLI 的单帧 JSON（如超长 assistant 消息、
+# 大段 tool_result）实测可达 400KB+ ⇒ readline() 抛 LimitOverrunError(ValueError)，
+# 该异常一路冒泡到编排层 ⇒ **整场会话被中止**（v10 实测 16:53:42「Separator is not
+# found, and chunk exceed the limit」，transcript 涨到 437KB 时触发）。
+# 抬到 32MiB 基本不可能再被触发（实测最大单帧约 437KB，余量两个数量级）；
+# 万一仍被触发，_readline_resilient 会降级「跳过该行」而不是让整场会话崩掉。
+_CLI_STREAM_LIMIT = 32 * 1024 * 1024
+
+
+async def _readline_resilient(reader) -> bytes:
+    """读一行；单行超过 StreamReader limit 时**降级跳过**而不是抛出。
+
+    CPython 的 `StreamReader.readline()` 在超限时的行为（asyncio/streams.py）：先
+    `self._buffer.clear()` 把这一行已缓冲的内容丢弃，再 raise ValueError(LimitOverrunError)
+    ——即**该行内容事后已不可救回**，任何「分片重读」都救不出来。故这里只能：
+    吞掉异常、返回空行使调用方跳过这一行、让流继续。
+    收益：不再因一行过长把整场会话中止（旧行为）；代价：该行内容丢失——但主防线是
+    `_CLI_STREAM_LIMIT`（32MiB），正常不会走到这条降级路径。
+    """
+    try:
+        return await reader.readline()
+    except ValueError:  # LimitOverrunError
+        return b"\n"            # 空行：各 parser 都会忽略，循环继续读下一行
+
+
 async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runtime=None, env=None,
                              stdin_data: bytes | None = None, keep_stdin: bool = False):
     """启动子进程并按行产出 ("text", str) 或 ("error", str)。
@@ -1324,6 +1374,9 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
             *cmd, cwd=cwd, env=env,
             stdin=asyncio.subprocess.PIPE if (stdin_data is not None or keep_stdin) else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            # 单行上限抬到 32MiB：claude 超长单帧 JSON（实测 400KB+）会撞默认 64KiB 限制
+            # ⇒ LimitOverrunError ⇒ 整场会话中止（见 _CLI_STREAM_LIMIT 注释）。
+            limit=_CLI_STREAM_LIMIT,
             # 自成进程组：超时/异常时整组回收，避免 claude/codex 的子进程孤儿化
             # （见 _kill_proc_group）。
             start_new_session=True,
@@ -1345,7 +1398,7 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
             return
         try:
             while True:
-                chunk = await proc.stderr.readline()
+                chunk = await _readline_resilient(proc.stderr)
                 if not chunk:
                     break
                 stderr_tail.append(chunk)
@@ -1369,7 +1422,7 @@ async def _stream_subprocess(cmd: list, cwd: str, timeout: int, parse: str, runt
                     pass
     try:
         while True:
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+            line = await asyncio.wait_for(_readline_resilient(proc.stdout), timeout=timeout)
             if not line:
                 break
             text = line.decode(errors="replace")

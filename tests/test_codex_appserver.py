@@ -362,6 +362,33 @@ class TestMcpToolCallNaming(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0][1]["name"], "end_discussion")
 
+    async def test_appserver_repeated_completed_same_id_is_deduped(self):
+        """同一受控 MCP 条目被重复上报（同 id）⇒ 只产一次 tool_use。
+
+        历史缺陷：受控分支不校验 id，而原生工具分支早已按 call_id 去重 ⇒ 重复上报会多记
+        一次调用（v10 实测一轮内 ask_human_input 落 3 条，其中一条逐字重复）。
+        """
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": self._item("mcpToolCall")}},
+            {"method": "item/completed", "params": {"item": self._item("mcpToolCall")}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual(len(tools), 1, "同 id 重复上报只应计一次")
+        self.assertEqual(tools[0][1]["name"], "end_discussion")
+
+    async def test_appserver_distinct_ids_are_all_counted(self):
+        """不同 id 是**不同的调用**（模型确实追问了第二次），必须各自计数——去重不能误杀。"""
+        evs = await self._collect([
+            {"method": "item/completed", "params": {"item": self._item("mcpToolCall")}},
+            {"method": "item/completed",
+             "params": {"item": dict(self._item("mcpToolCall"), id="call_2",
+                                     tool="ask_human_input", arguments={"question": "继续？"})}},
+            {"method": "turn/completed", "params": {}},
+        ])
+        tools = [e for e in evs if e[0] == "tool_use"]
+        self.assertEqual([t[1]["name"] for t in tools], ["end_discussion", "ask_human_input"])
+
     async def test_appserver_other_mcp_tool_ignored(self):
         # 非 end_discussion 的 MCP 调用（如内置工具）不产 tool_use，也不打断流式
         evs = await self._collect([
