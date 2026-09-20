@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""端到端探针：在隔离 app 实例里真跑一场辩论，验证 request_human_input 是否能被 agent 调起、
+"""端到端探针：在隔离 app 实例里真跑一场辩论，验证 ask_human_input 是否能被 agent 调起、
 编排层是否暂停等人、人工回答后能否续跑。
 
 会拉起真实 CLI（claude-code / codex）+ 本机免费模型 gemma4:26b（Ollama），
@@ -60,10 +60,10 @@ ANSWERS = _load_answers()
 ANSWER = ANSWERS[0]
 TASK = os.environ.get("PROBE_TASK", (
     "我们要一起给用户家的客厅（20 平米、朝北、采光差）做一份软装改造方案。"
-    "第一步：请你调用 request_human_input 工具向用户（人）提问，问题写在 question 里，"
+    "第一步：请你调用 ask_human_input 工具向用户（人）提问，问题写在 question 里，"
     "先问清楚预算上限。记住：必须在工具里问，不要在正文里问对方 agent；"
     "用户会用自然语言自由回复，你无需提供候选项。"
-    "拿到回答后，如果还有必须确认的关键信息，可以继续再次调用 request_human_input 追问（次数不限）；"
+    "拿到回答后，如果还有必须确认的关键信息，可以继续再次调用 ask_human_input 追问（次数不限）；"
     "确认够了就把结论写成完整方案，交给另一位讨论者继续。"
 ))
 
@@ -175,7 +175,7 @@ async def main() -> int:
         echo(f"  {brief(t)}")
     echo(f"提交了 {n_answered} 条人工回答（answered={answered}）；是否跑到 run_end = {finished}")
     if not hitl_seen:
-        echo("结论：本场没有任何 agent 调用 request_human_input（工具没有被触发）。")
+        echo("结论：本场没有任何 agent 调用 ask_human_input（工具没有被触发）。")
     # 完整运行日志体量大（数千条 token 事件）→ 放 raw/（不入库，见 probe/.gitignore）；
     # evidence/ 只留裁剪后的关键片段，由 README 引用。
     tag = os.environ.get("PROBE_TAG", "e2e")

@@ -1,9 +1,9 @@
-# probe/hitl-probe · request_human_input（HITL 人工介入）可用性留痕（2026-09-18）
+# probe/hitl-probe · ask_human_input（HITL 人工介入）可用性留痕（2026-09-18）
 
 ## 起因
 
 用户会话 `s_317d5554「跳高训练计划」`（项目 `agent探针(留痕)`，team `探针Team（双壳 · 本地 gemma）`）：
-议题是「想做一个跳高训练计划，请给多套方案让我看看」，用户希望 agent **调 `request_human_input`
+议题是「想做一个跳高训练计划，请给多套方案让我看看」，用户希望 agent **调 `ask_human_input`
 回来问人**，但整场 6 轮 prompt、2 个 agent，**一次都没调用**（倒是 claude 两次调了 `end_discussion`）。
 
 用户诉求：工具到底真可用还是假的？要求在项目内做留痕测试。
@@ -34,9 +34,9 @@ AGENTCHAT_WS=ws://127.0.0.1:8790/ws AGENTCHAT_HTTP=http://127.0.0.1:8790 \
 
 | 层 | 检查项 | 结果 |
 |---|---|---|
-| L1 | `terminate_signal_mcp.py` 的 `tools/list` 真的返回 `request_human_input`（含 schema），`tools/call` 正常回执 | ✅ |
+| L1 | `terminate_signal_mcp.py` 的 `tools/list` 真的返回 `ask_human_input`（含 schema），`tools/call` 正常回执 | ✅ |
 | L2 | claude 路径：网关把该工具以**干净名**转发给本地模型（同时放行内置工具、剥交互型与第三方 MCP） | ✅ |
-| L2b | 回程名还原：干净名 → `mcp__terminate-signal__request_human_input`（内置工具不被误加前缀） | ✅ |
+| L2b | 回程名还原：干净名 → `mcp__terminate-signal__ask_human_input`（内置工具不被误加前缀） | ✅ |
 | L3 | **codex 把该 MCP 调用上报给编排层**（`tool_use` 事件，HITL 状态机唯一输入） | ❌ |
 | L4 | 编排层识别（`_is_human_input` 三种写法 + 文本 json 兜底） | ✅ |
 | L5 | 每轮 prompt 都注入了 HITL 指令（真实会话 `s_317d5554` 的 6 条 prompt 全含） | ✅ |
@@ -50,7 +50,7 @@ codex 侧两条输出通路都**只放行 `end_discussion`**：
 - `backend/executor.py:1485`（`_parse_codex_line`，exec / rollout 回放）：
   `if ev.get("type") == "item.completed" and "end_discussion" in str(item.get("tool") or ""):`
 
-`request_human_input` 落到 `_is_mcp_tool_item` 命中但名字不匹配 → 掉进下一分支
+`ask_human_input` 落到 `_is_mcp_tool_item` 命中但名字不匹配 → 掉进下一分支
 `_codex_native_tool_use(it)`（只认 `command_execution` / `file_change`）→ 返回 None → **事件被吞**。
 对照实验结果（同一脚本内 end_discussion 对照组能通过）：
 
@@ -62,17 +62,17 @@ exec/rollout _parse_codex_line  mcp_tool_call → tool_use=[]      ❌
 对照组 end_discussion（app-server）            → tool_use=[('tool_use', {...})] ✅
 ```
 
-即：**codex 就算调了 `request_human_input`，编排层也收不到 ⇒ 不会暂停、前端不会弹人工介入卡片。**
+即：**codex 就算调了 `ask_human_input`，编排层也收不到 ⇒ 不会暂停、前端不会弹人工介入卡片。**
 （另有一条 `executor.py:971` 的 `item/tool/call` 分支已经兼容了两者，但那是罕见回退路径。）
 
 ## 端到端结论（隔离实例 8790，双壳分别单跑 chat 模式，本机 gemma4:26b）
 
-任务统一为：「设计跳高训练计划。**第一步必须调用 `request_human_input`** 向用户提问每周能练几次
+任务统一为：「设计跳高训练计划。**第一步必须调用 `ask_human_input`** 向用户提问每周能练几次
 （候选 1-2 / 3-4 / 5 次以上），不要在正文里问」。
 
 | 场景 | teams / agent | 结果 |
 |---|---|---|
-| claude 侧 | `tm_hitl_c` → H-Probe Claude（claude-code → 网关 8790 → Ollama gemma） | ✅ **真调通**：`tool_use mcp__terminate-signal__request_human_input` → `tool_result`（回执）→ 编排层广播 `human_input_required` → 人工作答 → 续跑下一轮；**一小时内连问两次都正常** |
+| claude 侧 | `tm_hitl_c` → H-Probe Claude（claude-code → 网关 8790 → Ollama gemma） | ✅ **真调通**：`tool_use mcp__terminate-signal__ask_human_input` → `tool_result`（回执）→ 编排层广播 `human_input_required` → 人工作答 → 续跑下一轮；**一小时内连问两次都正常** |
 | codex 侧 | `tm_hitl_x` → H-Probe Codex（codex app-server → 本机 Ollama 直连） | ❌ **没调**：全程无 tool_use，改成在正文里反问用户 |
 
 证据：

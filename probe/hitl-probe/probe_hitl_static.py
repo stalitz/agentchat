@@ -1,11 +1,11 @@
-"""request_human_input（HITL 人工介入）可用性分层探针 —— 静态层，不跑模型、不烧 token。
+"""ask_human_input（HITL 人工介入）可用性分层探针 —— 静态层，不跑模型、不烧 token。
 
-目的：用户实测「跳高训练计划」会话里没有一个 agent 调用 request_human_input，
+目的：用户实测「跳高训练计划」会话里没有一个 agent 调用 ask_human_input，
 需要确认「工具是否真可用」。本脚本沿调用链自底向上逐层取证：
 
-  L1 MCP 服务层   terminate_signal_mcp.py 是否真的提供 request_human_input（tools/list + tools/call）
+  L1 MCP 服务层   terminate_signal_mcp.py 是否真的提供 ask_human_input（tools/list + tools/call）
   L2 网关可见性   claude 路径：Anthropic tools → Ollama tools，该工具是否被转发（干净名）
-  L2b 名还原      模型以干净名调用时，回程是否还原成 mcp__terminate-signal__request_human_input
+  L2b 名还原      模型以干净名调用时，回程是否还原成 mcp__terminate-signal__ask_human_input
   L3 codex 上报   codex 两条通路（app-server 实时 / exec+rollout）是否把该 MCP 调用
                   产成 ("tool_use", {...}) 事件上报编排层 —— 编排层的 HITL 分支只认这个事件
   L4 编排层识别   _is_human_input 是否识别（含 MCP 原名）＋文本 json 兜底是否可用
@@ -55,7 +55,7 @@ def l1_mcp_server() -> bool:
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-         "params": {"name": "request_human_input",
+         "params": {"name": "ask_human_input",
                     "arguments": {"question": "用哪套方案？", "options": ["入门", "强化"]}}},
     ]
     payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in reqs)
@@ -65,17 +65,17 @@ def l1_mcp_server() -> bool:
     tools = (resp[1].get("result") or {}).get("tools") if len(resp) > 1 else []
     names = [t.get("name") for t in tools or []]
     log(f"tools/list 返回 ({len(names)}): {names}")
-    ok_list = "request_human_input" in names
+    ok_list = "ask_human_input" in names
     log(f"  → 工具定义存在: {ok_list}")
     if ok_list:
-        sch = [t for t in tools if t.get("name") == "request_human_input"][0]
+        sch = [t for t in tools if t.get("name") == "ask_human_input"][0]
         log(f"  → schema: {json.dumps(sch, ensure_ascii=False)}")
     call = (resp[2].get("result") or {}) if len(resp) > 2 else {}
     txt = "".join(c.get("text", "") for c in call.get("content") or [])
     log(f"tools/call 回执: {txt}")
     log(f"  → isError={call.get('isError')}")
     ok = ok_list and call.get("isError") is False
-    log(f"【L1 结论】MCP server 提供并正常回执 request_human_input: {ok}")
+    log(f"【L1 结论】MCP server 提供并正常回执 ask_human_input: {ok}")
     return ok
 
 
@@ -88,7 +88,7 @@ def _fake_claude_tools() -> list[dict]:
         {"name": "mcp__terminate-signal__end_discussion", "description": "结束讨论",
          "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}},
                           "required": ["reason"]}},
-        {"name": "mcp__terminate-signal__request_human_input", "description": "请求人工介入",
+        {"name": "mcp__terminate-signal__ask_human_input", "description": "请求人工介入",
          "input_schema": {"type": "object", "properties": {"question": {"type": "string"}},
                           "required": ["question"]}},
         {"name": "Bash", "description": "执行命令", "input_schema": {"type": "object"}},
@@ -114,29 +114,29 @@ def l2_gateway_visibility() -> bool:
     for t in oa.get("tools") or []:
         names.append(t.get("name") if "name" in t else (t.get("function") or {}).get("name"))
     log(f"转发给本地模型的工具名: {names}")
-    ok_rhi = "request_human_input" in names
+    ok_rhi = "ask_human_input" in names
     ok_ed = "end_discussion" in names
     ok_builtin = "Bash" in names and "Read" in names
     ok_strip = "AskUserQuestion" not in names and "mcp__other-server__whatever" not in names
-    log(f"  → request_human_input 转发: {ok_rhi}")
+    log(f"  → ask_human_input 转发: {ok_rhi}")
     log(f"  → end_discussion 转发:      {ok_ed}")
     log(f"  → claude 内置工具放行:       {ok_builtin}")
     log(f"  → 交互型/第三方 MCP 已剥:    {ok_strip}")
     log(f"  → 干净名（去 mcp__ 前缀）:   {not any(n and n.startswith('mcp__') for n in names)}")
     ok = ok_rhi and ok_ed and ok_builtin and ok_strip
-    log(f"【L2 结论】本地模型能看到 request_human_input: {ok}")
+    log(f"【L2 结论】本地模型能看到 ask_human_input: {ok}")
     return ok
 
 
 def l2b_name_restore() -> bool:
     rule("L2b · 回程名还原：模型以干净名调用 → 是否还原成 claude 注册的 MCP 原名")
-    cases = ["request_human_input", "anthropic:request_human_input",
+    cases = ["ask_human_input", "anthropic:ask_human_input",
              "end_discussion", "Bash", "Read"]
     ok = True
     for n in cases:
         restored = gateway._restore_mcp_name(n)
         log(f"  {n:35s} → {restored}")
-    r1 = gateway._restore_mcp_name("request_human_input") == "mcp__terminate-signal__request_human_input"
+    r1 = gateway._restore_mcp_name("ask_human_input") == "mcp__terminate-signal__ask_human_input"
     r2 = gateway._restore_mcp_name("end_discussion") == "mcp__terminate-signal__end_discussion"
     r3 = gateway._restore_mcp_name("Bash") == "Bash"
     ok = r1 and r2 and r3
@@ -145,7 +145,7 @@ def l2b_name_restore() -> bool:
 
 
 # --------------------------------------------------------------------------
-# L3 · codex 上报：两条通路是否把 request_human_input 上报给编排层
+# L3 · codex 上报：两条通路是否把 ask_human_input 上报给编排层
 # --------------------------------------------------------------------------
 def _mcp_item(itype: str, tool: str, args: dict) -> dict:
     return {"type": itype, "id": "call_9", "server": "terminate-signal",
@@ -179,7 +179,7 @@ async def l3_codex_report() -> bool:
     # app-server 实时通路（本 app 默认路径）
     for itype in ("mcpToolCall", "mcp_tool_call"):
         evs = await _as_collect([
-            {"method": "item/completed", "params": {"item": _mcp_item(itype, "request_human_input", args)}},
+            {"method": "item/completed", "params": {"item": _mcp_item(itype, "ask_human_input", args)}},
             {"method": "turn/completed", "params": {}},
         ])
         tools = [e for e in evs if e[0] == "tool_use"]
@@ -188,7 +188,7 @@ async def l3_codex_report() -> bool:
 
     # exec / rollout 通路
     for itype in ("mcpToolCall", "mcp_tool_call"):
-        ev = {"type": "item.completed", "item": _mcp_item(itype, "request_human_input", args)}
+        ev = {"type": "item.completed", "item": _mcp_item(itype, "ask_human_input", args)}
         got = executor._parse_codex_line(json.dumps(ev), None)
         tools = [e for e in got if e[0] == "tool_use"]
         results[f"exec/{itype}"] = tools
@@ -207,9 +207,9 @@ async def l3_codex_report() -> bool:
     rhi_ok = any(len(v) == 1 for k, v in results.items())
     log()
     log(f"  → end_discussion 能被上报: {ed_ok}（对照组，正常）")
-    log(f"  → request_human_input 能被上报: {rhi_ok}")
+    log(f"  → ask_human_input 能被上报: {rhi_ok}")
     if ed_ok and not rhi_ok:
-        log("  ⚠️ 同一分支只放行 end_discussion：codex 调了 request_human_input 也会被吞掉，")
+        log("  ⚠️ 同一分支只放行 end_discussion：codex 调了 ask_human_input 也会被吞掉，")
         log("     编排层收不到 tool_use ⇒ 不会暂停、前端也不会弹人工介入。这是**真的断了**，不是模型不调。")
     return rhi_ok
 
@@ -220,20 +220,20 @@ async def l3_codex_report() -> bool:
 def l4_orchestrator() -> bool:
     rule("L4 · 编排层： EVENT 到了之后能否被识别为人工介入（含文本 json 兜底）")
     checks = {
-        "干净名": "request_human_input",
-        "MCP 原名": "mcp__terminate-signal__request_human_input",
-        "anthropic: 变体": "anthropic:request_human_input",
+        "干净名": "ask_human_input",
+        "MCP 原名": "mcp__terminate-signal__ask_human_input",
+        "anthropic: 变体": "anthropic:ask_human_input",
     }
     ok = True
     for label, name in checks.items():
         r = orchestrator._is_human_input(name)
         log(f"  _is_human_input({name!r}) = {r}   [{label}]")
         ok = ok and r
-    txt = '```json\n{"tool":"request_human_input","question":"你选哪套？","options":["A","B"]}\n```'
+    txt = '```json\n{"tool":"ask_human_input","question":"你选哪套？","options":["A","B"]}\n```'
     parsed = orchestrator._extract_text_tool_call(txt)
     log(f"  文本 json 兜底 _extract_text_tool_call → {parsed}")
-    ok = ok and bool(parsed) and parsed.get("name") == "request_human_input"
-    log(f"【L4 结论】编排层能识别 request_human_input（含文本兜底）: {ok}")
+    ok = ok and bool(parsed) and parsed.get("name") == "ask_human_input"
+    log(f"【L4 结论】编排层能识别 ask_human_input（含文本兜底）: {ok}")
     return ok
 
 
@@ -255,9 +255,9 @@ def l5_prompt_injection(session: str) -> bool:
         o = json.loads(line)
         prompt = o.get("prompt") or ""
         total += 1
-        if "request_human_input" in prompt:
+        if "ask_human_input" in prompt:
             hit += 1
-    log(f"  {p.name}: 共 {total} 条 prompt，含 request_human_input 指令 {hit} 条")
+    log(f"  {p.name}: 共 {total} 条 prompt，含 ask_human_input 指令 {hit} 条")
     ok = total > 0 and hit == total
     log(f"【L5 结论】每轮都注入 HITL 指令: {ok}")
     return ok

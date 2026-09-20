@@ -1,7 +1,14 @@
-# HITL：request_human_input（agent 提问 → 暂停等人）
+# HITL：ask_human_input（agent 提问 → 暂停等人）
+
+> **改名说明（2026-09-20）**：工具原名 `request_human_input`，与 codex 内建的
+> `request_user_input` 名字过近 —— codex 会把本次调用归一化到内建工具，被 headless
+> 「Default mode」门禁拒掉（`request_user_input is unavailable in Default mode`），工具彻底
+> 不可用（实测 v9 通勤场）。改名后本文档同步为 `ask_human_input`；**旧名仍被兼容识别**
+> （历史会话已落盘的 tool_use、旧提示词残留），但不再对外暴露给模型。
+> 文档原名 `HITL_request_human_input设计.md`，同日随工具改名。
 
 > 配套需求：在辩论/对话中，当某个 agent 需要用户从多个方案中选择、或需澄清任务时，
-> 它调用 `request_human_input` 工具，编排器**暂停整场**、把问题推到前端、等用户回答后
+> 它调用 `ask_human_input` 工具，编排器**暂停整场**、把问题推到前端、等用户回答后
 > 作为下一条 delta 注入并续跑。解决「agent 反问被另一个 agent 接走、结果出人意料」的问题。
 
 ## 1. 背景与问题
@@ -26,7 +33,7 @@
 新增工具：
 
 ```
-request_human_input(question: str, options: list[str] = [])
+ask_human_input(question: str, options: list[str] = [])
 ```
 
 - `question`：要问用户的问题（必填）。
@@ -38,8 +45,8 @@ request_human_input(question: str, options: list[str] = [])
 
 ### 4.1 claude（stream-json）
 - 网关 `anthropic_to_openai` 的工具过滤：从「只留含 `end_discussion` 的」扩展为「只留
-  `end_discussion` 或 `request_human_input` 的」（按去前缀后的基名判定），其余内置工具仍不转发。
-- `_restore_mcp_name`：基名为 `request_human_input` 时还原为 `mcp__terminate-signal__request_human_input`
+  `end_discussion` 或 `ask_human_input` 的」（按去前缀后的基名判定），其余内置工具仍不转发。
+- `_restore_mcp_name`：基名为 `ask_human_input` 时还原为 `mcp__terminate-signal__ask_human_input`
   （与 end_discussion 同 server，故前缀同为 `terminate-signal`）。
 - claude 调该 MCP 工具 → 产出 `tool_use` 块 → executor 透传为 `("tool_use", {name, input})`
   → 编排层按名识别（无需回 tool_result：用户回答作为下一轮新 user 消息续接）。
@@ -47,15 +54,15 @@ request_human_input(question: str, options: list[str] = [])
 ### 4.2 codex（app-server 主路径 + exec 兜底）
 - 复用 `terminate-signal` server（`-c` 注册已含 `default_tools_approval_mode="approve"`），新工具自动可见。
 - `_as_read_loop`（`item/tool/call` 捕获段，现仅捕 `end_discussion`）：新增捕获
-  `request_human_input` → 将 `{"_tool_use": {name, input}}` 推入 `_as_queue`。
+  `ask_human_input` → 将 `{"_tool_use": {name, input}}` 推入 `_as_queue`。
 - 该 `item/tool/call` 仍走现有 `_as_autoanswer` 的 `item/tool/call` 空成功应答 → codex 本轮正常结束；
   编排层消费队列里的 `_tool_use` 后暂停。exec 兜底路径同理（MCP 工具被批准执行，回合末落 `tool_use`）。
 
 ## 5. 编排暂停/续跑
 
 ### 5.1 检测（orchestrator._run_turn）
-- 与 `end_discussion` 检测并列：新增 `_is_human_input(name)`（`request_human_input` 在基名或带 mcp 前缀）。
-- 流结束后扫 `tool_uses`，若存在 `request_human_input`，设 `self._human_input_request = {agent, question, options}`。
+- 与 `end_discussion` 检测并列：新增 `_is_human_input(name)`（`ask_human_input` 在基名或带 mcp 前缀）。
+- 流结束后扫 `tool_uses`，若存在 `ask_human_input`，设 `self._human_input_request = {agent, question, options}`。
 
 ### 5.2 暂停（_debate / _chat_turn）
 - `_debate`：在 `_run_turn` 之后、`round_i += 1` 之前插入判断：
@@ -83,16 +90,16 @@ request_human_input(question: str, options: list[str] = [])
 ## 7. prompt 提示（让 agent 在「该问」时主动调工具）
 
 - debate 系统提示 + gateway 系统提示追加一句（中文）：
-  「当你需要用户从多个方案中选择、或需澄清任务时，**调用 `request_human_input` 工具**而非在文本里
+  「当你需要用户从多个方案中选择、或需澄清任务时，**调用 `ask_human_input` 工具**而非在文本里
   反问——本场是多人辩论，对方 agent 会替你回答你的反问，导致结果偏离你的意图。」
 - 同时说明 `options` 参数用法（列出候选项让用户点选）。
 
 ## 8. 测试点
 
-- `test_gateway`：过滤同时保留 `end_discussion` 与 `request_human_input`；`_restore_mcp_name` 两者都还原。
+- `test_gateway`：过滤同时保留 `end_discussion` 与 `ask_human_input`；`_restore_mcp_name` 两者都还原。
 - `test_orchestrator`：`_is_human_input` 识别带/不带前缀名；`_run_turn` 检测到工具调用后置
   `_human_input_request`；`_debate` 暂停后由同 agent 续跑且不增轮次。
-- `test_codex_appserver` / `test_codex_parse`：`item/tool/call` 含 `request_human_input` 被捕获为 `_tool_use`。
+- `test_codex_appserver` / `test_codex_parse`：`item/tool/call` 含 `ask_human_input` 被捕获为 `_tool_use`。
 - `test_frontend_render.js`（jsdom）：`human_input_required` 渲染出问题 + 选项按钮。
 - `test_executor`：`.mcp.json` 的 `terminate-signal` server 暴露新工具（脚本含该工具即可，注册代码不变）。
 
@@ -138,13 +145,13 @@ chat 首轮）⇒ 要求先调工具问清决定性选择（给 2-4 个选项）
 - app-server 实时 `item/completed`（executor `_run_codex_appserver`）
 - `codex exec --json` / rollout 的 `item.completed`（`_parse_codex_line`）
 
-写法均为 `... and "end_discussion" in str(tool)`，`request_human_input` 掉进 else 被
+写法均为 `... and "end_discussion" in str(tool)`，`ask_human_input` 掉进 else 被
 `_codex_native_tool_use` 判 `None` 吞掉 ⇒ codex 即便真调了，编排层也收不到、不会暂停。
 现统一走 `_guarded_mcp_tool(item)`（与 `_is_mcp_tool_item` 同处），认干净名与 `mcp__…__` 前缀名，
 产出干净名给编排层；非受控 MCP 调用仍不产事件。
 
 **与网关无关**：两个工具同属 `terminate-signal` MCP server，codex 直连 MCP，不走网关；
-end_discussion 走得通 ⇒ request_human_input 只需放开上报过滤。
+end_discussion 走得通 ⇒ ask_human_input 只需放开上报过滤。
 
 ### 10.3 遗留（未做，等定）
 
@@ -159,7 +166,7 @@ end_discussion 走得通 ⇒ request_human_input 只需放开上报过滤。
 
 | # | 用户判断 | 核实结论 |
 |---|---|---|
-| ① | 同一轮 agent 应支持多次提问、用户多次回复，不限次数 | **成立**（旧实现同一次发言只取最后一个 `request_human_input` / codex 只取 `questions[0]`，其余静默丢弃） |
+| ① | 同一轮 agent 应支持多次提问、用户多次回复，不限次数 | **成立**（旧实现同一次发言只取最后一个 `ask_human_input` / codex 只取 `questions[0]`，其余静默丢弃） |
 | ② | 回复时不需要带每轮那种完整提示词 | **成立**（用户回答走 `_build_prompt` 整轮注入，一句回答被 ~2000 字包住，含两段「用代码块代替工具调用」兜底说明） |
 | ③ | 交给对方只需最后一次结论，不带与用户的来回交互 | **部分成立**（human 消息本就被 `_others_since_last` 排除；但 agent 在 HITL 中的**中间发言**仍会原样转述） |
 | ④ | 是 HITL 交互让 claude 以为需要 `<tool_code>`，且原样喂回强化 | **修订后成立**（原「纯随机 + 单 agent 自我模仿」的结论不完整：codex rollout 逐行可见 claude 的记号被当作「对方发言」喂给 codex、codex 照抄、又被喂回 claude 的**跨 agent 传染回路**） |
