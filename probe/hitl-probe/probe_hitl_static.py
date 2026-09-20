@@ -248,6 +248,7 @@ def l5_prompt_injection(session: str) -> bool:
         return True
     total = 0
     hit = 0
+    new_hits = 0
     for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -255,9 +256,15 @@ def l5_prompt_injection(session: str) -> bool:
         o = json.loads(line)
         prompt = o.get("prompt") or ""
         total += 1
+        # 该会话是 2026-09-18 录制的历史日志（工具当时叫 request_human_input）；
+        # 2026-09-20 改名后历史日志不会回溯改写，故两代名字都算「已注入」。
         if "ask_human_input" in prompt:
+            new_hits += 1
             hit += 1
-    log(f"  {p.name}: 共 {total} 条 prompt，含 ask_human_input 指令 {hit} 条")
+        elif "request_human_input" in prompt:
+            hit += 1
+    log(f"  {p.name}: 共 {total} 条 prompt，含 HITL 指令 {hit} 条"
+        f"（其中新名 ask_human_input {new_hits} 条，其余为该会话录制时的旧名）")
     ok = total > 0 and hit == total
     log(f"【L5 结论】每轮都注入 HITL 指令: {ok}")
     return ok
