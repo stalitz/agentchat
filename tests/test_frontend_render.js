@@ -707,7 +707,7 @@ setTimeout(async () => {
     dom.window.addRow('human', '我', '新任务');
     check(chatEl.scrollTop === 3000, '自己发消息应强制回到底部，实际 ' + chatEl.scrollTop);
 
-    // ---- HITL：agent 请求人工介入面板（request_human_input → 暂停等人，自由文本回复）----
+    // ---- HITL：agent 请求人工介入面板（ask_human_input → 暂停等人，自由文本回复）----
     const hitlPanel = doc.getElementById('hitlPanel');
     check(hitlPanel.style.display === 'none', 'HITL 面板默认应隐藏');
     // 选项列表 UI 已移除：不再渲染可点选按钮，用户用自然语言自由回复

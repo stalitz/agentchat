@@ -43,9 +43,13 @@ def _is_end_discussion(name) -> bool:
 
 
 def _is_human_input(name) -> bool:
-    """判定是否为 request_human_input 调用（HITL 人工介入请求）——兼容干净名与
-    MCP 原名（mcp__terminate-signal__request_human_input）。"""
-    return isinstance(name, str) and "request_human_input" in name
+    """判定是否为 HITL 人工介入请求（工具 ask_human_input，2026-09-20 前名 request_human_input）
+    ——兼容干净名、MCP 原名（mcp__terminate-signal__ask_human_input）与**旧名**。
+
+    旧名必须继续认：历史会话已落盘的 tool_calls / codex rollout 里存的都是 request_human_input，
+    回放与续接时不能因为改名就不认（改名的目的是不再把它暴露给模型，不是让旧记录失效）。
+    """
+    return isinstance(name, str) and ("ask_human_input" in name or "request_human_input" in name)
 
 
 def _codex_answers_from_questions(questions, answer_text):
@@ -99,15 +103,16 @@ def _now_str() -> str:
 
 def _extract_text_tool_call(full: str) -> dict | None:
     """兜底解析：模型未拿到工具 schema 时（如 deepseek 走云端直连、不经本地网关），
-    会把 end_discussion / request_human_input 调用写成 prompt 指令约定的文本 json：
+    会把 end_discussion / ask_human_input 调用写成 prompt 指令约定的文本 json：
 
         ```json
         {"tool": "end_discussion", "reason": "..."}
-        {"tool": "request_human_input", "question": "..."}
+        {"tool": "ask_human_input", "question": "..."}
         ```
 
     编排层解析后并入 tool_uses，让终止/人工介入状态机对两种表达（真 tool_use 块 / 文本 json）
     行为一致——否则 deepseek 的 json 不被识别、终止永不收敛、只能靠轮次上限强停。
+    产出**规范名**（旧名 request_human_input 的文本调用也归一到 ask_human_input）。
     返回 {"name": ..., "input": {...}} 或 None。
     """
     if not full:
@@ -123,14 +128,14 @@ def _extract_text_tool_call(full: str) -> dict | None:
             if not isinstance(reason, str):
                 reason = str(reason) if reason is not None else ""
             return {"name": "end_discussion", "input": {"reason": reason}}
-        if tool == "request_human_input":
+        if tool in ("ask_human_input", "request_human_input"):
             question = data.get("question", "")
             if not isinstance(question, str):
                 question = str(question) if question is not None else ""
             opts = data.get("options") or []
             if not isinstance(opts, list):
                 opts = []
-            return {"name": "request_human_input",
+            return {"name": "ask_human_input",
                     "input": {"question": question, "options": opts}}
     return None
 
@@ -214,11 +219,11 @@ class Session:
         # （立论轮只在会话真正第一次开口时出现，见 _is_opening_turn）。
         self._resumed = False
         self.inject_queue: asyncio.Queue = asyncio.Queue()
-        # HITL 人工介入：agent 调 request_human_input 时编排层暂停整场、等用户回答。
+        # HITL 人工介入：agent 调 ask_human_input 时编排层暂停整场、等用户回答。
         # human_input_event 初始未置位（await 即阻塞），provide_human_input 置位并存入回答。
         self.human_input_event = asyncio.Event()
         # {question, options}：唯一的一个「待问 / 正在问」的问题（**没有队列**）。
-        # 语义（用户口径 2026-09-20）：一次发言里 agent 最多调一次 request_human_input，
+        # 语义（用户口径 2026-09-20）：一次发言里 agent 最多调一次 ask_human_input，
         # 调了本次发言就结束；用户回答后 agent **再说一轮**（那是一次新的发言），
         # 由它根据回答决定是再问一次、还是给出结论。来回次数不限，但每次提问都是独立发言。
         self._human_input_request = None
@@ -553,7 +558,7 @@ class Session:
                     agent=agent.name,
                     turn=round_i // len(self.agents) + 1, max_rounds=self.max_rounds,
                 ))
-        # 人工介入提示（HITL）：需要用户拍板时必须调 request_human_input 工具，而非在正文里
+        # 人工介入提示（HITL）：需要用户拍板时必须调 ask_human_input 工具，而非在正文里
         # 反问对方 agent——辩论中对方会替你回答，导致结果偏离用户意图（2026-09-19 实测：agent
         # 连续三轮在正文里「等用户回复」，实际是它在自说自话）。措辞见 prompt_defaults.hitl_debate。
         parts.append(self._render_slot("hitl_debate"))
@@ -565,7 +570,7 @@ class Session:
     def _build_hitl_reply_prompt(self, agent: AgentConfig, answer: str) -> str:
         """HITL「回复轮」专用轻量提示词（2026-09-19 用户口径）。
 
-        用户回答经 request_human_input 交回时，只注入「回答 + 续问/收尾引导」，
+        用户回答经 ask_human_input 交回时，只注入「回答 + 续问/收尾引导」，
         **不复用** `_build_prompt` 的整轮提示词。理由：
         - 用户回答本质是**一次工具交互的回执**，不是新一轮议题，不需要共识终止 / 轮次门槛 /
           调性 / 完整 HITL 规则这些「轮到该 agent 正式发言」才需要的指令；
@@ -584,7 +589,7 @@ class Session:
         return "\n\n".join(parts)
 
     def _collect_human_input_questions(self, tool_uses: list) -> int:
-        """记下本轮 request_human_input 的那个问题，返回是否提问（0/1）。
+        """记下本轮 ask_human_input 的那个问题，返回是否提问（0/1）。
 
         一次发言只会调一次（用户口径 2026-09-20），故只保留**唯一**一个待问问题：
         万一某次真的出现多次调用，取最后一个（覆盖），绝不排队——排队会让「上一轮
@@ -732,7 +737,7 @@ class Session:
                 # 原生 HITL 通道（codex requestUserInput）：codex 那轮已在 executor 立即回
                 # result 结束（不阻塞），此处仅真暂停整场等人；用户回答经 1:1 续接作为
                 # 下一次 prompt 续发 codex（不在本分支回 result 解锁，否则 codex 会卡死等）。
-                # 与 MCP request_human_input（tool_use）共用同一个待问问题位与暂停 UI，
+                # 与 MCP ask_human_input（tool_use）共用同一个待问问题位与暂停 UI，
                 # 生命周期不重叠：native 在 _run_turn 返回前已清空，不会触发调用方的二次 pause。
                 # 同样**只取一个**（一问一答来回；不排队，见 _collect_human_input_questions）。
                 req = text or {}
@@ -787,7 +792,7 @@ class Session:
             if tool_use_ts is None:
                 tool_use_ts = _now_str()   # 文本表达无独立时间戳，以解析时刻近似
             tool_uses.append(text_tool)
-        # request_human_input（HITL 人工介入）：把本轮**全部**提问收进待问队列，
+        # ask_human_input（HITL 人工介入）：把本轮**全部**提问收进待问位，
         # _debate/_chat_turn 据此暂停整场等人；不中止本轮——发言正常落盘，由调用方续跑。
         asked = self._collect_human_input_questions(tool_uses)
         # HITL 交互过程发言（interim）：本轮是「回复用户回答」的一次续跑（hitl_reply），
@@ -1002,7 +1007,7 @@ class Session:
             if text:
                 await self._record_human(text, "用户")
             await self._run_turn(self.agents[0], len(self.history), text or None)
-        # HITL 人工介入（chat 模式）：agent 调 request_human_input → 本次发言结束、暂停等人
+        # HITL 人工介入（chat 模式）：agent 调 ask_human_input → 本次发言结束、暂停等人
         # → 用户答完后同一 agent **再说一轮**（新发言），由它决定再问还是收尾 ⇒ while 次数不限。
         while self._human_input_request:
             # 一问一答的来回：问掉当前这一个问题、拿到回答后立即让同一 agent 说下一轮。
@@ -1059,7 +1064,7 @@ class Session:
             full, errors = await self._run_turn(current, round_i, pending_inject)
             pending_inject = None
 
-            # HITL 人工介入：agent 调 request_human_input → 本次发言结束、暂停整场等人，
+            # HITL 人工介入：agent 调 ask_human_input → 本次发言结束、暂停整场等人，
             # 回答由「发起提问的 agent」再说一轮（round_i 不增，不消耗额外轮次）。
             # 内层 while = 一问一答的来回：答完立即再跑一轮新发言，若它又提问则继续，次数不限。
             # 须先于 errors 检查：工具轮可能带「未知工具」类误报错误，意图已被捕获。

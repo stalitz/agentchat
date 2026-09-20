@@ -444,7 +444,10 @@ def _reconcile_with_cli(project_path: str, sid: str, agent_sessions: dict) -> di
         cli_turns = executor.read_cli_transcript(cli_session_id, agent_name)
         if not cli_turns:  # None(无 transcript/离线) 或 [] (空文件) → 不动本地
             continue
-        res = store.reconcile_agent_messages(project_path, sid, agent_name, cli_turns)
+        # codex 一次发言内部多 turn 被 transcript 拆成多条 → 数量不一致时禁止 append（否则多气泡）；
+        # claude 保留 append 用于崩写恢复。
+        is_codex = bool(executor._codex_transcript_path(cli_session_id))
+        res = store.reconcile_agent_messages(project_path, sid, agent_name, cli_turns, is_codex=is_codex)
         if res.get("changed") or res.get("appended"):
             summary[agent_name] = res
     return summary

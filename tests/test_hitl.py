@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""回归测试：人工介入（HITL, request_human_input）链路（2026-09-19 修的两个问题）。
+"""回归测试：人工介入（HITL, ask_human_input）链路（2026-09-19 修的两个问题）。
 
 问题 1（codex 上报断链 · 真 bug）
     executor 的两条 codex 通路——app-server 实时 `item/completed`、`codex exec` 与 rollout
     兜底的 `item.completed`——判定受控 MCP 工具时都只写 `"end_discussion" in tool`，
-    `request_human_input` 掉进 else 分支被 `_codex_native_tool_use` 判 None 吞掉
+    `ask_human_input` 掉进 else 分支被 `_codex_native_tool_use` 判 None 吞掉
     ⇒ codex 即便真的调了，编排层也收不到、不会暂停（界面上只看到它在正文里空问）。
     修法：受控工具判定集中在 `_guarded_mcp_tool`（与 `_is_mcp_tool_item` 同处），两条通路共用。
 
@@ -50,20 +50,30 @@ class TestGuardedMcpTool(unittest.TestCase):
     def test_end_discussion_and_human_input_both_recognized(self):
         self.assertEqual(_guarded_mcp_tool(_mcp_item("end_discussion", {"reason": "x"})),
                          "end_discussion")
-        self.assertEqual(_guarded_mcp_tool(_mcp_item("request_human_input", {"question": "q"})),
-                         "request_human_input")
+        self.assertEqual(_guarded_mcp_tool(_mcp_item("ask_human_input", {"question": "q"})),
+                         "ask_human_input")
 
     def test_mcp_prefixed_name_normalized(self):
         # codex 侧可能带上 MCP 前缀（网关还原后的形态）
         self.assertEqual(
+            _guarded_mcp_tool(_mcp_item("mcp__terminate-signal__ask_human_input", {})),
+            "ask_human_input")
+
+    def test_legacy_name_normalized_to_new(self):
+        """改名兼容（2026-09-20）：旧名 request_human_input 仍要认，且**归一到新名**
+        —— 历史会话的 tool_use / rollout 里存的就是旧名。"""
+        self.assertEqual(
+            _guarded_mcp_tool(_mcp_item("request_human_input", {"question": "q"})),
+            "ask_human_input")
+        self.assertEqual(
             _guarded_mcp_tool(_mcp_item("mcp__terminate-signal__request_human_input", {})),
-            "request_human_input")
+            "ask_human_input")
 
     def test_app_server_camel_case_item_type(self):
         # app-server 通路 item.type 是驼峰 mcpToolCall
         self.assertEqual(
-            _guarded_mcp_tool(_mcp_item("request_human_input", {}, type_="mcpToolCall")),
-            "request_human_input")
+            _guarded_mcp_tool(_mcp_item("ask_human_input", {}, type_="mcpToolCall")),
+            "ask_human_input")
 
     def test_other_tools_not_guarded(self):
         self.assertIsNone(_guarded_mcp_tool(_mcp_item("some_other_tool", {})))
@@ -72,19 +82,29 @@ class TestGuardedMcpTool(unittest.TestCase):
 
 
 class TestCodexParseHumanInput(unittest.TestCase):
-    """_parse_codex_line（exec / rollout 通路）：request_human_input 必须产出 tool_use。"""
+    """_parse_codex_line（exec / rollout 通路）：ask_human_input 必须产出 tool_use。"""
 
     def test_human_input_yields_tool_use(self):
         line = ('{"type":"item.completed","item":{"id":"i1","type":"mcp_tool_call",'
-                '"server":"terminate-signal","tool":"request_human_input",'
+                '"server":"terminate-signal","tool":"ask_human_input",'
                 '"arguments":{"question":"你的训练频率？","options":["每周2次","每周4次"]}}}')
         out = _parse_codex_line(line, None)
         self.assertEqual(len(out), 1, f"应产出一条 tool_use，实际 {out}")
         kind, payload = out[0]
         self.assertEqual(kind, "tool_use")
-        self.assertEqual(payload["name"], "request_human_input")
+        self.assertEqual(payload["name"], "ask_human_input")
         self.assertEqual(payload["input"]["question"], "你的训练频率？")
         self.assertEqual(payload["input"]["options"], ["每周2次", "每周4次"])
+
+    def test_legacy_tool_name_still_yields_tool_use(self):
+        """改名兼容：rollout 里存的旧名 request_human_input 仍产出 tool_use（归一为新名）。"""
+        line = ('{"type":"item.completed","item":{"id":"i9","type":"mcp_tool_call",'
+                '"server":"terminate-signal","tool":"request_human_input",'
+                '"arguments":{"question":"旧名提问"}}}')
+        out = _parse_codex_line(line, None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][1]["name"], "ask_human_input")
+        self.assertEqual(out[0][1]["input"]["question"], "旧名提问")
 
     def test_end_discussion_still_yields_tool_use(self):
         # 回归：放开过滤不能把 end_discussion 弄丢
@@ -98,7 +118,7 @@ class TestCodexParseHumanInput(unittest.TestCase):
     def test_started_event_does_not_duplicate(self):
         # 只认 completed：started 不产事件，避免同一次调用计两次
         line = ('{"type":"item.started","item":{"id":"i3","type":"mcp_tool_call",'
-                '"tool":"request_human_input","arguments":{}}}')
+                '"tool":"ask_human_input","arguments":{}}}')
         self.assertEqual(_parse_codex_line(line, None), [])
 
 
@@ -124,7 +144,7 @@ class TestHitlPrompt(unittest.TestCase):
         a = models.AgentConfig(name="A", type="claude-code")
         s = self._session([a])
         p = s._build_prompt(a, "给我几套方案让我选", round_i=0)
-        self.assertIn("request_human_input", p, "chat 提示词必须点出工具名")
+        self.assertIn("ask_human_input", p, "chat 提示词必须点出工具名")
         self.assertIn("禁止用正文反问代替工具调用", p, "必须明令禁止正文反问")
         self.assertIn("先问后答", p, "诉求要拍板时应注入「先问后答」强指令")
 
@@ -132,7 +152,7 @@ class TestHitlPrompt(unittest.TestCase):
         a = models.AgentConfig(name="A", type="claude-code")
         s = self._session([a])
         p = s._build_prompt(a, "请介绍跳高训练原理", round_i=0)
-        self.assertIn("request_human_input", p, "通用规则每轮都在")
+        self.assertIn("ask_human_input", p, "通用规则每轮都在")
         self.assertNotIn("先问后答", p, "普通议题不应强制先问")
 
     def test_debate_prompt_warns_peer_will_answer(self):
@@ -141,7 +161,7 @@ class TestHitlPrompt(unittest.TestCase):
         s = self._session([a1, a2])
         s._initial_task = "请给多套跳高训练方案让我选"
         p = s._build_prompt(a1, "请给多套跳高训练方案让我选", round_i=0)
-        self.assertIn("request_human_input", p)
+        self.assertIn("ask_human_input", p)
         self.assertIn("对方 agent", p, "必须说明正文反问会被对方 agent 接走")
         self.assertIn("先问后答", p, "首个发言者（round_i=0）应先问后答")
 
@@ -152,7 +172,7 @@ class TestHitlPrompt(unittest.TestCase):
         s = self._session([a1, a2])
         s._initial_task = "请给多套方案让我选"
         p = s._build_prompt(a2, None, round_i=1)
-        self.assertIn("request_human_input", p)
+        self.assertIn("ask_human_input", p)
         self.assertNotIn("先问后答", p)
 
     def test_no_opening_after_already_asked(self):
@@ -161,7 +181,7 @@ class TestHitlPrompt(unittest.TestCase):
         s = self._session([a])
         s._hitl_asked = True
         p = s._build_prompt(a, "给我几套方案让我选", round_i=0)
-        self.assertIn("request_human_input", p)
+        self.assertIn("ask_human_input", p)
         self.assertNotIn("先问后答", p)
 
 
@@ -187,10 +207,10 @@ class _FakeProc:
 
 
 class TestNativeCodexHumanInput(unittest.TestCase):
-    """原生通道 item/tool/requestUserInput：兜底转 request_human_input 语义，且不卡 codex。
+    """原生通道 item/tool/requestUserInput：兜底转 ask_human_input 语义，且不卡 codex。
 
     关键不变量（用户纠正 2026-09-19）：requestUserInput 只是 codex 自发中断的**兜底**——
-    转成与真 request_human_input 同语义的暂停；但 codex 那轮必须立即结束（回 result），
+    转成与真 ask_human_input 同语义的暂停；但 codex 那轮必须立即结束（回 result），
     不能阻塞等人。用户回答经 1:1 续接作为下一次 prompt 续发 codex。
     """
 
@@ -224,8 +244,8 @@ class TestNativeCodexHumanInput(unittest.TestCase):
         self.assertEqual(frame["result"], {"answers": {}})
 
     def test_hitl_tool_result_has_interrupt_semantics(self):
-        # 受控工具回包：request_human_input 必须带中断语义（告知 codex「本轮已中止、等下次」）。
-        r = _hitl_tool_result("request_human_input")
+        # 受控工具回包：ask_human_input 必须带中断语义（告知 codex「本轮已中止、等下次」）。
+        r = _hitl_tool_result("ask_human_input")
         self.assertTrue(r["success"])
         self.assertIn("暂停并等待人工介入", r["contentItems"][0]["text"])
         self.assertIn("后续用户输入", r["contentItems"][0]["text"])
@@ -337,7 +357,7 @@ async def _wait_until(pred, tries=800, delay=0.005):
     return False
 
 
-def _ask(q, name="request_human_input", options=None):
+def _ask(q, name="ask_human_input", options=None):
     return ("tool_use", {"name": name, "input": {"question": q, "options": options or []}})
 
 
@@ -360,7 +380,7 @@ class TestHitlReplyPrompt(unittest.TestCase):
         s = self._session([a])
         p = s._build_hitl_reply_prompt(a, "每周 3-4 次")
         self.assertIn("每周 3-4 次", p, "必须带上用户回答原文")
-        self.assertIn("request_human_input", p, "要告知还能继续调工具问（不限次数）")
+        self.assertIn("ask_human_input", p, "要告知还能继续调工具问（不限次数）")
         self.assertIn("归纳", p, "要引导把几轮问答归纳成结论")
         self.assertNotIn("轮次门槛", p, "回复轮不重灌轮次门槛")
         self.assertNotIn("共识终止", p, "回复轮不重灌终止规则")
@@ -382,7 +402,7 @@ class TestHitlReplyPrompt(unittest.TestCase):
         a = models.AgentConfig(name="A", type="codex")
         s = self._session([a])
         n = s._collect_human_input_questions([
-            {"name": "request_human_input", "input": {"question": "Q1", "options": ["a"]}},
+            {"name": "ask_human_input", "input": {"question": "Q1", "options": ["a"]}},
             {"name": "mcp__terminate-signal__end_discussion", "input": {"reason": "x"}},
         ])
         self.assertEqual(n, 1, "一次发言里的一次提问")
@@ -391,8 +411,8 @@ class TestHitlReplyPrompt(unittest.TestCase):
         self.assertFalse(hasattr(s, "_human_input_queue"), "不应再有队列")
         # 极端情况：真的出现多次调用 → 取最后一个（覆盖），绝不排队
         s._collect_human_input_questions([
-            {"name": "request_human_input", "input": {"question": "Q1"}},
-            {"name": "mcp__terminate-signal__request_human_input", "input": {"question": "Q2"}},
+            {"name": "ask_human_input", "input": {"question": "Q1"}},
+            {"name": "mcp__terminate-signal__ask_human_input", "input": {"question": "Q2"}},
         ])
         self.assertEqual(s._human_input_request["question"], "Q2", "多次调用取最后一个，不排队")
 
@@ -405,8 +425,8 @@ class TestHitlReplyPrompt(unittest.TestCase):
         a = models.AgentConfig(name="A", type="codex")
         s = self._session([a])
         s._collect_human_input_questions([
-            {"name": "request_human_input", "input": {"question": "Q1"}},
-            {"name": "request_human_input", "input": {"question": "Q2"}},
+            {"name": "ask_human_input", "input": {"question": "Q1"}},
+            {"name": "ask_human_input", "input": {"question": "Q2"}},
         ])
 
         async def drive():
@@ -462,7 +482,7 @@ class TestChatMultiAskEndToEnd(unittest.TestCase):
             [("text", "先问频率。"),
              _ask("每周几次？", options=["2", "4"]), ("done", "")],
             [("text", "再问时段。"),
-             _ask("偏好时段？", name="mcp__terminate-signal__request_human_input"), ("done", "")],
+             _ask("偏好时段？", name="mcp__terminate-signal__ask_human_input"), ("done", "")],
             [("text", "结论：每周 4 次、早上训练。"), ("done", "")],
         ])
         s.runtimes[a.name] = rt
@@ -485,7 +505,7 @@ class TestChatMultiAskEndToEnd(unittest.TestCase):
         # 2) 回复轮 prompt 是轻量的（无轮次门槛/终止规则），且带用户回答与续问引导
         for p, ans in ((rt.prompts[1], "每周 4 次"), (rt.prompts[2], "早上")):
             self.assertIn(ans, p)
-            self.assertIn("request_human_input", p)
+            self.assertIn("ask_human_input", p)
             self.assertNotIn("轮次门槛", p, "回复轮不重灌整轮提示词")
             self.assertNotIn("共识终止", p, "回复轮不重灌整轮提示词")
         # 3) 起问轮（非回复轮）仍是完整提示词（含完整 HITL 规则），证明只对回复轮瘦身

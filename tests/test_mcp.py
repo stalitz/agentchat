@@ -73,5 +73,51 @@ class TestReadFrame(unittest.TestCase):
         self.assertNotIn("The conversation has concluded", text, "不得出现英文待命语")
 
 
+class TestHitlToolNaming(unittest.TestCase):
+    """HITL 工具命名（2026-09-20 由 request_human_input 改名为 ask_human_input）。
+
+    改名的原因：旧名与 codex 内建的 `request_user_input` 太接近，codex 会把调用归一化到
+    内建工具，被 headless「Default mode」门禁拒掉（实测 v9 通勤场工具完全不可用）。
+    锁定两件事：① 对外**只暴露新名**；② 旧名仍**能调通**（历史会话 / 提示词残留）。
+    """
+
+    def _tools_list(self):
+        resp = None
+        def _cap(frame):
+            nonlocal resp
+            resp = frame
+            raise SystemExit  # 抓一帧即退出循环
+        with mock.patch.object(mcp, "_write_frame", _cap), \
+                mock.patch.object(mcp, "_read_frame",
+                                  return_value='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'):
+            try:
+                mcp.main()
+            except SystemExit:
+                pass
+        return {t["name"]: t for t in resp["result"]["tools"]}
+
+    def test_exposed_name_is_new_only(self):
+        tools = self._tools_list()
+        self.assertIn("ask_human_input", tools, "必须暴露新名")
+        self.assertNotIn("request_human_input", tools, "旧名不得再暴露给模型")
+        self.assertIn("end_discussion", tools)
+        # 参数 schema 仍是标准 MCP inputSchema（question: string）——与 codex 内建
+        # request_user_input 的对象数组参数不同，也是防误调的一环
+        schema = tools["ask_human_input"]["inputSchema"]
+        self.assertEqual(schema["properties"]["question"]["type"], "string")
+        self.assertEqual(schema["required"], ["question"])
+
+    def test_legacy_name_still_accepted(self):
+        for name in ("ask_human_input", "request_human_input"):
+            resp = mcp._handle_call({"name": name, "arguments": {"question": "选哪个？"}})
+            self.assertFalse(resp.get("isError"), f"{name} 应能调通")
+            text = resp["content"][0]["text"]
+            self.assertIn("选哪个？", text)
+            self.assertIn("暂停并等待人工介入", text)
+        # 回执里点名的工具名统一用新名（不再向模型强化旧名）
+        resp = mcp._handle_call({"name": "request_human_input", "arguments": {"question": "q"}})
+        self.assertIn("ask_human_input", resp["content"][0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

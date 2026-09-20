@@ -1233,34 +1233,48 @@ if __name__ == "__main__":
 
 
 class TestHumanInputDetection(unittest.TestCase):
-    """HITL：request_human_input 工具的检测（agent 调它 → 编排层暂停整场等人）。
+    """HITL：ask_human_input 工具的检测（agent 调它 → 编排层暂停整场等人）。
 
     锁定：_is_human_input 对干净名与 MCP 原名都认；_extract_text_tool_call 对
-    request_human_input 的文本 json 兜底（给 deepseek 等不走网关的模型）能解析出
+    ask_human_input 的文本 json 兜底（给 deepseek 等不走网关的模型）能解析出
     question + options。
     """
 
     def test_is_human_input_both_names(self):
-        self.assertTrue(_is_human_input("request_human_input"))
-        self.assertTrue(_is_human_input("mcp__terminate-signal__request_human_input"))
+        self.assertTrue(_is_human_input("ask_human_input"))
+        self.assertTrue(_is_human_input("mcp__terminate-signal__ask_human_input"))
         # 非人工介入工具不认
         self.assertFalse(_is_human_input("end_discussion"))
         self.assertFalse(_is_human_input("mcp__terminate-signal__end_discussion"))
         self.assertFalse(_is_human_input("bash"))
 
-    def test_extract_text_tool_call_human_input(self):
-        # 模型把调用写成 prompt 约定的文本 json（代码围栏包裹）时，兜底解析应识别 request_human_input
+    def test_is_human_input_legacy_name_still_recognized(self):
+        """改名兼容（2026-09-20 request_human_input → ask_human_input）：历史会话已落盘的
+        tool_use / 旧提示词残留用旧名，编排层必须继续认，否则老会话的提问不再触发暂停。"""
+        self.assertTrue(_is_human_input("request_human_input"))
+        self.assertTrue(_is_human_input("mcp__terminate-signal__request_human_input"))
+
+    def test_extract_text_tool_call_legacy_name_normalized(self):
+        """文本兜底解析旧名时，产出**规范名** ask_human_input（新名是唯一对外口径）。"""
         s = _extract_text_tool_call(
-            '```json\n{"tool":"request_human_input","question":"选哪个方案？","options":["方案A","方案B"]}\n```')
+            '```json\n{"tool":"request_human_input","question":"旧名提问"}\n```')
         self.assertIsNotNone(s)
-        self.assertEqual(s["name"], "request_human_input")
+        self.assertEqual(s["name"], "ask_human_input")
+        self.assertEqual(s["input"].get("question"), "旧名提问")
+
+    def test_extract_text_tool_call_human_input(self):
+        # 模型把调用写成 prompt 约定的文本 json（代码围栏包裹）时，兜底解析应识别 ask_human_input
+        s = _extract_text_tool_call(
+            '```json\n{"tool":"ask_human_input","question":"选哪个方案？","options":["方案A","方案B"]}\n```')
+        self.assertIsNotNone(s)
+        self.assertEqual(s["name"], "ask_human_input")
         self.assertEqual(s["input"].get("question"), "选哪个方案？")
         self.assertEqual(s["input"].get("options"), ["方案A", "方案B"])
 
     def test_extract_text_tool_call_human_input_no_options(self):
         s = _extract_text_tool_call(
-            '```json\n{"tool":"request_human_input","question":"请澄清任务范围"}\n```')
+            '```json\n{"tool":"ask_human_input","question":"请澄清任务范围"}\n```')
         self.assertIsNotNone(s)
-        self.assertEqual(s["name"], "request_human_input")
+        self.assertEqual(s["name"], "ask_human_input")
         self.assertEqual(s["input"].get("question"), "请澄清任务范围")
         self.assertEqual(s["input"].get("options"), [])

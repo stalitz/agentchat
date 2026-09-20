@@ -487,7 +487,8 @@ def _merge_tool_info(msg: dict, turn: dict) -> bool:
     return changed
 
 
-def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_turns: list) -> dict:
+def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_turns: list,
+                            is_codex: bool = False) -> dict:
     """用 CLI transcript 的 agent 回合（cli_turns: 有序 [{content, thinking}]）覆盖本地该 agent 的消息。
 
     对齐规则（agent 为准）：
@@ -571,7 +572,7 @@ def reconcile_agent_messages(project_path: str, sid: str, agent_name: str, cli_t
                             hit = j
                             break
                 if hit is None:
-                    if len(cli_turns) > len(idxs) and not has_interrupted:
+                    if len(cli_turns) > len(idxs) and not has_interrupted and not is_codex:
                         msgs.append({
                             "round": len(msgs), "speaker": agent_name, "role": role,
                             "content": new_content, "thinking": new_think,

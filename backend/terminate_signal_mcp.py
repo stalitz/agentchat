@@ -1,4 +1,5 @@
-"""MCP stdio 服务：向 claude-code 暴露 `end_discussion(reason)` 工具。
+"""MCP stdio 服务：向 claude-code / codex 暴露 `end_discussion(reason)` 与
+`ask_human_input(question)` 两个受控工具（后者原名 request_human_input，见 TOOL2_NAME 处注释）。
 
 背景（需求文档 FR5.3a / 开发文档 §6）：终止讨论的可靠机制——agent 通过**结构化工具调用**
 表达终止意图，比纯字符串 TERMINATE 可靠。
@@ -33,7 +34,16 @@ INPUT_SCHEMA = {
 
 # 第二个工具：请求人工介入（HITL）。agent 需要用户从多方案中选择或澄清任务时调用，
 # 编排层据此暂停整场、把问题推前端、等用户回答后作为下一条 delta 续跑。
-TOOL2_NAME = "request_human_input"
+#
+# **命名（2026-09-20 改名）**：原名 `request_human_input` 与 codex 内建的
+# `request_user_input`（headless「Default mode」下被门禁）名字过于接近 —— codex 会把本次
+# 调用归一化到内建工具，报 `request_user_input is unavailable in Default mode`，工具因此
+# 完全不可用（实测 v9 通勤场：codex 连试多种参数格式全部被门禁，最终靠 claude 兜住）。
+# 改名 `ask_human_input` 与内建名拉开距离，绕开碰撞。
+# 旧名保留为**兼容别名**（只认不暴露）：历史会话的 tool_use / transcript 里存的是旧名，
+# 逐字比对与渲染仍要认它。
+TOOL2_NAME = "ask_human_input"
+LEGACY_TOOL2_NAMES = ("request_human_input",)
 TOOL2_DESC = (
     "当你需要用户（人类）从多个方案中选择、或需要澄清任务/需求时才调用。"
     "调用后系统会暂停当前多 agent 讨论并等待人工介入——请勿在文本里直接反问对方 agent，"
@@ -55,12 +65,12 @@ SERVER_INFO = {"name": "terminate-signal", "version": "0.2.0"}
 def _handle_call(params: dict) -> dict:
     args = params.get("arguments") or {}
     name = params.get("name", "")
-    if name == TOOL2_NAME:
+    if name == TOOL2_NAME or name in LEGACY_TOOL2_NAMES:
         question = str(args.get("question", "") or "")
         # 无状态确认：真实暂停/续跑由编排层执行；本服务仅提供工具调用通道。
         return {
             "content": [{"type": "text", "text": (
-                f"【工具回执】你的 request_human_input 调用已收到（问题：{question}）。"
+                f"【工具回执】你的 {TOOL2_NAME} 调用已收到（问题：{question}）。"
                 "系统将暂停并等待人工介入；人工回答将作为后续用户输入，你无需自行猜测答案。"
             )}],
             "isError": False,

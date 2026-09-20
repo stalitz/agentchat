@@ -164,7 +164,7 @@ def anthropic_to_openai(body: dict) -> dict:
     tools = body.get("tools")
     if tools:
         # 工具转发（2026-09-18 调整）：
-        # ① 受控工具 end_discussion / request_human_input（terminate-signal MCP server 下）始终转发（去前缀），
+        # ① 受控工具 end_discussion / ask_human_input（terminate-signal MCP server 下）始终转发（去前缀），
         #    由编排层驱动终止 / 人工介入状态机；
         # ② claude 内置工具（Bash/Read/Edit/Glob/Grep/Write/WebFetch/WebSearch/...）**不带 mcp__ 前缀**，
         #    由 claude CLI 本地执行——原样转发给本地模型，让其能看到并产出 tool_use
@@ -172,11 +172,11 @@ def anthropic_to_openai(body: dict) -> dict:
         #    （实测猜 shell:execute 失败、claude 回 No such tool available）；
         # ③ 第三方 MCP 工具（带 mcp__ 前缀、非受控）仍剥，避免本地模型乱调产生副作用；
         # ④ 交互型工具（AskUserQuestion/EnterPlanMode/ExitPlanMode）本 app 无 TTY 通道会卡死，也剥
-        #    （人工介入改用受控工具 request_human_input）。
+        #    （人工介入改用受控工具 ask_human_input）。
         keep = []
         for t in tools:
             name = t.get("name") or ""
-            if any(k in name for k in ("end_discussion", "request_human_input")):
+            if any(k in name for k in _GUARDED_TOOL_NAMES):
                 keep.append(t)            # 受控工具：始终转发
                 continue
             if name.startswith("mcp__"):
@@ -197,7 +197,7 @@ def anthropic_to_openai(body: dict) -> dict:
 
 
 # claude 内置的交互型工具：本 app 用无 TTY 子进程拉起 claude，
-# 这些工具需要真人实时回答 / 进入 plan 模式，无通道会卡死，必须剥（人工介入改用受控工具 request_human_input）。
+# 这些工具需要真人实时回答 / 进入 plan 模式，无通道会卡死，必须剥（人工介入改用受控工具 ask_human_input）。
 _CLAUDE_INTERACTIVE_TOOLS = frozenset({
     "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
 })
@@ -303,17 +303,27 @@ def _strip_mcp_prefix(name: str) -> str:
     return name
 
 
+# 受控工具名（terminate-signal MCP server 提供）。HITL 工具 2026-09-20 由 request_human_input
+# 改名 ask_human_input（与原内建 request_user_input 撞名 → codex 归一化后被门禁），旧名作为
+# 兼容别名继续认下：本地小模型可能沿用提示词/历史会话里的旧名产出 tool_use。
+_GUARDED_TOOL_NAMES = ("end_discussion", "ask_human_input", "request_human_input")
+# 旧名 → 现用名（MCP server 只注册了新名，还原时必须归一到新名才匹配得上）
+_GUARDED_TOOL_ALIASES = {"request_human_input": "ask_human_input"}
+
+
 def _restore_mcp_name(name: str) -> str:
-    """end_discussion / request_human_input（或带前缀变体）→ mcp__terminate-signal__<基名>。
+    """end_discussion / ask_human_input（或带前缀变体）→ mcp__terminate-signal__<基名>。
 
     模型可能以干净名或带其他前缀的名调用，claude 侧只注册了 MCP 原名——
     翻译 tool_calls 时必须还原，否则 claude 报「No such tool available」。
-    两个受控工具同属 terminate-signal server，故前缀统一为 mcp__terminate-signal__。
+    两个受控工具同属 terminate-signal server，故前缀统一为 mcp__terminate-signal__；
+    旧名 request_human_input 归一到 ask_human_input（server 已不再注册旧名）。
     """
     if name and not name.startswith("mcp__"):
         base = name.split("__")[-1] if "__" in name else name
         base = base.split(":")[-1]  # 兼容 anthropic: 前缀变体
-        if base in ("end_discussion", "request_human_input"):
+        if base in _GUARDED_TOOL_NAMES:
+            base = _GUARDED_TOOL_ALIASES.get(base, base)
             return f"mcp__terminate-signal__{base}"
     return name
 

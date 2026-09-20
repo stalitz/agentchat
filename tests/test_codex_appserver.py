@@ -93,7 +93,7 @@ class TestAppServerAutoApprove(unittest.TestCase):
 
     def test_user_input_immediately_ack_and_forward(self):
         # 原生 HITL 通道 item/tool/requestUserInput（codex 内建 ask-user）兜底转
-        # request_human_input 语义：读循环**立即回空 result**让 codex 本轮结束（不卡），
+        # ask_human_input 语义：读循环**立即回空 result**让 codex 本轮结束（不卡），
         # 同时把请求转交编排层走 human_input_required 真暂停——用户回答经 1:1 续接续发，
         # 而非回 result 解锁（否则 codex 会阻塞等人）。
         rt = _rt()
@@ -112,7 +112,7 @@ class TestAppServerAutoApprove(unittest.TestCase):
         frame = json.loads(rt._appserver_proc.stdin.writes[0].decode().strip())
         self.assertEqual(frame["id"], 7)
         self.assertEqual(frame["result"], {"answers": {}})
-        # 同时转交 HITL 给编排层（requestUserInput → request_human_input 语义兜底）
+        # 同时转交 HITL 给编排层（requestUserInput → ask_human_input 语义兜底）
         got = []
         while True:
             try:

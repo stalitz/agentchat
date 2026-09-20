@@ -383,7 +383,10 @@ ROLLOUT_LINES = [
     _em({"type": "agent_message", "message": "正文一"}),  # 与下一行 response_item 内容完全一致（真实 rollout 即如此）
     _ri({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "正文一"}]}),
     # ---- 回合 2：user 提示 → 工具搜索 → 思考 → 工具调用 → 正文 ----
+    # 真实 rollout 里**每次 app 发言都配一条 event_msg/user_message**（跨 08/09 全部 15 个
+    # rollout 实测：user_message 数 == app 提示词数），它才是权威的发言边界（见 _parse_codex_transcript）
     _ri({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "第二轮提示"}]}),
+    _em({"type": "user_message", "message": "第二轮提示"}),
     _ri({"type": "tool_search_call", "arguments": {"query": "end_discussion"}}),
     _ri({"type": "tool_search_output", "tools": []}),
     _ri({"type": "reasoning", "summary": [],
@@ -503,6 +506,56 @@ def test_codex_transcript_extracts_tool_use_from_function_call():
     assert t1["tool_calls"] == [{"name": "end_discussion", "input": {"reason": "达成一致"}}]
     blocks = [b for b in t1["blocks"] if b["type"] == "tool_use"]
     assert blocks and blocks[0]["input"] == {"reason": "达成一致"}
+
+
+def test_codex_internal_goal_does_not_split_turn():
+    """codex 的 goal 自驱轮**不是**一次新发言 —— 不得切分回合。
+
+    这是 2026-09-20 修的真 bug：旧实现见 `role=user` 就切回合，把 codex 一次发言内部的
+    goal 自驱续跑（`<codex_internal_context source="goal">`）当成新发言，reconcile 回填时
+    就凭空追加气泡 —— 实测 s_a3d8022f 真实 2 次发言被拆成 7 条（09-19 00:25 备份里
+    codex 消息从 2 条变 8 条）。
+    """
+    lines = [
+        _ri({"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "# AGENTS.md instructions\n<INSTRUCTIONS>..."}]}),
+        _ri({"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "真实提示"}]}),
+        _em({"type": "user_message", "message": "真实提示"}),
+        _ri({"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "第一段"}]}),
+        _ri({"type": "message", "role": "user",
+             "content": [{"type": "input_text",
+                          "text": '<codex_internal_context source="goal">\n'
+                                  "Continue working toward the active thread goal.\n</codex_internal_context>"}]}),
+        _ri({"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "第二段"}]}),
+    ]
+    turns = _parse_codex_transcript(_rollout(lines))
+    assert len(turns) == 1, f"goal 自驱轮 / 注入上下文不得切分发言，实际切出 {len(turns)} 条"
+    # 同一发言内的多段正文都留在这一条里（reconcile 按「1 发言 = 1 条」覆盖本地）
+    assert "第一段" in turns[0]["content"] and "第二段" in turns[0]["content"]
+
+
+def test_codex_legacy_rollout_without_user_message_events():
+    """旧版本 rollout 没有 `event_msg/user_message` ⇒ 退回按 user 消息切分，
+    但注入上下文（`<environment_context>` 等）仍不作边界。"""
+    lines = [
+        _ri({"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "开场"}]}),
+        _ri({"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "<environment_context><cwd>/tmp</cwd></environment_context>"}]}),
+        _ri({"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "后续"}]}),
+        _ri({"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "真提示"}]}),
+        _ri({"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "答复"}]}),
+    ]
+    turns = _parse_codex_transcript(_rollout(lines))
+    assert len(turns) == 2, f"应按真 user 消息切 2 条，实际 {len(turns)}"
+    assert "开场" in turns[0]["content"] and "后续" in turns[0]["content"], "注入上下文不得切分"
+    assert turns[1]["content"] == "答复"
 
 
 def test_codex_reasoning_texts_in_order():

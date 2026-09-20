@@ -876,7 +876,7 @@ class AgentRuntime:
                                 for _t in _rtexts:
                                     yield ("thinking", _t)
                     # app-server 的 MCP 调用条目名为 mcpToolCall（驼峰），见 _is_mcp_tool_item。
-                    # 受控工具（end_discussion / request_human_input）统一经 _guarded_mcp_tool 判定，
+                    # 受控工具（end_discussion / ask_human_input）统一经 _guarded_mcp_tool 判定，
                     # 其余 MCP 调用既不产文本、也不重复产 tool_use。
                     elif _is_mcp_tool_item(it):
                         _g = _guarded_mcp_tool(it)
@@ -1064,7 +1064,7 @@ class AgentRuntime:
                     o = json.loads(line)
                 except Exception:
                     continue
-                # 动态工具调用（含 end_discussion / request_human_input 经 client 路由的罕见情况）：
+                # 动态工具调用（含 end_discussion / ask_human_input 经 client 路由的罕见情况）：
                 # 捕获为 _tool_use 供编排层识别（pause / 投票），并**立即回 result 让 codex 本轮
                 # 结束（不阻塞）**——HITL 工具带中断语义（_hitl_tool_result），告知 codex「本轮
                 # 已中止、等用户下次回复」。正规 MCP 调用走 mcpToolCall（item/completed），其 result
@@ -1083,7 +1083,7 @@ class AgentRuntime:
                                       "result": _hitl_tool_result(base)})
                         continue
                 # 原生 HITL 通道 item/tool/requestUserInput：codex 内建 ask-user（Default 模式被门禁
-                # 时也可能发）——**兜底转 request_human_input 语义**：立即回空 result 让 codex 本轮
+                # 时也可能发）——**兜底转 HITL 工具语义**（ask_human_input）：立即回空 result 让 codex 本轮
                 # 结束（不卡），同时转交编排层走 human_input_required 真暂停；用户回答经 1:1 续接
                 # 作为下一次 prompt 续发 codex（而非回 result 解锁，否则 codex 会阻塞等人）。
                 if o.get("method") == "item/tool/requestUserInput":
@@ -1189,7 +1189,7 @@ class AgentRuntime:
             return True
         if method == "item/tool/call":
             # 未注册的动态工具：返回空成功，避免阻塞。受控工具（end_discussion /
-            # request_human_input）已在读循环捕获并回 _hitl_tool_result，不会落到这里。
+            # ask_human_input）已在读循环捕获并回 _hitl_tool_result，不会落到这里。
             self._as_send({"jsonrpc": "2.0", "id": rid,
                            "result": {"contentItems": [], "success": True}})
             return True
@@ -1206,7 +1206,7 @@ class AgentRuntime:
         except Exception:
             pass
 
-    # 注：request_human_input 的回包逻辑已迁移——受控工具（含 request_human_input /
+    # 注：HITL 工具（ask_human_input，原名 request_human_input）的回包逻辑已迁移——受控工具（含它 /
     # end_discussion）的 result 由读循环经 _hitl_tool_result 立即回（codex 那轮结束、不阻塞），
     # 原生 requestUserInput 通道同样立即回空 result 不卡 codex；人工回答经 1:1 续接续发，
     # 不再由 _as_respond_human_input 回 result 解锁（那会让 codex 卡死等人）。
@@ -1643,8 +1643,8 @@ def _parse_codex_line(text: str, runtime: "AgentRuntime | None"):
     item = ev.get("item")
     if _is_mcp_tool_item(item):
         if ev.get("type") == "item.completed":
-            # 受控工具（end_discussion / request_human_input）经同一谓词判定，
-            # 入参整体透传（end_discussion 取 reason、request_human_input 取 question/options）。
+            # 受控工具（end_discussion / ask_human_input）经同一谓词判定，
+            # 入参整体透传（end_discussion 取 reason、ask_human_input 取 question/options）。
             g = _guarded_mcp_tool(item)
             if g:
                 return [("tool_use", {
@@ -2089,41 +2089,45 @@ def _is_mcp_tool_item(item) -> bool:
 
 # 本 app 的「受控」MCP 工具（由 terminate_signal_mcp 提供）：两个都必须上报编排层——
 #   end_discussion      → 终止状态机收敛（两阶段共识）
-#   request_human_input → HITL 暂停整场等人
+#   ask_human_input     → HITL 暂停整场等人（原名 request_human_input）
 # 历史 bug（2026-09-19）：两条 codex 通路的上报判定都只写 "end_discussion" in tool，
-# request_human_input 掉进 else 分支被 _codex_native_tool_use 判 None 吞掉 ⇒ 即使 codex
+# HITL 工具掉进 else 分支被 _codex_native_tool_use 判 None 吞掉 ⇒ 即使 codex
 # 真的调了，编排层也收不到、不会暂停（界面上只看到它在正文里空问）。两处判定集中在此共用，
 # 与 _is_mcp_tool_item 同理，避免再次分叉。
-_GUARDED_MCP_TOOLS = ("end_discussion", "request_human_input")
+_GUARDED_MCP_TOOLS = ("end_discussion", "ask_human_input")
+# HITL 工具的**旧名**（2026-09-20 由 request_human_input 改名，见 terminate_signal_mcp.TOOL2_NAME）。
+# 历史 transcript / 已落盘消息里存的是旧名，逐字比对与回放仍要认它 —— 一律归一到新名。
+_GUARDED_MCP_TOOL_ALIASES = {"request_human_input": "ask_human_input"}
 
 
 def _guarded_mcp_tool(item) -> str | None:
-    """MCP 条目命中的受控工具**干净名**（end_discussion / request_human_input），否则 None。
+    """MCP 条目命中的受控工具**干净名**（end_discussion / ask_human_input），否则 None。
 
     codex 上报的工具名可能是干净名，也可能带 MCP 前缀（mcp__terminate-signal__xxx），故用
     endswith 归一；产出干净名是编排层 _is_end_discussion / _is_human_input 的约定输入。
+    旧名 request_human_input 一并认下并归一到 ask_human_input（见 _GUARDED_MCP_TOOL_ALIASES）。
     """
     if not _is_mcp_tool_item(item):
         return None
     name = str(item.get("tool") or "")
-    for g in _GUARDED_MCP_TOOLS:
+    for g in tuple(_GUARDED_MCP_TOOLS) + tuple(_GUARDED_MCP_TOOL_ALIASES):
         if name == g or name.endswith("__" + g):
-            return g
+            return _GUARDED_MCP_TOOL_ALIASES.get(g, g)
     return None
 
 
 def _hitl_tool_result(base: str) -> dict:
     """受控 MCP 工具调用后回给 codex 的 tool_result（item/tool/call 动态路由的罕见路径）。
 
-    - request_human_input：带**中断语义**，明确告诉 codex「本轮已中止、等待用户下次回复」，
-      与 terminate_signal_mcp.py 的 request_human_input handler 回执保持一致（该 handler 负责
-      mcpToolCall 常规路径）。codex 收到后本轮结束、不阻塞；用户回答经 1:1 续接作为下一次
-      输入续跑。
+    - ask_human_input（旧名 request_human_input）：带**中断语义**，明确告诉 codex
+      「本轮已中止、等待用户下次回复」，与 terminate_signal_mcp.py 的同名 handler 回执保持一致
+      （该 handler 负责 mcpToolCall 常规路径）。codex 收到后本轮结束、不阻塞；用户回答经 1:1
+      续接作为下一次输入续跑。
     - 其余（end_discussion 等）：正常成功确认。
     """
-    if base == "request_human_input":
+    if base in ("ask_human_input", "request_human_input"):   # 后者=旧名，见 _GUARDED_MCP_TOOL_ALIASES
         return {"contentItems": [{"type": "text", "text": (
-            "【工具回执】你的 request_human_input 调用已收到。"
+            "【工具回执】你的 ask_human_input 调用已收到。"
             "系统将暂停并等待人工介入；人工回答将作为后续用户输入，你无需自行猜测答案。")}],
             "success": True}
     return {"contentItems": [], "success": True}
@@ -2270,13 +2274,45 @@ def _codex_native_tool_result(item) -> dict | None:
     return {"is_error": is_err, "content": text}
 
 
+def _codex_is_injected_user(pl: dict) -> bool:
+    """该 `message`(role=user) 是否为 codex 自己注入的上下文（即**不是** app 的一次发言）。
+
+    实测（0.146.1，本机全部 rollout 逐条核对）rollout 里的 user 消息有三类，只有第三类是真发言：
+    - `<environment_context>` / `# AGENTS.md instructions` / `<user_instructions>`：会话启动时
+      codex 注入的环境与指令上下文（每个 rollout 固定 +1~5 条）；
+    - `<codex_internal_context source="goal">`：codex 的**线程 goal 自驱续跑**（objective 由它自己
+      从首轮任务里提取，`~/.codex/goals_1.sqlite` 持存），一次发言内部可连续出现多次；
+    - 其余 = app 通过 WS 递进去的提示词（同时会有一条 `event_msg/user_message` 与之成对）。
+    """
+    # 注意：user 消息的块类型实测是 `input_text`（assistant 才是 output_text），而
+    # `_codex_content_text` 只认 text/output_text ⇒ 直接复用它取到空串、判定恒为 False
+    # （本过滤会变成死代码）。故这里按「任意块只要有 text 字符串」宽松取文本。
+    content = pl.get("content")
+    if isinstance(content, list):
+        text = "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and isinstance(b.get("text"), str))
+    else:
+        text = content if isinstance(content, str) else ""
+    text = text.lstrip()
+    return text.startswith("<") or text.startswith("# AGENTS.md")
+
+
 def _parse_codex_transcript(path: str) -> list:
     """解析 codex rollout 为一个 agent 的回合序列（供对账覆盖本地历史）。
 
     把 codex 的原生 item 映射成**与 claude 同一套块类型**、复用 `_normalize_claude_blocks`
     产出时间线 blocks，前后端不需要第二套 schema。
+
+    **回合边界 = app 的一次发言**（`event_msg/user_message`，= 一次 `_run_turn`）——这是本函数
+    的关键契约：调用方 `reconcile_agent_messages` 按「CLI 回合数 vs 本地消息数」对齐，边界取错
+    就会凭空多出气泡。旧实现见 role=user 就切回合，把 codex 一次发言内部的 goal 自驱轮拆成多条
+    `cli_turn`，实测 s_a3d8022f 真实 2 次发言被拆成 7 条 → reconcile 追加 6 条幻影气泡
+    （09-19 00:25 备份 8 条 codex 消息，会话刚结束时是 2 条）。
+
     codex 0.146.1 实测 payload 形态：
-    - `message`（role=user）→ 一次新回合的起点（收口上一回合）
+    - `event_msg/user_message` → **一次 app 发言的起点**（权威边界，与 prompt 日志一一对应）
+    - `message`(role=user) → 注入上下文（见 `_codex_is_injected_user`），不作边界；
+      仅当整个 rollout 都没有 `user_message` 事件（旧版本）才退回按它切分
     - `reasoning` → **思考**（明文在 content[].reasoning_text 或 summary[].summary_text，
       见 `_codex_reasoning_item_texts`）
     - `message`（role=assistant）→ content[].type=output_text：**正文**
@@ -2308,10 +2344,22 @@ def _parse_codex_transcript(path: str) -> list:
             pending = {"think": [], "ans": [], "tc": [], "seq": [], "seen": set(), "ts": ts,
                        "trs": [], "calls": {}}
 
-    for pl, raw in _codex_iter_payloads(path):
+    items = list(_codex_iter_payloads(path))
+    # 该 rollout 是否带 app 发言事件（0.146.1 有）。有则只认它作边界，user 消息一律视为注入上下文
+    # —— 免得把 goal 自驱轮当成新发言（见函数 docstring）。
+    has_prompt_events = any(pl.get("type") == "user_message" for pl, _ in items)
+    for pl, raw in items:
         pt = pl.get("type")
         ts = raw.get("timestamp")
+        if pt == "user_message":                      # app 一次发言的起点（权威边界）
+            flush()
+            _open(ts)
+            continue
         if pt == "message" and pl.get("role") == "user":
+            # 注入上下文（环境/AGENTS.md/goal 自驱）不是发言边界；无 user_message 事件的旧版本
+            # 才退回按 user 消息切分。
+            if has_prompt_events or _codex_is_injected_user(pl):
+                continue
             flush()
             _open(ts)
             continue

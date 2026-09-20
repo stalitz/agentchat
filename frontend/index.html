@@ -610,7 +610,7 @@ function handleEvent(ev) {
       break;
     case 'human': addRow('human', ev.role || '人工介入', ev.text); break;
     case 'human_input_required':
-      // agent 调 request_human_input → 编排层暂停整场等人。只处理当前会话：
+      // agent 调 ask_human_input（原名 request_human_input）→ 编排层暂停整场等人。只处理当前会话：
       // 上方 guard 已把非当前会话事件（含本类）丢弃，避免串场污染。
       showHitlPanel(ev);
       break;

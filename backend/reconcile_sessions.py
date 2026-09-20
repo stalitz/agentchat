@@ -41,7 +41,8 @@ def main(argv: list[str]) -> int:
             if not cli_turns:
                 print(f"  {s['id']} {agent_name}: 无 transcript，跳过")
                 continue
-            res = store.reconcile_agent_messages(project_path, s["id"], agent_name, cli_turns)
+            is_codex = bool(executor._codex_transcript_path(cli_id))
+            res = store.reconcile_agent_messages(project_path, s["id"], agent_name, cli_turns, is_codex=is_codex)
             print(f"  {s['id']} {agent_name}: changed={res['changed']} appended={res['appended']}")
             total["changed"] += res["changed"]
             total["appended"] += res["appended"]

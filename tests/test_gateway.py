@@ -980,7 +980,7 @@ class TestThinkExplicitPassthrough(unittest.IsolatedAsyncioTestCase):
 
 
 class TestControlledToolForward(unittest.TestCase):
-    """HITL + 终止：网关只把受控工具（end_discussion / request_human_input）透传给模型。
+    """HITL + 终止：网关只把受控工具（end_discussion / ask_human_input）透传给模型。
 
     锁定：其它 MCP 工具（如真实 bash）不得泄漏给本地模型；两个受控工具都转发且名被剥前缀；
     _restore_mcp_name 对干净名 / anthrothic: 变体都能还原成 MCP 原名。
@@ -995,12 +995,12 @@ class TestControlledToolForward(unittest.TestCase):
     def test_only_controlled_tools_forwarded(self):
         out = self._oa_tools([
             "mcp__terminate-signal__end_discussion",
-            "mcp__terminate-signal__request_human_input",
+            "mcp__terminate-signal__ask_human_input",
             "mcp__some-server__bash",
         ])
         kept = [t["function"]["name"] for t in out]
         self.assertIn("end_discussion", kept)
-        self.assertIn("request_human_input", kept)
+        self.assertIn("ask_human_input", kept)
         self.assertNotIn("bash", kept)
         self.assertEqual(len(out), 2, "只应转发 2 个受控工具，实际 " + str(kept))
 
@@ -1012,12 +1012,24 @@ class TestControlledToolForward(unittest.TestCase):
     def test_restore_mcp_name_both(self):
         self.assertEqual(gateway._restore_mcp_name("end_discussion"),
                          "mcp__terminate-signal__end_discussion")
-        self.assertEqual(gateway._restore_mcp_name("request_human_input"),
-                         "mcp__terminate-signal__request_human_input")
-        self.assertEqual(gateway._restore_mcp_name("anthropic:request_human_input"),
-                         "mcp__terminate-signal__request_human_input")
+        self.assertEqual(gateway._restore_mcp_name("ask_human_input"),
+                         "mcp__terminate-signal__ask_human_input")
+        self.assertEqual(gateway._restore_mcp_name("anthropic:ask_human_input"),
+                         "mcp__terminate-signal__ask_human_input")
         # 非受控工具名原样返回
         self.assertEqual(gateway._restore_mcp_name("bash"), "bash")
+
+    def test_restore_mcp_name_legacy_maps_to_new(self):
+        """旧名 request_human_input 必须归一到 ask_human_input —— MCP server 已只注册新名，
+        还原成旧名会让 claude 报「No such tool available」（历史提示词残留时踩到）。"""
+        for n in ("request_human_input", "anthropic:request_human_input"):
+            self.assertEqual(gateway._restore_mcp_name(n),
+                             "mcp__terminate-signal__ask_human_input")
+
+    def test_legacy_controlled_tool_still_forwarded(self):
+        # 旧名受控工具仍要透传（本地模型可能沿用旧名），且还原时会被归一到新名
+        out = self._oa_tools(["mcp__terminate-signal__request_human_input"])
+        self.assertEqual([t["function"]["name"] for t in out], ["request_human_input"])
 
     def test_claude_builtin_tools_forwarded(self):
         # claude 内置工具（无 mcp__ 前缀）应原样转发给本地模型，让其能调；
