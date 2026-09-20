@@ -267,6 +267,35 @@ class TestStore(unittest.TestCase):
         self.assertEqual(a_msgs[1]["content"], "agent真实答案A1")
         self.assertEqual(a_msgs[2]["content"], "agent真实答案A2")
 
+    def test_reconcile_codex_never_appends_when_cli_more(self):
+        # codex 专属兜底（is_codex=True）：cli 回合数 > 本地条数时**禁止 append**。
+        # 成因：codex rollout 的 role=user 含注入上下文（<environment_context> / AGENTS.md /
+        # <codex_internal_context source="goal">）与 goal 自驱轮，旧解析会多切回合；
+        # 一旦走 append 分支就凭空长出「幻影气泡」（实测 s_a3d8022f：2 次发言被追加成 8 条）。
+        # 实时落盘已较完整，牺牲 codex 的崩写恢复换「不污染历史」。
+        p = TMP / "rec_codex"
+        s = store.create_session(str(p), "codex 不追加")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "codex", "role": "甲", "content": "本地已有回答"})
+        cli_turns = [{"content": f"多切出来的第{i}条", "thinking": ""} for i in range(3)]
+        res = store.reconcile_agent_messages(str(p), s["id"], "codex", cli_turns, is_codex=True)
+        msgs = [m for m in store.read_session(str(p), s["id"])["messages"] if m["speaker"] == "codex"]
+        self.assertEqual(res["appended"], 0, "codex 数量不一致时不得追加（防幻影气泡）")
+        self.assertEqual(len(msgs), 1, "本地条数保持不变")
+        self.assertEqual(msgs[0]["content"], "本地已有回答")
+
+    def test_reconcile_non_codex_still_appends_when_cli_more(self):
+        # 反面回归：claude 等非 codex 仍保留 append（崩写/掉轮恢复依赖它），
+        # 否则「CLI 有、本地没有」的真实发言永远补不回来。
+        p = TMP / "rec_noncodex"
+        s = store.create_session(str(p), "claude 仍追加")
+        store.append_message(str(p), s["id"], {"round": 0, "speaker": "claude", "role": "甲", "content": "本地已有回答"})
+        cli_turns = [{"content": f"真实回答{i}", "thinking": ""} for i in range(3)]
+        res = store.reconcile_agent_messages(str(p), s["id"], "claude", cli_turns, is_codex=False)
+        msgs = [m for m in store.read_session(str(p), s["id"])["messages"] if m["speaker"] == "claude"]
+        self.assertEqual(res["appended"], 3, "非 codex 保留追加（崩写恢复）")
+        self.assertEqual([m["content"] for m in msgs][0], "本地已有回答", "内容不匹配时本地条保留")
+        self.assertEqual(len(msgs), 4)
+
     def test_reconcile_skips_claude_error_turns(self):
         # claude 外壳的错误文本回合（API Error / No response requested.）不是有效发言：
         # reconcile 对账时必须剔除，不得匹配/追加回本地当发言（s_54d1232e 曾因此被带回）
