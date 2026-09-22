@@ -754,8 +754,9 @@ function appendToolPlan(content, atype) {
 function addRow(cls, who, text, ts) {
   var row = document.createElement('div'); row.className = 'row' + (cls === 'human' ? ' human' : '');
   var b = document.createElement('div'); b.className = 'bubble ' + cls;
-  // 系统消息 / 人工介入支持 markdown；错误等纯文本保持转义
-  var rich = (cls === 'sys' || cls === 'human') ? mdToHtml(text) : esc(text);
+  // 系统消息支持 markdown；人类发言保持转义并保留换行（.bubble 已 white-space:pre-wrap），
+  // 走 mdToHtml 会把单换行折叠成空格（markdown 软换行语义），不符合聊天所见即所得预期。
+  var rich = (cls === 'sys') ? mdToHtml(text) : esc(text);
   b.innerHTML = '<div class="who">' + esc(who) + (ts ? '<span class="ts">' + esc(ts) + '</span>' : '') + '</div>' + rich;
   // 人类消息 = 用户主动动作 ⇒ 强制回到底部；系统提示/历史渲染走「贴底才跟随」
   row.appendChild(b); chat.appendChild(row); scrollChatBottom(cls === 'human');
@@ -1452,7 +1453,7 @@ function editTitle(s, titleEl) {
     } else { renderSessions(); }
   }
   input.onkeydown = function (ev) {
-    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    if (ev.key === 'Enter' && !ev.isComposing && ev.keyCode !== 229) { ev.preventDefault(); commit(); }
     else if (ev.key === 'Escape') { ev.preventDefault(); finished = true; renderSessions(); }
   };
   input.onblur = function () { commit(); };
@@ -2117,6 +2118,8 @@ function openSettings() {
   // 显示「当前生效」文本：配置有就用配置，否则显示内置默认（可改、可恢复默认）
   var consVal = ptCfg.consensus != null ? ptCfg.consensus : (ptDef.consensus || '');
   var extraVal = ptCfg.extra_rules != null ? ptCfg.extra_rules : (ptDef.extra_rules || '');
+  var flwDebVal = ptCfg.hitl_followup_debate != null ? ptCfg.hitl_followup_debate : (ptDef.hitl_followup_debate || '');
+  var flwChatVal = ptCfg.hitl_followup_chat != null ? ptCfg.hitl_followup_chat : (ptDef.hitl_followup_chat || '');
   function field(id, label, def, help, type, wide) {
     type = type || 'text';
     def = def == null ? '' : String(def);
@@ -2175,6 +2178,23 @@ function openSettings() {
       '<textarea id="gExtraRules" class="set-input" rows="3" style="resize:vertical; font-family:monospace; font-size:12px; width:100%; box-sizing:border-box;" placeholder="场景专属规则（如盲棋/游戏），留空则无">' + esc(extraVal) + '</textarea>' +
       '<div class="set-help">每轮注入所有 agent 的附加规则；留空＝无</div>' +
     '</div>' +
+    '<div class="set-section">HITL 回复提示词（用户回答后）</div>' +
+    '<div class="set-field wide" style="padding:0 22px;">' +
+      '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
+        '<label class="set-label" for="gHitlFollowDebate">回复后追问提示词（辩论）</label>' +
+        '<button type="button" class="ghost" style="font-size:12px; padding:2px 10px;" onclick="setTemplateDefault(\'gHitlFollowDebate\')">恢复默认</button>' +
+      '</div>' +
+      '<textarea id="gHitlFollowDebate" class="set-input" rows="4" style="resize:vertical; font-family:monospace; font-size:12px; width:100%; box-sizing:border-box;">' + esc(flwDebVal) + '</textarea>' +
+      '<div class="set-help">用户回答注入后的回复轮提示词（辩论模式）；留空＝内置默认</div>' +
+    '</div>' +
+    '<div class="set-field wide" style="padding:0 22px;">' +
+      '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
+        '<label class="set-label" for="gHitlFollowChat">回复后追问提示词（单聊）</label>' +
+        '<button type="button" class="ghost" style="font-size:12px; padding:2px 10px;" onclick="setTemplateDefault(\'gHitlFollowChat\')">恢复默认</button>' +
+      '</div>' +
+      '<textarea id="gHitlFollowChat" class="set-input" rows="4" style="resize:vertical; font-family:monospace; font-size:12px; width:100%; box-sizing:border-box;">' + esc(flwChatVal) + '</textarea>' +
+      '<div class="set-help">用户回答注入后的回复轮提示词（单聊模式）；留空＝内置默认</div>' +
+    '</div>' +
     '</div>' +
     '<div class="set-foot">' +
       '<button class="set-cancel" onclick="closeModal()">取消</button>' +
@@ -2196,9 +2216,11 @@ function openSettings() {
 // 恢复提示词模板默认：把 textarea 重置为内置默认文本（保存时与默认一致会自动视为未配置）
 function setTemplateDefault(id) {
   var defs = (cfg.settings && cfg.settings.prompt_template_defaults && cfg.settings.prompt_template_defaults.debate) || {};
-  var key = id === 'gConsensus' ? 'consensus' : 'extra_rules';
+  var keys = { gConsensus: 'consensus', gExtraRules: 'extra_rules',
+               gHitlFollowDebate: 'hitl_followup_debate', gHitlFollowChat: 'hitl_followup_chat' };
+  var key = keys[id];
   var el = document.getElementById(id);
-  if (el) el.value = (defs[key] != null ? defs[key] : '');
+  if (el && key) el.value = (defs[key] != null ? defs[key] : '');
 }
 function submitSettings() {
   var body = {
@@ -2220,6 +2242,10 @@ function submitSettings() {
       if (cons && cons !== (defs.consensus || '')) ptNew.debate.consensus = cons; else delete ptNew.debate.consensus;
       var extra = v('gExtraRules').trim();
       if (extra && extra !== (defs.extra_rules || '')) ptNew.debate.extra_rules = extra; else delete ptNew.debate.extra_rules;
+      var flwDeb = v('gHitlFollowDebate').trim();
+      if (flwDeb && flwDeb !== (defs.hitl_followup_debate || '')) ptNew.debate.hitl_followup_debate = flwDeb; else delete ptNew.debate.hitl_followup_debate;
+      var flwChat = v('gHitlFollowChat').trim();
+      if (flwChat && flwChat !== (defs.hitl_followup_chat || '')) ptNew.debate.hitl_followup_chat = flwChat; else delete ptNew.debate.hitl_followup_chat;
       return ptNew;
     })(),
   };
@@ -2248,17 +2274,17 @@ document.addEventListener('keydown', function (e) {
 });
 // 对话模式：Enter 发送、Shift+Enter 换行（辩论模式的任务框保持多行，不抢 Enter）
 document.getElementById('task').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey && isChatMode()) { e.preventDefault(); startSession(); }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && isChatMode()) { e.preventDefault(); startSession(); }
 });
 // 输入变化即刷新主按钮可用态（辩论模式：空议题时「开始/继续讨论」禁用）
 document.getElementById('task').addEventListener('input', refreshSendBtn);
 // 介入框：Enter 直接介入；Shift+Enter 换行
 document.getElementById('inject').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doInject(); }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); doInject(); }
 });
 // HITL 回答框：Enter 直接提交；Shift+Enter 换行
 document.getElementById('hitlAnswer').addEventListener('keydown', function (e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitHumanInput(); }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); submitHumanInput(); }
 });
 
 function closeFs() { document.getElementById('fsModal').classList.remove('show'); }

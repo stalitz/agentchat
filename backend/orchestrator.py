@@ -69,22 +69,11 @@ def _codex_answers_from_questions(questions, answer_text):
 
 
 
-# 「议题明显要用户拍板」的措辞：命中且本场尚未问过用户时，首个发言者必须先问后答（hitl_opening）。
-# 背景（2026-09-19 实测）：议题写成「请给多套方案让我选」时，两个 gemma 都理解成「把方案摆出来
-# 即可」，各自假设条件直接开讲，用户要的「按我的情况选一套」反而没发生。命中词表刻意放宽：
-# 漏判的代价（又一场自说自话）远大于误判的代价（多问一个问题）。
-_HITL_TASK_HINTS = (
-    "多套", "多种方案", "几个方案", "两套", "三套", "备选", "方案让我", "让我选", "帮我选",
-    "让我看看", "给我方案", "哪个更好", "哪个更合适", "选一个", "挑一个", "你建议", "推荐哪个",
-    "适合我", "我该选",
-    "options", "alternatives", "choose", "pick one", "which one", "which do",
-)
-
-
-def _task_needs_human_choice(text) -> bool:
-    """议题是否明显要用户做选择（据此决定是否注入「先问后答」强指令）。"""
-    t = (text or "").lower()
-    return any(h in t for h in _HITL_TASK_HINTS)
+# 2026-09-21：「议题明显要用户拍板」的词表机制（_HITL_TASK_HINTS + _task_needs_human_choice）
+# 已按用户口径**删除**——原先命中词表就强制首个发言者「先问后答」（hitl_opening 槽）。
+# 词表猜不出「任务条件是否已给全」：用户条件完整（如「预算 1.5 万以内」）时，反而被迫先问
+# 一个无意义的问题、白耗一轮。现在「是否要问用户」完全交给 agent 判断，软提示常驻在每个
+# agent 每轮提示词里（见 prompt_defaults 的 hitl_chat / hitl_debate：「先问后答（按需）」）。
 
 
 # 「中止 → 继续」时发给被中止 agent 的提示：那半截内容已作废，必须显式告知别再往下接，
@@ -228,8 +217,6 @@ class Session:
         # 由它根据回答决定是再问一次、还是给出结论。来回次数不限，但每次提问都是独立发言。
         self._human_input_request = None
         self._human_input_answer = None    # str：用户对当前问题的回答
-        # 本场是否已向用户提过问：用于抑制「先问后答」强指令重复注入（问过一次即不再要求）。
-        self._hitl_asked = False
         # 本场议题（debate 由 _debate 写入 / resume 时从历史回填；chat 不用）。
         # 在此先初始化为空：_build_prompt 在 _debate 之外（单测、chat 首轮）也会读它。
         self._initial_task = ""
@@ -346,7 +333,6 @@ class Session:
         没有队列（用户口径 2026-09-20）：一次发言只可能产生一个问题，问完即清空；
         用户答完后由调用方让同一 agent **再跑一轮新发言**，它自行决定再问还是收尾。
         """
-        self._hitl_asked = True   # 已问过：后续轮次不再注入「先问后答」强指令
         if not self._human_input_request:
             return ""
         req = self._human_input_request or {}
@@ -454,9 +440,6 @@ class Session:
             parts.append("请以对话方式直接回复。这是人机对话，不要调用 end_discussion 工具或输出其调用文本（辩论模式专用）。")
             # 人工介入（HITL）：硬触发条件 + 禁止正文反问 + 仅无工具时的 json 兜底写法。
             parts.append(self._render_slot("hitl_chat"))
-            # 本轮诉求要用户拍板、且本场还没问过 → 先问后答（否则只能替用户假设条件）。
-            if not self._hitl_asked and _task_needs_human_choice(inject):
-                parts.append(self._render_slot("hitl_opening", task=(inject or "")[:120]))
             return "\n\n".join(parts)
 
         # 多 agent 辩论（FR5.3b 子项2）：回传「本方上次发言之后的全部他人发言」（按发生顺序），
@@ -562,9 +545,6 @@ class Session:
         # 反问对方 agent——辩论中对方会替你回答，导致结果偏离用户意图（2026-09-19 实测：agent
         # 连续三轮在正文里「等用户回复」，实际是它在自说自话）。措辞见 prompt_defaults.hitl_debate。
         parts.append(self._render_slot("hitl_debate"))
-        # 议题要用户拍板、且本场还没问过 → 首个发言者（round_i == 0）先问后答。
-        if not self._hitl_asked and round_i == 0 and _task_needs_human_choice(self._initial_task):
-            parts.append(self._render_slot("hitl_opening", task=(self._initial_task or "")[:120]))
         return "\n\n".join(parts)
 
     def _build_hitl_reply_prompt(self, agent: AgentConfig, answer: str) -> str:

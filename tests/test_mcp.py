@@ -112,8 +112,8 @@ class TestHitlToolNaming(unittest.TestCase):
             resp = mcp._handle_call({"name": name, "arguments": {"question": "选哪个？"}})
             self.assertFalse(resp.get("isError"), f"{name} 应能调通")
             text = resp["content"][0]["text"]
-            self.assertIn("选哪个？", text)
-            self.assertIn("暂停并等待人工介入", text)
+            self.assertNotIn("选哪个？", text, "回执不应重复问题（只收提问、不回显）")
+            self.assertIn("本次发言到此结束", text)
         # 回执里点名的工具名统一用新名（不再向模型强化旧名）
         resp = mcp._handle_call({"name": "request_human_input", "arguments": {"question": "q"}})
         self.assertIn("ask_human_input", resp["content"][0]["text"])

@@ -2180,8 +2180,8 @@ def _hitl_tool_result(base: str) -> dict:
     """
     if base in ("ask_human_input", "request_human_input"):   # 后者=旧名，见 _GUARDED_MCP_TOOL_ALIASES
         return {"contentItems": [{"type": "text", "text": (
-            "【工具回执】你的 ask_human_input 调用已收到。"
-            "系统将暂停并等待人工介入；人工回答将作为后续用户输入，你无需自行猜测答案。")}],
+            "【工具回执】你的 ask_human_input 调用已收到，本次发言到此结束，请交还控制权。"
+            "用户回答会作为后续输入给你，无需自行猜测或重复提问。")}],
             "success": True}
     return {"contentItems": [], "success": True}
 

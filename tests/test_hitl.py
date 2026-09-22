@@ -12,8 +12,10 @@
     旧措辞「当你需要用户从多个方案中选择时」被 gemma 一律理解成「把方案摆出来即可」，
     于是直接在正文里反问；而辩论里正文反问会被**对方 agent** 接过去回答，用户根本看不到
     （实测：agent 连续三轮「等用户回复」，实际是自说自话）。
-    修法：硬触发条件 + 明令禁止正文反问 + 议题要用户拍板时先问后答
-    （prompt_defaults 新增 hitl_chat / hitl_debate / hitl_opening 三槽位）。
+    修法：判断条件 + 明令禁止正文反问 + 「先问后答（按需）」软提示**每轮常驻**
+    （prompt_defaults 的 hitl_chat / hitl_debate 两槽位）。
+    2026-09-21 修正：删去按议题词表强制的 hitl_opening「本场必须先问后答」——
+    「是否要问用户」交给 agent 判断，不因议题含「多套/帮我选」等字样就强制先问。
 
 运行：
   .venv/bin/python tests/run.py
@@ -29,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 
 from tests.base import models, orch, store  # noqa: E402
 from backend.executor import _guarded_mcp_tool, _parse_codex_line, AgentRuntime, _hitl_tool_result  # noqa: E402
-from backend.orchestrator import _task_needs_human_choice, _codex_answers_from_questions  # noqa: E402
+from backend.orchestrator import _codex_answers_from_questions  # noqa: E402
 
 
 class Recorder:
@@ -123,7 +125,12 @@ class TestCodexParseHumanInput(unittest.TestCase):
 
 
 class TestHitlPrompt(unittest.TestCase):
-    """提示词：硬触发条件 / 禁止正文反问 / 议题要拍板时先问后答。"""
+    """提示词：该问用户的判断条件 / 禁止正文反问 / 「先问后答」软提示**每轮常驻**。
+
+    2026-09-21 口径修正：不再有按议题词表强制的「本场必须先问后答」（hitl_opening 槽与
+    _HITL_TASK_HINTS 词表已删）。「是否要问用户」交给 agent 判断，软提示「先问后答（按需）」
+    写进 hitl_chat / hitl_debate，每轮、每议题都在。
+    """
 
     def setUp(self):
         self.proj = "/tmp/agentchat_test_hitl_" + str(id(self))
@@ -133,27 +140,23 @@ class TestHitlPrompt(unittest.TestCase):
         s = orch.Session(self.proj, self.sid, agents, max_rounds, Recorder(), timeout=300)
         return s
 
-    def test_task_hint_detection(self):
-        self.assertTrue(_task_needs_human_choice("请给多套方案让我选"))
-        self.assertTrue(_task_needs_human_choice("帮我选一个更合适的"))
-        self.assertTrue(_task_needs_human_choice("Give me a few options to choose from"))
-        self.assertFalse(_task_needs_human_choice("请介绍一下跳高训练的基本原理"))
-        self.assertFalse(_task_needs_human_choice(""))
-
-    def test_chat_prompt_has_hard_rule(self):
+    def test_chat_prompt_has_soft_hint(self):
         a = models.AgentConfig(name="A", type="claude-code")
         s = self._session([a])
         p = s._build_prompt(a, "给我几套方案让我选", round_i=0)
         self.assertIn("ask_human_input", p, "chat 提示词必须点出工具名")
         self.assertIn("禁止用正文反问代替工具调用", p, "必须明令禁止正文反问")
-        self.assertIn("先问后答", p, "诉求要拍板时应注入「先问后答」强指令")
+        self.assertIn("先问后答", p, "「先问后答（按需）」软提示应常驻")
+        self.assertIn("要不要问由你自己判断", p, "判断权归 agent，不得强制要问")
 
-    def test_chat_prompt_no_opening_when_task_is_plain(self):
+    def test_chat_prompt_soft_hint_even_when_task_is_plain(self):
+        # 软提示是每轮常驻的通用规则，与议题「像不像要拍板」无关（词表机制已删）
         a = models.AgentConfig(name="A", type="claude-code")
         s = self._session([a])
         p = s._build_prompt(a, "请介绍跳高训练原理", round_i=0)
         self.assertIn("ask_human_input", p, "通用规则每轮都在")
-        self.assertNotIn("先问后答", p, "普通议题不应强制先问")
+        self.assertIn("先问后答", p, "软提示每轮都在（不再挑议题）")
+        self.assertIn("信息已经足够", p, "须给出「够信息就直接推进」的反向引导")
 
     def test_debate_prompt_warns_peer_will_answer(self):
         a1 = models.AgentConfig(name="A", type="claude-code")
@@ -163,26 +166,23 @@ class TestHitlPrompt(unittest.TestCase):
         p = s._build_prompt(a1, "请给多套跳高训练方案让我选", round_i=0)
         self.assertIn("ask_human_input", p)
         self.assertIn("对方 agent", p, "必须说明正文反问会被对方 agent 接走")
-        self.assertIn("先问后答", p, "首个发言者（round_i=0）应先问后答")
+        self.assertIn("先问后答", p, "软提示在辩论首轮也在")
 
-    def test_debate_opening_only_for_first_speaker(self):
-        # 第二个发言者（round_i=1）不再重复要求先问，否则每人都问一遍
+    def test_debate_soft_hint_on_later_rounds(self):
+        # 每轮都带（不再只首轮）：第二个发言者 / 后续轮次同样有软提示
         a1 = models.AgentConfig(name="A", type="claude-code")
         a2 = models.AgentConfig(name="B", type="codex")
         s = self._session([a1, a2])
         s._initial_task = "请给多套方案让我选"
         p = s._build_prompt(a2, None, round_i=1)
         self.assertIn("ask_human_input", p)
-        self.assertNotIn("先问后答", p)
+        self.assertIn("先问后答", p, "后续轮次同样常驻软提示")
 
-    def test_no_opening_after_already_asked(self):
-        # 本场已问过用户 → 不再注入强指令（避免反复追问）
-        a = models.AgentConfig(name="A", type="claude-code")
-        s = self._session([a])
-        s._hitl_asked = True
-        p = s._build_prompt(a, "给我几套方案让我选", round_i=0)
-        self.assertIn("ask_human_input", p)
-        self.assertNotIn("先问后答", p)
+    def test_hitl_opening_slot_removed(self):
+        # hitl_opening 槽与词表强触发已删除：不再有任何「本场必须先问后答」的强制文案
+        from backend.prompt_defaults import PROMPT_TEMPLATES_DEBATE as D
+        self.assertNotIn("hitl_opening", D)
+        self.assertNotIn("必须先问后答", "\n".join(D.values()))
 
 
 class _FakeStdin:
@@ -247,8 +247,8 @@ class TestNativeCodexHumanInput(unittest.TestCase):
         # 受控工具回包：ask_human_input 必须带中断语义（告知 codex「本轮已中止、等下次」）。
         r = _hitl_tool_result("ask_human_input")
         self.assertTrue(r["success"])
-        self.assertIn("暂停并等待人工介入", r["contentItems"][0]["text"])
-        self.assertIn("后续用户输入", r["contentItems"][0]["text"])
+        self.assertIn("本次发言到此结束", r["contentItems"][0]["text"])
+        self.assertIn("后续输入", r["contentItems"][0]["text"])
         # 其余受控工具（end_discussion）正常成功、无中断语义
         self.assertEqual(_hitl_tool_result("end_discussion"), {"contentItems": [], "success": True})
 

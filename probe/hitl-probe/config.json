@@ -1,77 +1,80 @@
 {
- "projects": {
-  "pr_hitl": {
-   "id": "pr_hitl",
-   "name": "hitl-probe",
-   "path": "/Users/stalitz/www/agent-chat/probe/hitl-probe/work",
-   "team_ids": [
-    "tm_hitl",
-    "tm_hitl_c",
-    "tm_hitl_x"
-   ]
-  }
- },
- "teams": {
-  "tm_hitl": {
-   "id": "tm_hitl",
-   "name": "HITL 探针（双壳 · 本地 gemma）",
-   "agent_ids": [
-    "ag_hitl_codex",
-    "ag_hitl_claude"
-   ]
+  "projects": {
+    "pr_hitl": {
+      "id": "pr_hitl",
+      "name": "hitl-probe",
+      "path": "/Users/stalitz/www/agent-chat/probe/hitl-probe/work",
+      "team_ids": [
+        "tm_hitl",
+        "tm_hitl_c",
+        "tm_hitl_x"
+      ]
+    }
   },
-  "tm_hitl_c": {
-   "id": "tm_hitl_c",
-   "name": "HITL 单壳 · claude+gemma",
-   "agent_ids": [
-    "ag_hitl_claude"
-   ]
+  "teams": {
+    "tm_hitl": {
+      "id": "tm_hitl",
+      "name": "HITL 探针（双壳 · 本地 gemma）",
+      "agent_ids": [
+        "ag_hitl_codex",
+        "ag_hitl_claude"
+      ]
+    },
+    "tm_hitl_c": {
+      "id": "tm_hitl_c",
+      "name": "HITL 单壳 · claude+gemma",
+      "agent_ids": [
+        "ag_hitl_claude"
+      ]
+    },
+    "tm_hitl_x": {
+      "id": "tm_hitl_x",
+      "name": "HITL 单壳 · codex+gemma",
+      "agent_ids": [
+        "ag_hitl_codex"
+      ]
+    }
   },
-  "tm_hitl_x": {
-   "id": "tm_hitl_x",
-   "name": "HITL 单壳 · codex+gemma",
-   "agent_ids": [
-    "ag_hitl_codex"
-   ]
-  }
- },
- "agents": {
-  "ag_hitl_codex": {
-   "id": "ag_hitl_codex",
-   "name": "H-Probe Codex",
-   "type": "codex",
-   "role": "探针用 codex：直连本机 Ollama 跑 gemma（免费）。",
-   "model": "gemma4:26b",
-   "cli_args": "",
-   "fake_terminate_round": 0,
-   "base_url": "http://localhost:11434",
-   "api_key": null,
-   "think": false
+  "agents": {
+    "ag_hitl_codex": {
+      "id": "ag_hitl_codex",
+      "name": "H-Probe Codex",
+      "type": "codex",
+      "role": "探针用 codex：直连本机 Ollama 跑 gemma（免费）。",
+      "model": "gemma4:26b",
+      "cli_args": "",
+      "fake_terminate_round": 0,
+      "base_url": "http://localhost:11434",
+      "api_key": null,
+      "think": false
+    },
+    "ag_hitl_claude": {
+      "id": "ag_hitl_claude",
+      "name": "H-Probe Claude",
+      "type": "claude-code",
+      "role": "探针用 claude：经本 app 内置网关接本机 gemma。",
+      "model": "gemma4:26b",
+      "cli_args": "",
+      "fake_terminate_round": 0,
+      "base_url": "http://127.0.0.1:8790",
+      "api_key": null,
+      "think": false
+    }
   },
-  "ag_hitl_claude": {
-   "id": "ag_hitl_claude",
-   "name": "H-Probe Claude",
-   "type": "claude-code",
-   "role": "探针用 claude：经本 app 内置网关接本机 gemma。",
-   "model": "gemma4:26b",
-   "cli_args": "",
-   "fake_terminate_round": 0,
-   "base_url": "http://127.0.0.1:8790",
-   "api_key": null,
-   "think": false
+  "settings": {
+    "default_timeout": 300,
+    "default_max_rounds": 2,
+    "default_model": "deepseek-v4-flash",
+    "default_model_codex": "deepseek-v4-flash",
+    "ollama_base_url": "http://localhost:11434",
+    "ollama_num_ctx": 16384,
+    "think": true,
+    "claude_max_output_tokens": 64000,
+    "prompt_templates": {
+      "debate": {
+        "hitl_followup_debate": "【用户已回答你的提问】\n如果你还有需要用户拍板或澄清的问题，**继续调用 ask_human_input 工具**问即可（每次发言只调用一次，回答会作为后续输入给你），不要在正文里反问，也不要在同一次发言里重复调用。\n**禁止自造调用格式**：不要用 `<call:ask_human_input>`、`<tool_code>` 之类的 XML/伪标签书写调用——系统只认「真工具调用」与 ```json 代码块，自造格式一概不识别，等于没问、用户看不到你的问题。\n（**仅当**工具列表里确实没有该工具时，才用多行 json 兜底，禁止压缩成一行）：\n```json\n{\n  \"tool\": \"ask_human_input\",\n  \"question\": \"...\"\n}\n```\n如果已经没有别的问题了，请**把刚才这几轮问答归纳成一个完整、可直接执行的结论或方案**，并用它作为你本次的正式发言正文——**对方 agent 只能看到你的发言正文，看不到你和用户之间的问答过程**，所以结论必须落在正文里，不要只说「已确认用户需求」这类空话，也不要把问题原样抛给对方 agent。\n不要再输出「等你回复」之类的待命文字。",
+        "hitl_followup_chat": "【用户已回答你的提问】\n如果你还有需要用户拍板或澄清的问题，**继续调用 ask_human_input 工具**问即可（每次发言只调用一次），不要在正文里反问，也不要在同一次发言里重复调用。\n**禁止自造调用格式**：不要用 `<call:ask_human_input>`、`<tool_code>` 之类的 XML/伪标签书写调用——系统只认「真工具调用」与 ```json 代码块，自造格式一概不识别，等于没问、我看不到你的问题。\n（**仅当**工具列表里确实没有该工具时，才用多行 json 兜底，禁止压缩成一行）：\n```json\n{\n  \"tool\": \"ask_human_input\",\n  \"question\": \"...\"\n}\n```\n如果已经没有别的问题了，请**把这几轮问答归纳成一个完整结论并直接给出最终答复**，不要再追问，也不要输出「等你回复」之类的待命文字。"
+      }
+    }
   }
- },
- "settings": {
-  "default_timeout": 300,
-  "default_max_rounds": 2,
-  "default_model": "deepseek-v4-flash",
-  "default_model_codex": "deepseek-v4-flash",
-  "ollama_base_url": "http://localhost:11434",
-  "ollama_num_ctx": 16384,
-  "think": true,
-  "claude_max_output_tokens": 64000,
-  "prompt_templates": {
-   "debate": {}
-  }
- }
 }

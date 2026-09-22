@@ -772,6 +772,49 @@ setTimeout(async () => {
     check(live && live.classList.contains('unknown'),
       '实时流：turn_start 未带 atype 时气泡应为 unknown，实际 ' + (live && live.className));
 
+    // ---- IME 合成态守护：中文输入法按回车「上屏」时不得触发发送/介入/提交 ----
+    // 历史 bug：Enter 处理未判 isComposing，拼音未上屏就把半截文字发了。
+    const spy = { startSession: 0, doInject: 0, submitHumanInput: 0 };
+    dom.window.startSession = () => { spy.startSession++; };
+    dom.window.doInject = () => { spy.doInject++; };
+    dom.window.submitHumanInput = () => { spy.submitHumanInput++; };
+    doc.body.classList.add('chat-mode'); // 使 #task 的 Enter 发送分支生效
+    const fireKey = (el, o) => {
+      o = o || {};
+      const ev = new dom.window.KeyboardEvent('keydown', { key: o.key || 'Enter', shiftKey: !!o.shiftKey, bubbles: true, cancelable: true });
+      Object.defineProperty(ev, 'isComposing', { value: !!o.isComposing, configurable: true });
+      if (o.keyCode !== undefined) Object.defineProperty(ev, 'keyCode', { value: o.keyCode, configurable: true });
+      el.dispatchEvent(ev);
+      return ev;
+    };
+    const taskEl = doc.getElementById('task'), injectEl = doc.getElementById('inject'), hitlEl = doc.getElementById('hitlAnswer');
+    let ev1 = fireKey(taskEl, { isComposing: true });
+    check(spy.startSession === 0 && !ev1.defaultPrevented, '#task: IME 合成中按回车不应发送、不应 preventDefault');
+    fireKey(taskEl, { isComposing: false });
+    check(spy.startSession === 1, '#task: 合成结束后按回车应正常发送');
+    fireKey(taskEl, { isComposing: false, keyCode: 229 });
+    check(spy.startSession === 1, '#task: keyCode===229（旧内核 IME）也应拦截，不发送');
+    fireKey(injectEl, { isComposing: true });
+    check(spy.doInject === 0, '#inject: IME 合成中按回车不应介入');
+    fireKey(injectEl, { isComposing: false });
+    check(spy.doInject === 1, '#inject: 合成结束后应正常介入');
+    fireKey(hitlEl, { isComposing: true });
+    check(spy.submitHumanInput === 0, '#hitlAnswer: IME 合成中按回车不应提交');
+    fireKey(hitlEl, { isComposing: false });
+    check(spy.submitHumanInput === 1, '#hitlAnswer: 合成结束后应正常提交');
+
+    // ---- 人类发言必须保留换行（不再走 mdToHtml 把单换行折叠成空格）----
+    // 历史 bug：人类发言经 mdToHtml，'a\nb\nc' 被 join(' ') 压成一行，气泡里看不到换行。
+    chatEl2.innerHTML = '';
+    dom.window.addRow('human', '我', '第一行\n第二行\n第三行');
+    const hb = chatEl2.querySelector('.bubble.human');
+    check(hb && hb.textContent.indexOf('第一行\n第二行\n第三行') >= 0, '人类发言应保留换行（\\n 未被折叠成空格）');
+    check(hb && cs(hb).whiteSpace === 'pre-wrap', '人类气泡应 white-space:pre-wrap，换行才可见，实际 ' + (hb && cs(hb).whiteSpace));
+    chatEl2.innerHTML = '';
+    dom.window.addRow('sys', '系统', '**加粗** 文本');
+    const sb = chatEl2.querySelector('.bubble.sys');
+    check(sb && sb.innerHTML.indexOf('<strong>加粗</strong>') >= 0, '系统消息仍渲染 markdown（不因本次改动退化）');
+
     if (!ok) { console.error('前端渲染回归测试失败'); process.exit(1); }
     console.log('前端渲染回归测试通过 ✓');
     process.exit(0);
