@@ -228,3 +228,49 @@ v7 端到端（隔离实例 8790，会话 `s_9df8d0e4`，议题「20㎡ 朝北�
 - **与 ④ 的关系**：这条丢失**不是** `<tool_code>` 清洗问题（从未做清洗），是实时流到落盘的缺口；
   修完才能真实验证 FR20.1 规则 3 在 codex 侧是否成立。
 - 留痕：`probe/hitl-probe/evidence/hitl_v7_multiround_20260920.md`。
+
+## 13. 2026-09-22：撤回重发（回答提交后可撤回，原文不丢）
+
+### 13.1 问题（用户实测暴露）
+用户提交回答后，编排层**同一次循环迭代**立刻跑回复轮（`_run_turn(..., hitl_reply=True)`），
+毫秒级拉起 CLI。于是：
+
+- **没有"追加补充"的窗口**——曾设想"提交后还能补一句"，实测不成立：`_pause_for_human_input`
+  返回后同一迭代就起进程；唯一能打断在途轮的是 `_abort_requested`，代价是废掉一条**已付费**的
+  CLI turn 再重跑，收益不成比。
+- 普通「中止」救不了：它结束在途发言并写 `pending_turn`（等「继续」由该 agent 重说，
+  且**不再持有用户回答**），用户改好的文字无处可去。
+- 输入框已清空 + 文字找不回 ⇒ **几个字无所谓，几百字的回答要重打**。
+- 真实触发场景（2026-09-22 会话 `s_0480e439`）：中文输入法按回车本意「拼音上屏」，却触发了发送，
+  半截回答（`日志是服务器端挂载目录收集并灌入`）被送出；回答不仅没被追问，还被模型
+  **静默脑补**成 "file-based log collection" 写进方案（见 开发文档「撤回重发」小节）。
+
+### 13.2 设计
+`recall_human_input()`：作废在途回复轮 **+ 把同一提问带原回答重新抛回**——保留提问状态，
+用户改完重新提交即重跑该回复轮（`round_i` 不增、不留 `pending_turn`、不结束本场）。
+
+| 动作 | 在途轮 | 用户回答 | `pending_turn` | 后续 |
+|---|---|---|---|---|
+| 中止 `abort` | 作废（`interrupted`） | 被丢弃（不再持有） | **写**（等「继续」重说） | 本场收尾，点「继续」由该 agent 重说 |
+| 撤回 `recall_human_input` | 作废（`interrupted`） | 保留为 `draft`，标记 `voided` | **不写** | 提问重开、继续等新回答 |
+
+- **只在 HITL 回复轮可撤**（`_hitl_reply_inflight`）：回答一旦被采纳就撤不回来，
+  不能让撤回误伤下一位 agent 的正常发言；拒绝时提示改用「介入」框补充。
+- **旧回答保留可见**（`voided`，不删除）——与「已中止的 agent 发言」同口径：内容留档，
+  但要一眼看出不作数。
+- 前端**撤回与中止合一**（2026-09-23）：主按钮在生成中按「当前在途轮触发源」分流——命中用户文本
+  （task/inject/hitl）→ 标「撤回」并走撤回（回答走服务端 `recall_human_input`、回答框随重开提问用
+  `draft` 预填；任务/介入走中止 + 前端回填原文）；命中另一个 agent 的发言 → 标「中止」走普通
+  中止。原独立「↩ 撤回重发」按钮已删除，且撤回快照**按轮作废**（`turn_end` 清空），避免长 run 里
+  挂着开场那句 task 的撤回。
+
+### 13.3 测试点
+- `test_hitl.py::TestHitlRecall::test_recall_reopens_same_question_with_draft`：`_GatedRuntime`
+  把回复轮卡住模拟"正在生成"→ 撤回生效 → 同一提问带 `draft` 重开 → 改后的答案进新回复轮；
+  断言被撤回轮标 `interrupted`、旧回答标 `voided`、无 `pending_turn`。
+- `test_hitl.py::TestHitlRecall::test_recall_rejected_when_not_in_hitl_reply`：不在回复轮里
+  → 返回 `"no_hitl"` 且不置位中止标志。
+- `test_frontend_render.js`：生成中主按钮按触发源分流（用户文本→「撤回 */」、agent→「中止」）、
+  `mainAction`/`doRecall` 合一分发、`recall_human_input` 动作、`draft` 预填、任务撤回后主按钮为
+  「重新发送」、**第 1 轮 `turn_end` 后撤回快照作废（第 2 轮主按钮回到「中止」）**、`run_end`
+  清理规则、`pendingResendBySid` 重发占位保留、撤回被拒时状态退回。
