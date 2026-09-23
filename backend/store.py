@@ -373,6 +373,24 @@ def append_message(project_path: str, sid: str, entry: dict) -> None:
     _save_sessions(project_path, sessions)
 
 
+def mark_last_message_voided(project_path: str, sid: str) -> None:
+    """把会话内**最后一条**消息标记为已撤回（voided）。
+
+    「撤回重发」（HITL）用：人提交的回答已落盘，但用户当场撤回、改完会重新提交一条。
+    旧那条**不删**（保留可见、可追溯「中间输错过」），只打作废标记——与「已中止的
+    agent 发言」（interrupted）同口径：内容留档，但要一眼看出它不作数。
+    """
+    sessions = _load_sessions(project_path)
+    for s in sessions:
+        if s["id"] == sid:
+            msgs = s.get("messages") or []
+            if msgs:
+                msgs[-1]["voided"] = True
+                s["updated_at"] = _now()
+            break
+    _save_sessions(project_path, sessions)
+
+
 def get_agent_sessions(project_path: str, sid: str) -> dict:
     """返回该会话下各 agent 的持续 CLI 会话 id 映射：{agent_name: cli_session_id}。"""
     s = read_session(project_path, sid)

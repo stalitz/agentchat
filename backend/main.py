@@ -63,7 +63,8 @@ clients: set[WebSocket] = set()
 sessions: dict[str, Session] = {}
 
 ACTION_CN = {"stop": "停止", "pause": "暂停", "resume": "继续", "inject": "介入",
-             "abort": "中止", "resume_turn": "继续", "human_input": "人工介入"}
+             "abort": "中止", "recall_human_input": "撤回重发", "resume_turn": "继续",
+             "human_input": "人工介入"}
 
 
 async def broadcast(event: dict):
@@ -245,6 +246,36 @@ async def handle_abort(msg: dict):
                             "点「继续」可由该 agent 重新发言。"})
 
 
+async def handle_recall_human_input(msg: dict):
+    """「撤回重发」：作废在途的 HITL 回复轮，把同一提问（带原回答预填）重新抛回给用户。
+
+    存在的理由：用户点「提交回答」后，编排层同一次迭代就拉起 CLI（毫秒级），此后没有
+    任何"追加补充"的窗口——想改只能撤回。而普通「中止」会结束在途发言并留待续接
+    （等「继续」由该 agent 重说，且**不再持有用户回答**），用户改好的文字无处可去。
+
+    turn 级能力，仅当编排层确实停在「HITL 回复轮」里才有效：回答一旦被采纳（回复轮跑完）
+    就撤不回来了，此时退化为提示用户改用「介入」框补充。
+    """
+    sid = msg.get("session_id")
+    s = sessions.get(sid) if sid else None
+    if not (s and s.running):
+        await broadcast({"type": "error", "text": "当前没有正在生成的发言，「撤回重发」无效。"})
+        return
+    channel = await s.recall_human_input()
+    if channel == "no_hitl":
+        await broadcast({
+            "type": "error",
+            "text": "这条回答已被采纳（回复轮已结束），撤不回来了；"
+                    "如需更正，请用下方「介入」框补充说明。",
+        })
+        return
+    await broadcast({
+        "type": "system",
+        "msg": f"已撤回本次回答（该次发言作废、不计轮次，中断通道：{channel}）。"
+               "原回答已回填到回答框，修改后重新提交即可。",
+    })
+
+
 async def handle_resume_turn(msg: dict):
     """「继续」：让被中止的 agent 重新发言（turn 级续接）。
 
@@ -300,6 +331,9 @@ async def ws_endpoint(ws: WebSocket):
             elif action == "abort":
                 # turn 级：两种模式都放行（与下面 debate-only 的暂停/恢复/停止分开处理）
                 await handle_abort(msg)
+            elif action == "recall_human_input":
+                # turn 级：撤回刚提交的人工回答（作废在途回复轮 + 重开同一提问，带原回答预填）
+                await handle_recall_human_input(msg)
             elif action == "resume_turn":
                 # turn 级续接：不需要议题输入，兑现「待续接」记录
                 await handle_resume_turn(msg)

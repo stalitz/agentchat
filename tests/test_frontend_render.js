@@ -743,6 +743,110 @@ setTimeout(async () => {
     dom.window.composeClear();
     check(hitlPanel.style.display === 'none', '切会话（composeClear）应关闭残留的 HITL 面板');
 
+    // ---- 撤回 / 中止 合一：生成中主按钮按「当前在途轮触发源」分流 ----
+    // 用户刚发的文本（task/inject/hitl）→ 显示「撤回」，停后可重发原文；另一个 agent 的发言 → 显示「中止」。
+    const mainBtn = doc.getElementById('btnStart');
+    const taskBox = doc.getElementById('task');
+    const ansBox2 = doc.getElementById('hitlAnswer');
+
+    // ① 在途轮非用户文本触发 → 主按钮为「中止」（不出现撤回）
+    dom.window.curSid = 's_b';
+    dom.window.curPid = 'pr_demo';
+    dom.window.recallBySid = {};
+    dom.window.pendingResendBySid = {};
+    dom.window.runningBySid['s_b'] = true;
+    dom.window.refreshSendBtn();
+    check(mainBtn.textContent === '中止', '无用户文本触发时在途主按钮应为「中止」，实际 ' + mainBtn.textContent);
+
+    // ② 提交人工回答 → 主按钮变「撤回回答」；生成中点主按钮（=doRecall）发 recall_human_input
+    captured.length = 0;
+    const longAns = '这是一段很长的回答，写了几百字，发现答漏了一条，不想重打第二遍';
+    ansBox2.value = longAns;
+    dom.window.submitHumanInput();
+    check(captured.length === 1 && JSON.parse(captured[0]).action === 'human_input',
+      '前置：提交回答应发 human_input');
+    check(mainBtn.textContent.indexOf('撤回回答') >= 0,
+      '提交回答后（发言在跑）主按钮应为「撤回回答」，实际 ' + mainBtn.textContent);
+    captured.length = 0;
+    dom.window.mainAction();   // 生成中点主按钮 = doRecall
+    check(captured.length === 1 && JSON.parse(captured[0]).action === 'recall_human_input',
+      '撤回回答应发送 recall_human_input（服务端作废在途轮 + 重开提问），实际 ' + JSON.stringify(captured));
+
+    // ③ 服务端重开提问带 draft → 回答框预填被撤回的原文（核心：文字不丢、不必重打）
+    ansBox2.value = '';
+    dom.window.handleEvent({ type: 'human_input_required', sid: 's_b', agent: '架构师',
+      question: '选哪个方案？', options: [], draft: longAns });
+    check(ansBox2.value === longAns, '重开提问应预填被撤回的原回答，实际 ' + JSON.stringify(ansBox2.value));
+    check(hitlPanel.style.display === 'block', '撤回后同一提问应重新弹出面板');
+
+    // ④ 主输入框（任务）：生成中主按钮「撤回重发」；撤回→先 abort、回填原文、主按钮变「重新发送」
+    dom.window.runningBySid['s_b'] = true;
+    dom.window.recallBySid['s_b'] = { kind: 'task', text: '一段很长的任务描述，写错了要改' };
+    taskBox.value = '';   // 模拟 startSession 发送后清空输入框
+    dom.window.refreshSendBtn();
+    check(mainBtn.textContent.indexOf('撤回重发') >= 0, '主输入框发送后主按钮应为「撤回重发」，实际 ' + mainBtn.textContent);
+    captured.length = 0;
+    dom.window.mainAction();
+    check(captured.length === 1 && JSON.parse(captured[0]).action === 'abort',
+      '任务撤回应先发 abort 中止在途发言，实际 ' + JSON.stringify(captured));
+    check(taskBox.value === '一段很长的任务描述，写错了要改',
+      '任务撤回应把原文回填输入框，实际 ' + JSON.stringify(taskBox.value));
+    dom.window.runningBySid['s_b'] = false;   // 模拟中止收尾：发言已停
+    dom.window.refreshSendBtn();
+    check(mainBtn.textContent === '重新发送',
+      '撤回后主按钮应为「重新发送」（不是「继续」），实际 ' + mainBtn.textContent);
+    check(mainBtn.disabled === false, '原文已回填 → 主按钮应可点，不该仍被"空输入"禁用');
+
+    // ⑤ 撤回后点主按钮必须走「发送」，不能落到「继续」（否则把被中止的发言重说一遍）
+    let started = 0;
+    dom.window.startSession = function () { started++; };
+    dom.window.ctrl = function () { captured.push('ctrl'); };
+    captured.length = 0;
+    dom.window.mainAction();
+    check(started === 1 && captured.indexOf('ctrl') < 0,
+      '撤回后点主按钮应重新发送（startSession），实际 started=' + started + ' captured=' + JSON.stringify(captured));
+
+    // ⑥ 关键：长 run 里 turn_end 后撤回快照作废 —— 第 2 轮在途主按钮应是「中止」而非挂着开场那句「撤回重发」
+    dom.window.curSid = 's_z';
+    dom.window.runningBySid['s_z'] = true;
+    dom.window.recallBySid['s_z'] = { kind: 'task', text: '开场任务' };
+    dom.window.refreshSendBtn();
+    check(mainBtn.textContent.indexOf('撤回重发') >= 0, '开场轮在途应显示「撤回重发」');
+    dom.window.handleEvent({ type: 'turn_end', sid: 's_z', interrupted: false });  // 第 1 轮结束
+    dom.window.refreshSendBtn();
+    check(mainBtn.textContent === '中止',
+      '第 1 轮 turn_end 后撤回快照应作废，第 2 轮在途主按钮应为「中止」（历史 bug：曾挂住开场那句），实际 ' + mainBtn.textContent);
+
+    // ⑦ run_end 关闭撤回窗口；但 task 撤回的「重新发送」占位（pendingResendBySid）必须保留，否则改好的文字发不出去
+    dom.window.curSid = 's_b';
+    dom.window.curPid = null;   // 避免触发会话列表刷新，保持断言确定性
+    dom.window.recallBySid['s_x'] = { kind: 'task', text: 'x' };
+    dom.window.pendingResendBySid['s_x'] = { kind: 'task', text: 'x' };
+    dom.window.handleEvent({ type: 'run_end', sid: 's_x', aborted: true });
+    check(dom.window.recallBySid['s_x'] === null, 'run_end 后撤回快照应清掉（再撤没有意义）');
+    check(dom.window.pendingResendBySid['s_x'] && dom.window.pendingResendBySid['s_x'].kind === 'task',
+      'run_end 后 task 撤回的「重新发送」占位必须保留，否则改好的文字发不出去');
+
+    // ⑧ 撤回被拒（回答已被采纳、回复轮已跑完）→ 本地快照必须退回，否则主按钮卡在「撤回」发不出去
+    dom.window.curSid = 's_b';
+    dom.window.recallBySid['s_b'] = { kind: 'hitl', text: 'x' };
+    dom.window.handleEvent({ type: 'error', sid: 's_b',
+      text: '这条回答已被采纳（回复轮已结束），撤不回来了；如需更正，请用下方「介入」框补充说明。' });
+    check(dom.window.recallBySid['s_b'] === null,
+      '撤回被拒后应退回本地快照（避免主按钮卡在「撤回」发不出去）');
+
+    // ---- 中栏/右栏分隔条拖动方向：往右拖应加宽中栏（历史 bug：dir 传了 -1，方向做反）----
+    const bodyCs = dom.window.getComputedStyle(doc.body);
+    const splitSessions = doc.getElementById('splitSessions');
+    check(splitSessions != null, '应存在中栏/右栏分隔条 #splitSessions');
+    const beforeW = parseFloat(bodyCs.getPropertyValue('--sessions-w'));
+    splitSessions.dispatchEvent(new dom.window.MouseEvent('mousedown', { clientX: 300, bubbles: true, cancelable: true }));
+    doc.dispatchEvent(new dom.window.MouseEvent('mousemove', { clientX: 380, bubbles: true }));
+    doc.dispatchEvent(new dom.window.MouseEvent('mouseup', { clientX: 380, bubbles: true }));
+    const afterW = parseFloat(dom.window.getComputedStyle(doc.body).getPropertyValue('--sessions-w'));
+    check(afterW > beforeW,
+      '分隔条往右拖 80px 应**加宽**中栏（--sessions-w ' + beforeW + ' → ' + afterW + '），方向不能做反');
+
     // ---- 气泡颜色按「发言者名」解析 agent 类型；名字不在配置里 → 中性灰 unknown（不伪装成 claude 蓝）----
     // 历史 bug：导入/改名过的历史会话 speaker 名对不上配置，回落 claude-code，
     // 导致 codex 会话显示成 claude 蓝气泡、fake 陪练也显示成蓝的，看上去像 claude 在说话。

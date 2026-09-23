@@ -203,6 +203,7 @@ class Session:
         self._abort_requested = False
         self._current_runtime = None   # 当前在途 turn 的 runtime（中止时定位中断目标）
         self._turn_in_flight = False   # 当前是否有 turn 在执行（看门狗据此决定是否硬停）
+        self._abort_watchdog_task = None   # 在途的中止看门狗（turn 正常收尾后必须撤销，见下）
         self.last_abort_channel = ""   # 实际使用的中断通道（诊断用）
         # 本次 run 是否为「中止后的继续」（resume）：续接进来的发言已有前文交锋，不算立论轮
         # （立论轮只在会话真正第一次开口时出现，见 _is_opening_turn）。
@@ -217,6 +218,13 @@ class Session:
         # 由它根据回答决定是再问一次、还是给出结论。来回次数不限，但每次提问都是独立发言。
         self._human_input_request = None
         self._human_input_answer = None    # str：用户对当前问题的回答
+        # ---- 「撤回重发」（recall，turn 级）----
+        # 用户点提交后，回复轮会**立刻**拉起 CLI（几毫秒内），此后无法再"追加补充"；
+        # 唯一能救的是当场撤回：作废在途回复轮 + 把同一提问（带原回答预填）重新抛回给用户，
+        # 改完重新提交即重跑该回复轮（不计轮次、不产生 pending_turn、不结束本场）。
+        self._recall_requested = False     # 本次在途 turn 的中止是「撤回重发」而非普通中止
+        self._hitl_reply_inflight = False  # 当前在途 turn 是否就是「HITL 回复轮」（可否撤回）
+        self._last_human_question = None   # {question, options}：最近一次提问（撤回后重开用）
         # 本场议题（debate 由 _debate 写入 / resume 时从历史回填；chat 不用）。
         # 在此先初始化为空：_build_prompt 在 _debate 之外（单测、chat 首轮）也会读它。
         self._initial_task = ""
@@ -309,7 +317,10 @@ class Session:
         if self._turn_in_flight and self.last_abort_channel != "none":
             # 看门狗：协议帧发出后 turn 仍未收尾（个别后端/版本可能不响应中断）→ 整组硬停，
             # 否则「中止」形同虚设，死循环照样跑下去。
-            asyncio.create_task(self._abort_watchdog(rt, 2.5))
+            # 句柄必须留着：turn 一旦正常收尾（_finish_aborted_turn）就撤销它——否则 2.5s 后
+            # 它会拿"当前是否有 turn 在执行"作判据，误杀**紧接着开的下一轮**（撤回重发正是
+            # 在同一 run 里立刻重开一轮）。
+            self._abort_watchdog_task = asyncio.create_task(self._abort_watchdog(rt, 2.5))
         return self.last_abort_channel
 
     async def _abort_watchdog(self, rt, grace: float):
@@ -336,8 +347,17 @@ class Session:
         if not self._human_input_request:
             return ""
         req = self._human_input_request or {}
+        # 记住这次提问：万一用户在回复轮里点「撤回重发」，据此把**同一个问题**重新抛回
+        # （提问内容在下面会被清空，不留档就没法重开）。
+        self._last_human_question = {
+            "question": req.get("question", ""),
+            "options": req.get("options") or [],
+        }
+        # draft：仅「撤回重发」重开提问时非空——带上被撤回的原回答，前端预填回答框，
+        # 用户改几个字就能重发，不必整段重打。
         await self._emit(type="human_input_required", agent=agent.name,
-                         question=req.get("question", ""), options=req.get("options") or [])
+                         question=req.get("question", ""), options=req.get("options") or [],
+                         draft=req.get("draft") or "")
         await self.human_input_event.wait()
         self.human_input_event.clear()
         answer = (self._human_input_answer or "").strip()
@@ -346,6 +366,34 @@ class Session:
         if answer:
             await self._record_human(answer, "人工回答")
         return answer
+
+    async def recall_human_input(self) -> str:
+        """「撤回重发」：作废在途的 HITL 回复轮，把同一提问（带原回答预填）重新抛回给用户。
+
+        为什么需要它（2026-09-22 用户口径）：用户点「提交回答」后，编排层**同一次迭代**就
+        `await _run_turn(..., hitl_reply=True)` 拉起 CLI（毫秒级），此后没有任何"追加补充"的
+        窗口——想改只能撤回。而普通 abort() 会结束本次在途发言并留 pending_turn（等「继续」
+        由该 agent 重说，且**不再持有用户回答**），用户改好的文字无处可去。
+
+        撤回与 abort 的区别：
+        - abort：作废在途 turn + 留 pending_turn（等「继续」重说），本场随即收尾；
+        - recall：作废在途 turn，但**保留提问状态**，让编排层回到「等人工回答」的位置，
+          用户改完重新提交即重跑该回复轮（不计轮次、不产生 pending_turn、不结束本场）。
+
+        返回实际使用的中断通道；`"no_hitl"` 表示当前不在可撤回的 HITL 回复轮里
+        （回答已被采纳 / 非 HITL 回合），调用方据此提示用户。
+        """
+        if not (self._hitl_reply_inflight and self._last_human_question):
+            return "no_hitl"
+        # 先标记旧回答作废（此刻最后一条消息仍是那条回答；被中止的 agent 气泡要等
+        # _run_turn 收尾才落盘，所以必须抢在 abort 之前标）——保留可见但标记已撤回，
+        # 与「已中止的 agent 发言」同口径：内容不删，但要一眼看出它不作数。
+        try:
+            store.mark_last_message_voided(self.project_path, self.session_id)
+        except Exception:
+            pass
+        self._recall_requested = True
+        return await self.abort()
 
     # ---------------- prompt ----------------
     def _render_slot(self, slot: str, **kw) -> str:
@@ -921,10 +969,26 @@ class Session:
         }
         self.history.append(entry)
         store.append_message(self.project_path, self.session_id, entry)
+        # 本函数被调用 = 中断已经生效（turn 已收尾）⇒ 看门狗没必要了，立刻撤销。
+        # 不撤销的后果：它 2.5s 后按「当前是否有 turn 在跑」判断，会误杀同一 run 里
+        # **紧接着重开的那一轮**（撤回重发正是这个形态）。
+        if self._abort_watchdog_task is not None:
+            self._abort_watchdog_task.cancel()
+            self._abort_watchdog_task = None
+        await self._emit(type="turn_end", agent=agent.name, interrupted=True)
+        if self._recall_requested:
+            # 「撤回重发」：本场不结束、提问马上重开（见 recall_human_input），
+            # 所以**不留 pending_turn**——否则用户会看到「继续」按钮与重开的回答框并存，
+            # 两条续接路径互相打岔。
+            store.clear_pending_turn(self.project_path, self.session_id)
+            await self._record_system(
+                f"{agent.name} 的本次发言已随你的撤回作废（不计入轮次）。"
+                f"你上一条回答已标记为「已撤回」并回填到回答框，修改后重新提交即可。"
+            )
+            return
         store.set_pending_turn(self.project_path, self.session_id, {
             "agent": agent.name, "round_i": round_i,
         })
-        await self._emit(type="turn_end", agent=agent.name, interrupted=True)
         await self._record_system(
             f"{agent.name} 的本次发言已被中止（内容作废，不计入轮次）。"
             f"点「继续」将由 {agent.name} 就当前议题重新完整发言。"
@@ -994,8 +1058,17 @@ class Session:
             answer = await self._pause_for_human_input(self.agents[0])
             if self.stop_event.is_set() or self._abort_requested:
                 break
+            # 「撤回重发」窗口：只覆盖这一个回复轮（见 recall_human_input）
+            self._hitl_reply_inflight = True
             # hitl_reply=True → 走轻量提示词（只带回答 + 续问/收尾引导，不重灌整轮指令）
             await self._run_turn(self.agents[0], len(self.history), answer, hitl_reply=True)
+            self._hitl_reply_inflight = False
+            # 「撤回重发」：作废在途轮后把同一提问（带原回答）重新抛回，本场继续、不计轮次
+            if self._recall_requested:
+                self._recall_requested = False
+                self._abort_requested = False
+                self._human_input_request = dict(
+                    self._last_human_question or {}, draft=answer)
         # 失败时 _run_turn 已落 system 错误消息并广播 error；单 agent 本轮即结束，无需额外处理
         await self._emit(type="run_end", mode="chat", aborted=self._abort_requested)
 
@@ -1053,10 +1126,21 @@ class Session:
                 answer = await self._pause_for_human_input(current)
                 if self.stop_event.is_set() or self._abort_requested:
                     break
+                # 打开「撤回重发」窗口：只覆盖**这一个回复轮**（recall_human_input 据此判定
+                # 可否撤回——回答一旦被采纳就撤不回来了，不能让撤回误伤下一位 agent 的发言）。
+                self._hitl_reply_inflight = True
                 # hitl_reply=True → 走轻量提示词（只带回答 + 续问/收尾引导，不重灌整轮指令）；
                 # 该轮若又发起提问，落盘时标 interim（交互过程，不转述给对方）。
                 full, errors = await self._run_turn(
                     current, round_i, answer, hitl_reply=True)
+                self._hitl_reply_inflight = False
+                # 「撤回重发」：作废在途轮后把**同一提问**（带被撤回的原回答）重新抛回，
+                # 本场继续、不计轮次；while 条件随即为真 → 回到「等人工回答」继续。
+                if self._recall_requested:
+                    self._recall_requested = False
+                    self._abort_requested = False
+                    self._human_input_request = dict(
+                        self._last_human_question or {}, draft=answer)
 
             # 发言被中止：整场停下（不推进 round_i、不喂给下一位），等「继续」由同一 agent 重说。
             # 中止 ≠ 停止：停止是「跑完当前发言不再开下一轮」，中止是当场作废这次发言。

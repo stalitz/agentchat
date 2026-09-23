@@ -369,7 +369,7 @@
         <span class="ctx-meta lock-tag" id="teamLockTag" style="display:none"
               title="本会话已有对话，Team 不可更改；要换 Team 请点中栏「＋ 新」新建会话">Team 已锁定（已有对话）</span>
         <span class="ctx-meta" id="modeTag"></span>
-        <button class="primary" id="btnStart" onclick="mainAction()" title="对话模式：发送；生成中：中止">开始讨论</button>
+        <button class="primary" id="btnStart" onclick="mainAction()" title="对话/辩论模式：发送或开始讨论；生成中：中止或撤回（用户刚发的内容可撤回重发）">开始讨论</button>
         <span id="ctrlBtns" class="debate-only" style="display:inline-flex; gap:8px;">
           <button onclick="ctrl('pause')" title="当前发言跑完，在下一位开始前挂起（轮边界生效）">暂停</button>
           <button onclick="ctrl('resume')" title="解除暂停（轮边界，不需要输入内容）">恢复</button>
@@ -487,6 +487,15 @@ var runningBySid = {};   // sid -> bool：各会话是否正在跑（多会话�
 // 权威值来自 GET /api/session 的 pending_turn；这里缓存一份，避免流式结束后要重载才知道状态。
 var pendingBySid = {};
 function isRunning(sid) { return sid ? !!runningBySid[sid] : false; }
+// sid -> {kind:'task'|'inject'|'hitl', text, recalled}：该会话「最近一次发送」的原文快照。
+// 用途：发送后想停/想改时，能把原文**原样取回**（几个字无所谓，几百字的回答重打会崩溃）。
+//   kind=task   → 主输入框（任务 / 对话消息）
+//   kind=inject → 介入框
+//   kind=hitl   → 人工回答框（撤回走服务端 recall_human_input：重开同一提问并预填原文）
+// recalled=true 表示已点过撤回、正等用户改完重发（主按钮据此显示「重新发送」）。
+var recallBySid = {};   // 当前在途轮若是「用户文本触发」（task/inject/hitl），记录其 kind+原文；
+                       // 仅在该轮跑动期间有效，turn_end 即作废（避免长 run 里第 5 轮还挂着开场那句撤回）
+var pendingResendBySid = {};  // 撤回后待用户「重新发送」的原输入（task 场景）；abort 后由主按钮兑现
 var expanded = { projects: {}, teams: {} };  // 树展开状态
 
 WS.onopen = function () { setStatus('已连接', true); };
@@ -569,7 +578,9 @@ function makeHsplit(elId, varName) {
 }
 applySizes();
 makeVsplit('splitSidebar', '--sidebar-w', 1);
-makeVsplit('splitSessions', '--sessions-w', -1);
+// 「中栏 / 右栏」之间的分隔条：拖动方向取 +1——分隔条左边就是中栏（#sessions，宽度即
+// --sessions-w），右边是 flex:1 的 main。往右拖应当**加宽中栏**（此前是 -1，方向做反了）。
+makeVsplit('splitSessions', '--sessions-w', 1);
 makeHsplit('splitChat', '--composer-h');
 
 function setStatus(t, ok) { document.getElementById('status').textContent = t; }
@@ -582,6 +593,8 @@ function handleEvent(ev) {
       runningBySid[ev.sid] = false;
       // 中止收尾：该会话留下「待续接」标记（切换到它时主按钮显示「继续」）
       pendingBySid[ev.sid] = ev.aborted ? {} : null;
+      // run 已结束，没有在途轮 → 撤回快照关闭（pendingResendBySid 不动，task 撤回后的「重新发送」靠它）
+      recallBySid[ev.sid] = null;
       refreshSendBtn();
       if (curPid) refreshSessionList(curPid);
     }
@@ -596,6 +609,8 @@ function handleEvent(ev) {
       // 被中止的 run：记下待续接（主按钮立刻变「继续」，不必等重载）；
       // 正常结束则清掉（该会话的待续接已被有效发言兑现）
       if (ev.sid) pendingBySid[ev.sid] = ev.aborted ? { agent: curTurnAgent || '' } : null;
+      // run 已结束，没有在途轮 → 撤回快照关闭（pendingResendBySid 不动，task 撤回后的「重新发送」靠它）
+      if (ev.sid) recallBySid[ev.sid] = null;
       refreshSendBtn();
       if (!curPid) break;
       refreshSessionList(curPid);
@@ -614,7 +629,13 @@ function handleEvent(ev) {
       // 上方 guard 已把非当前会话事件（含本类）丢弃，避免串场污染。
       showHitlPanel(ev);
       break;
-    case 'error': addRow('sys', '错误', ev.text); break;
+    case 'error':
+      addRow('sys', '错误', ev.text);
+      // 撤回被拒（回答已被采纳、回复轮已跑完）：把本地「已撤回」状态退回去，
+      // 否则主按钮会一直卡在「重新发送」、原文也回不到回答框
+      if (ev.text && ev.text.indexOf('已被采纳') >= 0 && curSid) recallBySid[curSid] = null;
+      refreshSendBtn();
+      break;
     case 'turn_start':
       agentNameColor[ev.agent] = ev.atype || 'unknown';
       curTurnAgent = ev.agent;
@@ -674,7 +695,12 @@ function handleEvent(ev) {
         // HITL 交互过程发言：与用户的来回问答（又问了一次），可见但不转述给对方 agent
         else if (ev.interim) markInterim(cur);
       }
-      curTurnAgent = null; cur = null; curAnswer = null; break;
+      curTurnAgent = null; cur = null; curAnswer = null;
+      // 本轮结束 → 其在途轮的「撤回」快照作废：长 run 里被触发的只是这一轮，
+      // 下一轮由另一个 agent 触发，不应还挂着开场那句 task 的「撤回重发」（历史 bug）。
+      if (ev.sid) recallBySid[ev.sid] = null;
+      refreshSendBtn();
+      break;
   }
 }
 
@@ -1172,10 +1198,29 @@ function refreshSendBtn() {
   if (!b) return;
   b.classList.remove('abort-btn');
   if (isRunning(curSid)) {
+    // 生成中：主按钮同时承载「中止」与「撤回」——二者是同一动作（掐断在途轮），
+    // 区别仅在「当前在途轮由谁触发」：用户刚发的文本 → 标「撤回」（停后可用原文重发）；
+    // 另一个 agent 的发言 → 标「中止」（停后由该 agent 重新发言）。
     b.disabled = false;
     b.classList.add('abort-btn');
-    b.textContent = '中止';
-    b.title = '立刻掐断正在生成的输出；本次发言作废（不计轮次、不喂给其他 agent），点「继续」可由该 agent 重新发言';
+    var rc = curSid ? recallBySid[curSid] : null;
+    if (rc) {
+      b.textContent = rc.kind === 'hitl' ? '↩ 撤回回答'
+                     : (rc.kind === 'inject' ? '↩ 撤回介入' : '↩ 撤回重发');
+      b.title = '中止本次发言并把刚发送的内容取回：task/介入可改完重发，HITL 可重新回答；该 agent 也会重新发言';
+    } else {
+      b.textContent = '中止';
+      b.title = '立刻掐断正在生成的输出；本次发言作废（不计轮次、不喂给其他 agent），点「继续」可由该 agent 重新发言';
+    }
+    return;
+  }
+  var pr = curSid ? pendingResendBySid[curSid] : null;
+  if (pr) {
+    // 撤回后原文已回填输入框：主按钮改为「重新发送」，直接兑现「改完就发」的意图
+    // （不能落到下面的「继续」分支——那会把被中止的发言重说一遍，而不是发送改好的文字）
+    b.disabled = !document.getElementById('task').value.trim();
+    b.title = '撤回后原文已回填，修改完点这里重新发送';
+    b.textContent = isChatMode() ? '重新发送' : '重新讨论';
     return;
   }
   var pend = curSid ? pendingBySid[curSid] : null;
@@ -1195,10 +1240,46 @@ function refreshSendBtn() {
     : (curMsgCount > 0 ? '继续讨论（已有 ' + curMsgCount + ' 条）' : '开始讨论');
 }
 
-// 主按钮的动作分发：同一个按钮承载「中止 / 继续 / 发送（开始讨论）」
+// 主按钮在生成中同时是「撤回/中止」：点它统一走 doRecall —— 有用户文本触发记录就走撤回
+// （HITL 重开提问 / task·介入中止并回填原文），否则走普通中止（该 agent 重新发言）。
+function doRecall() {
+  if (!isRunning(curSid)) return;            // 只在生成中可撤回/中止
+  var rc = curSid ? recallBySid[curSid] : null;
+  if (!rc) { ctrl('abort'); return; }        // 在途轮由另一个 agent 触发 → 普通中止
+  if (rc.kind === 'hitl') {
+    // 人工回答撤回走服务端：作废在途回复轮 + 把同一提问重新抛回（带原回答预填），
+    // 否则这条回答已被消费，重开的回答框无处可去。
+    WS.send(JSON.stringify({ action: 'recall_human_input', session_id: curSid }));
+    setStatus('已请求撤回本次回答…', true);
+  } else if (rc.kind === 'inject') {
+    // 介入：turn 级中止即可，原文在前端回填；重发入口是介入框自己的「介入」按钮
+    ctrl('abort');
+    var ib = document.getElementById('inject');
+    ib.value = rc.text; ib.focus();
+    setStatus('已中止本次发言，原文已回填介入框，点「介入」可重发', true);
+  } else { // task
+    // 任务：中止 + 原文回填，并用 pendingResendBySid 让主按钮变「重新发送」兑现改完重发
+    pendingResendBySid[curSid] = { kind: 'task', text: rc.text };
+    ctrl('abort');
+    var tb = document.getElementById('task');
+    tb.value = rc.text; tb.focus();
+    setStatus('已中止本次发言，原文已回填，可修改后重新发送', true);
+  }
+  refreshSendBtn();
+}
+
+// 主按钮的动作分发：同一个按钮承载「中止 / 撤回 / 继续 / 发送（开始讨论）/ 撤回后重发」
 function mainAction() {
   if (!curPid) { alert('请先在左侧选择一个项目'); return; }
-  if (isRunning(curSid)) { ctrl('abort'); return; }
+  if (isRunning(curSid)) {
+    // 生成中：统一走 doRecall —— 有用户文本触发就撤回（停后重发），否则普通中止
+    doRecall();
+    return;
+  }
+  // 撤回后重发：优先级高于「继续」——用户要的是把改好的文字发出去，
+  // 不是把被中止的发言重说一遍（落到 pend 分支就错了）。
+  var pr = curSid ? pendingResendBySid[curSid] : null;
+  if (pr) { pendingResendBySid[curSid] = null; startSession(); return; }
   if (curSid && pendingBySid[curSid]) { ctrl('resume_turn'); return; }
   startSession();
 }
@@ -1221,6 +1302,8 @@ function startSession() {
     pendingBySid[sid] = null;
     runningBySid[sid] = true; refreshSendBtn();
     WS.send(JSON.stringify({ action: 'start', project_id: curPid, team_id: tid, session_id: sid, task: task, max_rounds: mr, tone: tone }));
+    // 撤回快照：生成中若发现发早了/发漏了，主按钮显示「撤回重发」，点它可取回原文重发
+    recallBySid[sid] = { kind: 'task', text: task };
     document.getElementById('task').value = '';  // 内容已作为消息回显，输入框清空
   }).catch(function (e) { if (curSid) runningBySid[curSid] = false; refreshSendBtn(); setStatus('准备会话失败: ' + e.message, false); });
 }
@@ -1241,22 +1324,35 @@ function doInject() {
   var x = document.getElementById('inject').value.trim();
   if (!x) { setStatus('介入内容为空', false); return; }
   WS.send(JSON.stringify({ action: 'inject', text: x, session_id: curSid }));
+  recallBySid[curSid] = { kind: 'inject', text: x };
   document.getElementById('inject').value = '';
 }
 // HITL：agent 请求人工介入 → 弹出回答面板
 function showHitlPanel(ev) {
   document.getElementById('hitlAgent').textContent = ev.agent ? ('· ' + ev.agent) : '';
   document.getElementById('hitlQuestion').textContent = ev.question || '(无具体问题，请自由回复)';
-  document.getElementById('hitlAnswer').value = '';
+  var ta = document.getElementById('hitlAnswer');
+  // 「撤回重发」回来的提问带 draft（被撤回的原回答）→ 预填，改几个字就能重发；
+  // 首次提问没有 draft，用本地快照兜底（同一意图：别让用户白重打一遍）。
+  var rc = curSid ? recallBySid[curSid] : null;
+  ta.value = ev.draft || (rc && rc.kind === 'hitl' ? rc.text : '') || '';
   document.getElementById('hitlPanel').style.display = 'block';
-  document.getElementById('hitlAnswer').focus();
+  ta.focus();
+  try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) {}
+  // 提问已经回到手上 → 这条撤回记录使命结束；不清会让主按钮一直停在「重新发送」
+  if (curSid) recallBySid[curSid] = null;
+  refreshSendBtn();
 }
 function submitHumanInput() {
   var x = document.getElementById('hitlAnswer').value.trim();
   if (!x) { setStatus('回答为空', false); return; }
   WS.send(JSON.stringify({ action: 'human_input', text: x, session_id: curSid }));
+  // 撤回快照：回答提交后回复轮立刻开跑，若发现答漏了/答错了，生成中的主按钮显示「撤回回答」——
+  // 服务端会作废该轮并把同一提问带原文重新抛回（几百字的回答重打会崩溃）
+  recallBySid[curSid] = { kind: 'hitl', text: x };
   document.getElementById('hitlPanel').style.display = 'none';
   document.getElementById('hitlAnswer').value = '';
+  refreshSendBtn();
 }
 function composeClear() {
   chat.innerHTML = ''; cur = null;

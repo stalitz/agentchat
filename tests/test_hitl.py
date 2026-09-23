@@ -652,5 +652,119 @@ class TestDebateMultiAskHandoff(unittest.TestCase):
         self.assertNotIn("答B-早上", b_prompt, "用户回答不应进对方 delta")
 
 
+class _GatedRuntime:
+    """脚本化 runtime，额外支持「卡住等中断」——用来测在途发言被撤回。
+
+    真实场景就是 CLI 正在生成：此时用户点「撤回重发」，编排层要当场掐断这一轮、
+    并把同一提问带原回答重新抛回。脚本里遇到 `("WAIT", "")` 就挂起，直到
+    `interrupt()`（中止入口）放行——等价于「中断帧发出后进程把本轮吐完」。
+    """
+
+    def __init__(self, scripts):
+        self._scripts = list(scripts)
+        self.prompts = []
+        self.cli_session_id = None
+        self.gates = []            # 每次 run 一个闸门（测试据此放行）
+        self.hard_killed = False
+
+    def run(self, prompt, project_path, timeout, meta=None):
+        self.prompts.append(prompt)
+        script = self._scripts.pop(0) if self._scripts else [("done", "")]
+        gate = asyncio.Event()
+        self.gates.append(gate)
+
+        async def gen():
+            for ev in script:
+                if ev == ("WAIT", ""):
+                    await gate.wait()
+                    return
+                yield ev
+        return gen()
+
+    async def interrupt(self):
+        if self.gates:
+            self.gates[-1].set()
+        return "turn_interrupt"
+
+    def hard_kill(self):
+        self.hard_killed = True
+
+    async def aclose(self):
+        pass
+
+
+class TestHitlRecall(unittest.TestCase):
+    """「撤回重发」：回答提交后、回复轮还在跑时可撤回——作废该轮 + 同一提问带原回答重开。
+
+    存在理由（2026-09-22 用户口径）：提交后编排层**同一次迭代**就拉起 CLI（毫秒级），
+    没有任何"追加补充"的窗口；此前只能眼看着它跑完，且输入框已清空、几百字回答要重打。
+    撤回与「中止」的区别：中止结束在途发言并留待续接（等「继续」重说，且不再持有用户回答），
+    撤回则保留提问状态，用户改完重新提交即重跑该回复轮（不计轮次、不留 pending_turn）。
+    """
+
+    def setUp(self):
+        self.proj = "/tmp/agentchat_test_recall_" + str(id(self))
+        self.sid = store.create_session(self.proj, "撤回重发测试")["id"]
+
+    def test_recall_reopens_same_question_with_draft(self):
+        a = models.AgentConfig(name="A", type="codex")
+        s = orch.Session(self.proj, self.sid, [a], 4, Recorder(), timeout=300)
+        rt = _GatedRuntime([
+            [("text", "先问预算。"), _ask("预算多少？"), ("done", "")],      # 起问
+            [("text", "正在按你的回答组织方案…"), ("WAIT", "")],             # 回复轮 #1：卡住 → 被撤回
+            [("text", "结论：按 2000 元（含运费）落地。"), ("done", "")],     # 回复轮 #2：改好的回答
+        ])
+        s.runtimes[a.name] = rt
+
+        async def drive():
+            task = asyncio.create_task(s._chat_turn("出个方案"))
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("question") == "预算多少？"))
+            s.provide_human_input("2000")
+            self.assertTrue(await _wait_until(lambda: s._hitl_reply_inflight),
+                            "提交后回复轮应进入在途状态（撤回窗口打开）")
+            self.assertNotEqual(await s.recall_human_input(), "no_hitl",
+                                "HITL 回复轮在途时撤回应真生效")
+            self.assertTrue(await _wait_until(
+                lambda: (s._human_input_request or {}).get("draft") == "2000"),
+                "撤回后应重开**同一提问**并带上被撤回的原回答（用户改几个字即可重发）")
+            self.assertEqual(s._human_input_request.get("question"), "预算多少？",
+                             "重开的必须是同一个问题，不能换成别的问题")
+            s.provide_human_input("2000，含运费")
+            await asyncio.wait_for(task, timeout=5)
+
+        asyncio.run(drive())
+
+        # ① 被撤回的那轮落盘但标 interrupted（内容可见、不作数，与「中止」同口径）
+        aborted = [m for m in s.history if m.get("speaker") == "A" and m.get("interrupted")]
+        self.assertEqual(len(aborted), 1, "被撤回的那轮应落盘并标 interrupted")
+        # ② 被撤回的那条回答标 voided：不删除（可追溯"曾输错"），但要一眼看出不作数
+        saved = store.read_session(self.proj, self.sid) or {}
+        msgs = saved.get("messages") or []
+        voided = [m for m in msgs
+                  if m.get("speaker") == "human" and m.get("role") == "人工回答" and m.get("voided")]
+        self.assertEqual(len(voided), 1, "被撤回的回答应标 voided（不删除）")
+        human_ans = [m for m in msgs
+                     if m.get("speaker") == "human" and m.get("role") == "人工回答"]
+        self.assertEqual(len(human_ans), 2, "撤回后重新提交 → 两条人工回答（前一条已撤回）")
+        # ③ 不留 pending_turn：本场没结束（提问已重开继续等答案），不该冒出一条「继续」的路
+        self.assertFalse(store.get_pending_turn(self.proj, self.sid),
+                         "撤回不产生待续接记录，否则「继续」与重开的回答框会互相打岔")
+        # ④ 重开后的回复轮用的是**改好**的答案（不是原来那条）
+        self.assertIn("2000，含运费", rt.prompts[-1])
+        self.assertIn("正在按你的回答组织方案…", [m.get("content") for m in aborted],
+                      "被撤回轮的半截内容应保留在历史里（可追溯）")
+
+    def test_recall_rejected_when_not_in_hitl_reply(self):
+        """不在 HITL 回复轮里（回答已被采纳 / 非 HITL 回合）→ 明确拒绝。
+
+        不能退化成"顺手把别的在途轮撤了"——那会误伤正在正常发言的对方 agent。
+        """
+        a = models.AgentConfig(name="A", type="codex")
+        s = orch.Session(self.proj, self.sid, [a], 4, Recorder(), timeout=300)
+        self.assertEqual(asyncio.run(s.recall_human_input()), "no_hitl")
+        self.assertFalse(s._abort_requested, "拒绝撤回时不应顺手置位中止标志")
+
+
 if __name__ == "__main__":
     unittest.main()
